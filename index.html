@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Junos Quick Change Configurator</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <p class="eyebrow">Visual quick-change tool</p>
+        <h1>Junos switch port configurator</h1>
+        <p class="hero-copy">Discover the switch, select ports visually, build a focused change, and review the live candidate diff before deployment.</p>
+      </header>
+
+      <main class="layout">
+        <section class="panel device-panel">
+          <div class="device-topbar">
+            <div>
+              <p class="section-label">Connection and inventory</p>
+              <h2>Target device</h2>
+            </div>
+            <div id="connectionStatus" class="status-pill">Not connected</div>
+          </div>
+
+          <div class="device-connection-layout">
+            <div class="credentials-block">
+              <h3>Login credentials</h3>
+              <div class="saved-device-controls">
+                <label>Saved device<select id="savedDevice"><option value="">Choose a saved device</option></select></label>
+                <button id="quickConnectBtn" class="secondary" disabled>Quick connect</button>
+              </div>
+              <div class="form-grid login-grid">
+                <label>Host / IP<input id="host" autocomplete="off" /></label>
+                <label>Username<input id="username" autocomplete="username" /></label>
+                <label>Password<input id="password" type="password" autocomplete="current-password" placeholder="Uses local .env when blank" /></label>
+              </div>
+              <div class="button-row connection-actions">
+                <button id="connectBtn">Connect & pull data</button>
+                <button id="saveDeviceBtn" class="secondary" disabled>Save device</button>
+              </div>
+              <p class="credential-note">Saved credentials remain local in <code>.env</code> and passwords are never returned to the browser.</p>
+            </div>
+
+            <div class="device-identity">
+              <h3>Discovered device</h3>
+              <label>Device name<input id="deviceName" value="" readonly /></label>
+              <div id="deviceMetadata" class="device-metadata">Connect to load device identity.</div>
+              <div class="connection-inline"><strong>SSH</strong><span id="connectionHint">ssh netops@host</span></div>
+              <div class="refresh-controls">
+                <label>Auto-refresh<select id="refreshInterval"><option value="0">Off</option><option value="30">Every 30 seconds</option><option value="60">Every minute</option><option value="300">Every 5 minutes</option></select></label>
+                <button id="refreshNowBtn" class="secondary" disabled>Refresh now</button>
+              </div>
+              <small id="lastRefresh" class="muted">Not refreshed yet</small>
+            </div>
+          </div>
+
+          <div class="inventory-toolbar">
+            <div class="selection-mode-control">
+              <label>
+                Tile selection
+                <select id="selectionMode">
+                  <option value="single">Single</option>
+                  <option value="range">Range</option>
+                  <option value="multi">Multi-select</option>
+                </select>
+              </label>
+              <p id="selectionModeHint">Single mode keeps one port selected at a time.</p>
+            </div>
+            <div class="button-row inventory-actions">
+              <button id="selectAllBtn">Select all</button>
+              <button id="clearSelectionBtn" class="secondary">Clear selection</button>
+              <button id="richardViewBtn" class="secondary" type="button" aria-pressed="false" title="Because sometimes 108 pixels is simply not enough.">Richard View</button>
+            </div>
+            <div class="port-legend" aria-label="Port status legend">
+              <span><i class="legend-swatch state-up"></i> Link up</span>
+              <span><i class="legend-swatch state-down"></i> Link down</span>
+              <span><i class="legend-dot"></i> Configured (VLAN assigned)</span>
+            </div>
+          </div>
+
+          <div class="port-grid" id="portGrid"></div>
+          <details class="note-card diagnostics-card">
+            <summary>Diagnostics output</summary>
+            <pre id="diagnosticsOutput"></pre>
+          </details>
+        </section>
+
+        <section class="panel workspace-panel">
+          <div class="workspace-heading">
+            <div>
+              <p class="section-label">Configuration hub</p>
+              <h2>Port change workspace</h2>
+            </div>
+            <span id="selectionSummary">0 selected</span>
+          </div>
+
+          <nav class="workspace-tabs" role="tablist" aria-label="Configuration workflows">
+            <button class="tab-button active" id="tab-configure" role="tab" aria-selected="true" aria-controls="panel-configure" data-tab="configure">Configure</button>
+            <button class="tab-button" id="tab-move" role="tab" aria-selected="false" aria-controls="panel-move" data-tab="move">Move config</button>
+            <button class="tab-button" id="tab-series" role="tab" aria-selected="false" aria-controls="panel-series" data-tab="series">Series</button>
+            <button class="tab-button" id="tab-vlans" role="tab" aria-selected="false" aria-controls="panel-vlans" data-tab="vlans">VLANs</button>
+            <button class="tab-button review-tab" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review">Review & deploy</button>
+          </nav>
+
+          <div class="tab-panel active" id="panel-configure" role="tabpanel" aria-labelledby="tab-configure" data-panel="configure">
+            <div class="tab-intro"><h3>Configure selected ports</h3><p>Controls hydrate from a single selected port. Use them to build a final switching configuration or append a focused edit.</p></div>
+            <div class="configuration-tools">
+              <label>Port mode<select id="portMode"><option value="access">Access</option><option value="trunk">Trunk</option></select></label>
+              <fieldset class="vlan-picker">
+                <legend>VLAN membership</legend>
+                <div id="vlanMembership" class="vlan-options" role="group" aria-live="polite"><span class="muted">Connect to discover VLANs</span></div>
+              </fieldset>
+              <label>Description<input id="description" value="Quick change" /></label>
+            </div>
+            <div class="tab-card-grid">
+              <div class="tool-group">
+                <h4>Configuration builder</h4>
+                <p>Regenerate the intended port configuration or append focused edits to the current preview.</p>
+                <div class="button-row stage-actions">
+                  <button id="applyBtn">Regenerate full config</button>
+                  <button id="addVlanBtn" class="secondary">Append VLAN add</button>
+                  <button id="removeVlanBtn" class="secondary">Append VLAN removal</button>
+                  <button id="setDescriptionBtn" class="secondary">Append description</button>
+                </div>
+              </div>
+              <div class="tool-group port-admin-group">
+                <h4>Port administration</h4>
+                <p>Enable, disable, or remove all configuration from the selected interfaces.</p>
+                <div class="button-row stage-actions">
+                  <button id="enablePortsBtn" class="confirm">Enable selected</button>
+                  <button id="disablePortsBtn" class="secondary">Disable selected</button>
+                  <button id="clearPortsBtn" class="danger-outline">Clear selected configuration</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-panel" id="panel-move" role="tabpanel" aria-labelledby="tab-move" data-panel="move" hidden>
+            <div class="tab-intro"><h3>Move exact interface configuration</h3><p>Destinations are cleared first. Source ports that are not reused as destinations are cleared and disabled.</p></div>
+            <div class="feature-focus-card move-config-group">
+              <div class="shift-controls">
+                <label>Destination offset<input id="shiftOffset" type="number" value="1" /></label>
+                <button id="moveConfigBtn">Build move commands</button>
+              </div>
+              <div id="moveSummary" class="tool-summary muted">Select configured source ports to preview the mapping.</div>
+            </div>
+          </div>
+
+          <div class="tab-panel" id="panel-series" role="tabpanel" aria-labelledby="tab-series" data-panel="series" hidden>
+            <div class="tab-intro"><h3>Create a numbered series</h3><p>Rename consecutive discovered ports, with the option to also apply one shared switching configuration.</p></div>
+            <div class="feature-focus-card series-group">
+              <div class="series-controls">
+                <label class="series-start">Start port<select id="seriesStartPort"><option value="">Select a start port</option></select></label>
+                <label>Port count<input id="seriesCount" type="number" min="1" max="128" value="4" /></label>
+                <label>First number<input id="seriesStartNumber" type="number" min="0" value="1" /></label>
+                <label class="series-prefix">Description prefix<input id="seriesDescription" value="hw_ap_" /></label>
+                <label>Description postfix<input id="seriesPostfix" placeholder="Optional" /></label>
+              </div>
+              <div class="series-options" role="group" aria-label="Optional series behavior">
+                <label class="compact-checkbox"><input id="seriesIncludePortNumber" type="checkbox" checked /><span>Add <code>##_</code> port prefix</span></label>
+                <label class="compact-checkbox" title="Uses the mode and VLAN selections from the Configure tab"><input id="seriesConfigurationScope" type="checkbox" /><span>Also apply shared port config <small>Configure tab mode + VLANs</small></span></label>
+              </div>
+              <div class="series-footer">
+                <div id="seriesDescriptionPreview" class="tool-summary muted">Example description: <code>01_hw_ap_1</code></div>
+                <button id="buildSeriesBtn">Build series configuration</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-panel" id="panel-vlans" role="tabpanel" aria-labelledby="tab-vlans" data-panel="vlans" hidden>
+            <div class="tab-intro"><h3>Create a VLAN</h3><p>Add a named VLAN to the command preview and make it available in the Configure tab membership picker.</p></div>
+            <div class="feature-focus-card vlan-create-group">
+              <div class="vlan-create-controls">
+                <label>VLAN name<input id="newVlanName" placeholder="CAMERAS" /></label>
+                <label>VLAN ID<input id="newVlanId" type="number" min="1" max="4094" /></label>
+                <button id="createVlanBtn">Add VLAN command</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-panel" id="panel-review" role="tabpanel" aria-labelledby="tab-review" data-panel="review" hidden>
+            <div class="tab-intro"><h3>Review and deploy</h3><p>Review generated commands and current port context, then load the live Junos candidate diff before pushing.</p></div>
+            <div class="config-workspace">
+              <textarea id="configOutput" spellcheck="false" aria-label="Generated Junos configuration"></textarea>
+              <aside class="port-summary-panel">
+                <h4>Selected port summary</h4>
+                <div id="selectionSummaryBox" class="summary-card"></div>
+                <div id="intendedChangeSummary" class="intended-summary"></div>
+              </aside>
+            </div>
+
+            <div class="deployment-stage">
+              <div class="stage-heading">
+                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Preview the device diff first. Push then uses a five-minute confirmed commit.</p></div>
+                <span id="commitTimer" class="commit-timer ready" aria-live="polite">Ready</span>
+              </div>
+              <div class="compare-panel">
+                <div class="button-row">
+                  <button id="previewBtn" class="secondary">Run show | compare</button>
+                  <span id="previewState" class="preview-state">Preview required</span>
+                </div>
+                <pre id="compareOutput">No device comparison loaded.</pre>
+              </div>
+              <div class="button-row deployment-actions">
+                <button id="pushBtn" class="danger" disabled>Push with rollback protection</button>
+                <button id="confirmBtn" class="confirm" disabled>Confirm committed change</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="script.js"></script>
+  </body>
+</html>

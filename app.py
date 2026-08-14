@@ -1,0 +1,636 @@
+import hashlib
+import ipaddress
+import logging
+import os
+import re
+import shlex
+from pathlib import Path
+from typing import Any
+
+import paramiko
+from dotenv import dotenv_values, load_dotenv, set_key
+from flask import Flask, jsonify, request, send_from_directory
+
+APP_DIR = Path(__file__).resolve().parent
+ENV_PATH = APP_DIR / ".env"
+load_dotenv(ENV_PATH)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("junos_helper")
+
+app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
+API_VERSION = 7
+COMMIT_COMMENT = "Applied by Junos Helper"
+CONFIRM_COMMENT = "Confirmed by Junos Helper"
+SAVED_DEVICE_PREFIX = "JUNOS_DEVICE_"
+
+DISCOVERY_COMMANDS = (
+    "show interfaces terse",
+    "show vlans",
+    "show configuration vlans | display set",
+    "show version",
+    "show configuration interfaces | display set",
+    "show configuration system host-name | display set",
+)
+INTERFACE_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:(?:ge|xe|et|fe|mge)-\d+/\d+/\d+(?:/\d+)?|(?:ae|reth)\d+)(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _saved_device_id(hostname: str) -> str:
+    readable = re.sub(r"[^A-Z0-9]+", "_", hostname.upper()).strip("_")[:36] or "DEVICE"
+    digest = hashlib.sha256(hostname.lower().encode("utf-8")).hexdigest()[:8].upper()
+    return f"{readable}_{digest}"
+
+
+def _saved_devices() -> dict[str, dict[str, str]]:
+    values = dotenv_values(ENV_PATH) if ENV_PATH.exists() else {}
+    devices: dict[str, dict[str, str]] = {}
+    suffixes = {"HOSTNAME", "HOST", "USERNAME", "PASSWORD"}
+    for key, value in values.items():
+        if not key.startswith(SAVED_DEVICE_PREFIX):
+            continue
+        remainder = key[len(SAVED_DEVICE_PREFIX):]
+        device_id, separator, field = remainder.rpartition("_")
+        if not separator or field not in suffixes:
+            continue
+        devices.setdefault(device_id, {})[field.lower()] = value or ""
+    return {
+        device_id: details
+        for device_id, details in devices.items()
+        if details.get("hostname") and details.get("host") and details.get("username") and details.get("password")
+    }
+
+
+def _connection_values(payload: dict[str, Any]) -> tuple[str, str, str]:
+    device_id = str(payload.get("deviceId") or "").strip().upper()
+    saved = _saved_devices().get(device_id, {}) if re.fullmatch(r"[A-Z0-9_]{1,64}", device_id) else {}
+    host = (payload.get("host") or saved.get("host") or os.getenv("JUNOS_HOST", "")).strip()
+    username = (payload.get("username") or saved.get("username") or os.getenv("JUNOS_USERNAME", "")).strip()
+    password = payload.get("password") or saved.get("password") or os.getenv("JUNOS_PASSWORD", "")
+    return host, username, password
+
+
+def _ssh_client(host: str, username: str, password: str) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    if _env_flag("JUNOS_ALLOW_UNKNOWN_HOST_KEY"):
+        logger.info("Automatic SSH host-key acceptance is enabled for this connection")
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    client.connect(
+        hostname=host,
+        port=int(os.getenv("JUNOS_SSH_PORT", "22")),
+        username=username,
+        password=password,
+        look_for_keys=False,
+        allow_agent=False,
+        timeout=10,
+        auth_timeout=10,
+        banner_timeout=10,
+    )
+    return client
+
+
+def _run_command(client: paramiko.SSHClient, command: str) -> tuple[str, str]:
+    variants = []
+    if not command.startswith("cli"):
+        variants.append(f"cli -c {shlex.quote(command)}")
+    variants.append(command)
+
+    for variant in variants:
+        stdin, stdout, stderr = client.exec_command(variant)
+        output = stdout.read().decode("utf-8", errors="replace")
+        error = stderr.read().decode("utf-8", errors="replace")
+        combined = f"{output}\n{error}".strip()
+        if combined:
+            if "command not found" in combined.lower() or "unknown command" in combined.lower():
+                continue
+            return output, error
+    return "", ""
+
+
+def _parse_interfaces(output: str) -> list[str]:
+    matches = []
+    for line in output.splitlines():
+        for match in INTERFACE_RE.finditer(line):
+            iface = match.group(1).split(".")[0]
+            if iface not in matches:
+                matches.append(iface)
+    return matches
+
+
+def _parse_interface_details(output: str) -> list[dict[str, str]]:
+    details_by_name: dict[str, dict[str, str]] = {}
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Physical") or line.startswith("Interface"):
+            continue
+        match = INTERFACE_RE.search(line)
+        if not match:
+            continue
+        matched_name = match.group(1)
+        if "." in matched_name:
+            continue
+        iface = matched_name
+        parts = line.split()
+        admin = "unknown"
+        oper = "unknown"
+        if len(parts) >= 3:
+            admin = parts[1].lower() if parts[1].lower() in {"up", "down"} else "unknown"
+            oper = parts[2].lower() if parts[2].lower() in {"up", "down"} else "unknown"
+        details_by_name[iface] = {"name": iface, "admin": admin, "oper": oper, "raw": line}
+
+    return list(details_by_name.values())
+
+
+def _parse_vlan_memberships(output: str) -> list[dict[str, str]]:
+    memberships: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in lines:
+        lowered = line.lower()
+        if lowered.startswith(("name", "vlan", "routing instance")) or set(line) <= {"-", " ", "+"}:
+            continue
+        parts = re.split(r"\s+", line)
+        tag_index = next((index for index, part in enumerate(parts) if re.fullmatch(r"\d+", part)), None)
+        if tag_index is None or tag_index == 0:
+            continue
+        name = parts[tag_index - 1]
+        value = parts[tag_index]
+        key = (name, value)
+        if key not in seen:
+            memberships.append({"name": name, "value": value})
+            seen.add(key)
+    return memberships
+
+
+def _parse_configured_vlans(output: str) -> list[dict[str, str]]:
+    """Parse stable `set vlans NAME vlan-id TAG` configuration lines."""
+    memberships: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    pattern = re.compile(r"^set vlans\s+(\S+)\s+vlan-id\s+(\d+)\s*$", re.IGNORECASE)
+    for raw_line in output.splitlines():
+        match = pattern.match(raw_line.strip())
+        if not match:
+            continue
+        key = (match.group(1), match.group(2))
+        if key not in seen:
+            memberships.append({"name": key[0], "value": key[1]})
+            seen.add(key)
+    return memberships
+
+
+def _parse_interface_configuration(output: str) -> dict[str, dict[str, Any]]:
+    configuration: dict[str, dict[str, Any]] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^set interfaces\s+(\S+)\s+(.+)$", line)
+        if not match:
+            continue
+        interface_name = match.group(1).split(".")[0]
+        if not INTERFACE_RE.fullmatch(interface_name):
+            continue
+        remainder = match.group(2)
+        details = configuration.setdefault(interface_name, {"vlans": [], "setLines": []})
+        details["setLines"].append(line)
+
+        mode_match = re.search(r"(interface-mode|port-mode)\s+(access|trunk)\b", remainder)
+        if mode_match:
+            details["modeKeyword"] = mode_match.group(1)
+            details["mode"] = mode_match.group(2)
+
+        description_match = re.match(r"description\s+(.+)$", remainder)
+        if description_match:
+            try:
+                description_parts = shlex.split(description_match.group(1))
+            except ValueError:
+                description_parts = []
+            if description_parts:
+                details["description"] = " ".join(description_parts)
+
+        if remainder == "disable":
+            details["disabled"] = True
+
+        vlan_match = re.search(r"vlan members\s+(.+)$", remainder)
+        if vlan_match:
+            try:
+                values = shlex.split(vlan_match.group(1).replace("[", " ").replace("]", " "))
+            except ValueError:
+                values = []
+            for value in values:
+                if value not in details["vlans"]:
+                    details["vlans"].append(value)
+    return configuration
+
+
+def _configured_interface_names(configuration: dict[str, dict[str, Any]]) -> set[str]:
+    """Treat switch ports with at least one VLAN membership as configured."""
+    return {
+        name
+        for name, details in configuration.items()
+        if details.get("vlans")
+    }
+
+
+def _parse_metadata(results: list[dict[str, str]]) -> dict[str, str]:
+    combined = "\n".join(item.get("output", "") for item in results)
+    metadata: dict[str, str] = {}
+
+    # detect hostname from several possible outputs
+    hostname_matches = re.findall(r"(?:hostname|Hostname|host-name|Host-name)\s+([A-Za-z0-9._-]+)", combined, re.IGNORECASE)
+    if hostname_matches:
+        metadata["hostname"] = hostname_matches[0]
+    else:
+        # also detect from configuration output lines like: set system host-name switch01
+        m = re.search(r"set system host-name\s+([A-Za-z0-9._-]+)", combined)
+        if m:
+            metadata["hostname"] = m.group(1)
+
+    model_match = re.search(r"Model:\s*(.+)", combined, re.IGNORECASE)
+    if model_match:
+        metadata["model"] = model_match.group(1).strip()
+
+    version_match = re.search(r"Junos:\s*(.+)", combined, re.IGNORECASE)
+    if version_match:
+        metadata["version"] = version_match.group(1).strip()
+
+    serial_match = re.search(r"Serial\s+number:\s*(.+)", combined, re.IGNORECASE)
+    if serial_match:
+        metadata["serial"] = serial_match.group(1).strip()
+
+    return metadata
+
+
+@app.get("/")
+@app.get("/index.html")
+def index() -> Any:
+    return send_from_directory(APP_DIR, "index.html")
+
+
+@app.get("/styles.css")
+def stylesheet() -> Any:
+    return send_from_directory(APP_DIR, "styles.css")
+
+
+@app.get("/script.js")
+def javascript() -> Any:
+    return send_from_directory(APP_DIR, "script.js")
+
+
+@app.get("/api/health")
+def health() -> Any:
+    return jsonify({"ok": True, "apiVersion": API_VERSION})
+
+
+@app.get("/api/defaults")
+def defaults() -> Any:
+    """Return non-secret local-development defaults to the browser."""
+    return jsonify(
+        {
+            "host": os.getenv("JUNOS_HOST", ""),
+            "username": os.getenv("JUNOS_USERNAME", ""),
+        }
+    )
+
+
+def _public_saved_devices() -> list[dict[str, str]]:
+    def device_sort_key(device: dict[str, str]) -> tuple[int, int | str, str]:
+        try:
+            address = ipaddress.ip_address(device["host"])
+            return (0 if address.version == 4 else 1, int(address), device["hostname"].lower())
+        except ValueError:
+            return (2, device["host"].lower(), device["hostname"].lower())
+
+    return sorted(
+        (
+            {
+                "id": device_id,
+                "hostname": details["hostname"],
+                "host": details["host"],
+                "username": details["username"],
+            }
+            for device_id, details in _saved_devices().items()
+        ),
+        key=device_sort_key,
+    )
+
+
+@app.get("/api/devices")
+def saved_devices() -> Any:
+    return jsonify({"ok": True, "devices": _public_saved_devices()})
+
+
+@app.post("/api/devices")
+def save_device() -> Any:
+    payload = request.get_json(silent=True) or {}
+    hostname = str(payload.get("hostname") or "").strip()
+    host, username, password = _connection_values(payload)
+    if not hostname or not re.fullmatch(r"[A-Za-z0-9._-]{1,253}", hostname):
+        return jsonify({"ok": False, "error": "A valid discovered device hostname is required."}), 400
+    if not host or not username or not password:
+        return jsonify({"ok": False, "error": "Host, username, and password are required to save a device."}), 400
+
+    device_id = _saved_device_id(hostname)
+    values = {
+        "HOSTNAME": hostname,
+        "HOST": host,
+        "USERNAME": username,
+        "PASSWORD": password,
+    }
+    try:
+        for field, value in values.items():
+            key = f"{SAVED_DEVICE_PREFIX}{device_id}_{field}"
+            set_key(str(ENV_PATH), key, value, quote_mode="always")
+            os.environ[key] = value
+    except OSError as exc:
+        logger.warning("Unable to save device %s: %s", hostname, exc)
+        return jsonify({"ok": False, "error": f"Unable to update {ENV_PATH.name}: {exc}"}), 500
+
+    device = next(item for item in _public_saved_devices() if item["id"] == device_id)
+    logger.info("Saved local connection profile for %s", hostname)
+    return jsonify({"ok": True, "device": device})
+
+
+@app.post("/api/connect")
+def connect_switch() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, username, password = _connection_values(payload)
+
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+
+    client: paramiko.SSHClient | None = None
+
+    try:
+        client = _ssh_client(host, username, password)
+        results = []
+        for command in DISCOVERY_COMMANDS:
+            output, error = _run_command(client, command)
+            results.append({"command": command, "output": output, "error": error})
+
+        parsed_interface_names: list[str] = []
+        interface_details: list[dict[str, str]] = []
+        vlan_memberships_by_name: dict[str, dict[str, str]] = {}
+        for item in results:
+            if item["command"].startswith("show interfaces"):
+                parsed_interface_names.extend(_parse_interfaces(item["output"]))
+                interface_details.extend(_parse_interface_details(item["output"]))
+            if item["command"] == "show vlans":
+                for vlan in _parse_vlan_memberships(item["output"]):
+                    vlan_memberships_by_name[vlan["name"]] = vlan
+            if item["command"].startswith("show configuration vlans"):
+                for vlan in _parse_configured_vlans(item["output"]):
+                    vlan_memberships_by_name[vlan["name"]] = vlan
+
+        parsed_interface_names = list(dict.fromkeys(parsed_interface_names))
+        # collect configured interfaces from any configuration output
+        interface_configuration: dict[str, dict[str, Any]] = {}
+        for item in results:
+            cmd = item.get("command", "")
+            out = item.get("output", "") or ""
+            if "show configuration interfaces" in cmd:
+                interface_configuration.update(_parse_interface_configuration(out))
+
+        configured_interfaces = _configured_interface_names(interface_configuration)
+
+        # mark configured flag on interface details where applicable
+        for d in interface_details:
+            name = d.get("name", "")
+            configured = interface_configuration.get(name, {})
+            d["configured"] = name in configured_interfaces
+            d["vlans"] = configured.get("vlans", [])
+            for field in ("mode", "modeKeyword", "description", "disabled", "setLines"):
+                if field in configured:
+                    d[field] = configured[field]
+
+        metadata = _parse_metadata(results)
+        logger.info("Discovery completed for %s: interfaces=%s metadata=%s", host, parsed_interface_names, metadata)
+        return jsonify(
+            {
+                "ok": True,
+                "host": host,
+                "results": results,
+                "interfaces": parsed_interface_names,
+                "portCount": len(parsed_interface_names),
+                "metadata": metadata,
+                "deviceName": metadata.get("hostname") or host,
+                "interfaceDetails": interface_details,
+                "vlanMemberships": sorted(
+                    vlan_memberships_by_name.values(), key=lambda vlan: (int(vlan["value"]), vlan["name"])
+                ),
+                "configuredInterfaces": list(configured_interfaces),
+                "interfaceConfiguration": interface_configuration,
+                "debug": {
+                    "interfaceCount": len(parsed_interface_names),
+                    "vlanCount": len(vlan_memberships_by_name),
+                    "configuredInterfaceCount": len(configured_interfaces),
+                    "rawCommands": [item["command"] for item in results],
+                },
+            }
+        )
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        logger.warning("Discovery failed for %s: %s", host, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _validated_config_lines(config_text: str) -> list[str]:
+    if len(config_text) > 65536:
+        raise ValueError("Configuration is too large.")
+
+    commands: list[str] = []
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if any(token in line for token in (";", "`", "$(", "\x00")):
+            raise ValueError(f"Unsafe command delimiter in line: {line}")
+        try:
+            parts = shlex.split(line)
+        except ValueError as exc:
+            raise ValueError(f"Invalid quoting in line: {line}") from exc
+        if len(parts) < 3 or parts[0] not in {"set", "delete"}:
+            raise ValueError("Only approved interface and VLAN commands are allowed.")
+        if parts[1] == "interfaces":
+            if not INTERFACE_RE.fullmatch(parts[2].split(".")[0]):
+                raise ValueError(f"Unsupported interface name: {parts[2]}")
+            if len(parts) == 3 and parts[0] != "delete":
+                raise ValueError("A complete interface command is required.")
+        elif parts[1] == "vlans":
+            if parts[0] != "set" or len(parts) != 5 or parts[3] != "vlan-id":
+                raise ValueError("Only 'set vlans NAME vlan-id ID' VLAN commands are allowed.")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", parts[2]):
+                raise ValueError(f"Unsupported VLAN name: {parts[2]}")
+            if not parts[4].isdigit() or not 1 <= int(parts[4]) <= 4094:
+                raise ValueError(f"VLAN ID must be between 1 and 4094: {parts[4]}")
+        else:
+            raise ValueError("Only approved interface and VLAN commands are allowed.")
+        commands.append(line)
+
+    if not commands:
+        raise ValueError("No actionable Junos commands found.")
+    if len(commands) > 500:
+        raise ValueError("Configuration contains too many commands.")
+    return commands
+
+
+def _execute_cli(client: paramiko.SSHClient, cli_commands: str) -> tuple[str, str, int]:
+    remote_command = f"cli -c {shlex.quote(cli_commands)}"
+    _, stdout, stderr = client.exec_command(remote_command, timeout=60)
+    output = stdout.read().decode("utf-8", errors="replace")
+    error = stderr.read().decode("utf-8", errors="replace")
+    exit_status = stdout.channel.recv_exit_status()
+    return output, error, exit_status
+
+
+def _clean_compare_output(output: str) -> str:
+    noise = {"entering configuration mode", "exiting configuration mode"}
+    return "\n".join(line for line in output.splitlines() if line.strip().lower() not in noise).strip()
+
+
+def _cli_failure_message(output: str, error: str, fallback: str) -> str:
+    """Prefer actionable Junos CLI text, which is commonly written to stdout."""
+    lines = [line.strip() for line in f"{error}\n{output}".splitlines() if line.strip()]
+    actionable = [
+        line for line in lines
+        if any(marker in line.lower() for marker in ("error", "failed", "warning", "permission", "required"))
+    ]
+    message = "\n".join(actionable or lines[-4:])
+    return message[:2000] or fallback
+
+
+@app.post("/api/preview")
+def preview_config() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, username, password = _connection_values(payload)
+    config_text = (payload.get("config") or "").strip()
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+    try:
+        commands = _validated_config_lines(config_text)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    client: paramiko.SSHClient | None = None
+    try:
+        client = _ssh_client(host, username, password)
+        combined = "; ".join(commands)
+        output, error, exit_status = _execute_cli(
+            client,
+            f"configure private; {combined}; show | compare; rollback 0; exit",
+        )
+        combined_output = f"{output}\n{error}".lower()
+        if exit_status != 0 or any(marker in combined_output for marker in ("error:", "syntax error")):
+            return jsonify({"ok": False, "error": error.strip() or "Preview failed.", "output": output.strip()}), 500
+        return jsonify({"ok": True, "compare": _clean_compare_output(output), "error": error.strip()})
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        logger.warning("Preview failed for %s: %s", host, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if client is not None:
+            client.close()
+
+
+@app.post("/api/push")
+def push_config() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, username, password = _connection_values(payload)
+    config_text = (payload.get("config") or "").strip()
+
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+    if not config_text:
+        return jsonify({"ok": False, "error": "No configuration provided."}), 400
+
+    try:
+        commands = _validated_config_lines(config_text)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    client: paramiko.SSHClient | None = None
+
+    try:
+        client = _ssh_client(host, username, password)
+        combined = "; ".join(commands)
+        output, error, exit_status = _execute_cli(
+            client,
+            f'configure exclusive; {combined}; commit check; commit confirmed 5 comment "{COMMIT_COMMENT}"; exit',
+        )
+        combined_output = f"{output}\n{error}".lower()
+        failure_markers = ("error:", "commit failed", "configuration check-out failed", "syntax error")
+        success = "commit complete" in combined_output or "commit confirmed" in combined_output
+        if exit_status != 0 or not success or any(marker in combined_output for marker in failure_markers):
+            message = _cli_failure_message(output, error, "Commit did not complete.")
+            logger.warning("Commit rejected by %s (status %s): %s", host, exit_status, message)
+            return jsonify(
+                {"ok": False, "error": message, "output": output.strip()}
+            ), 502
+
+        return jsonify(
+            {
+                "ok": True,
+                "output": output.strip(),
+                "error": error.strip(),
+                "pendingConfirmation": True,
+                "confirmMinutes": 5,
+            }
+        )
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        logger.warning("Push failed for %s: %s", host, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if client is not None:
+            client.close()
+
+
+@app.post("/api/confirm")
+def confirm_config() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, username, password = _connection_values(payload)
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+
+    client: paramiko.SSHClient | None = None
+    try:
+        client = _ssh_client(host, username, password)
+        output, error, exit_status = _execute_cli(
+            client,
+            f'configure exclusive; commit comment "{CONFIRM_COMMENT}"; exit',
+        )
+        combined_output = f"{output}\n{error}".lower()
+        if exit_status != 0 or "commit complete" not in combined_output or "error:" in combined_output:
+            message = _cli_failure_message(output, error, "Commit confirmation failed.")
+            logger.warning("Commit confirmation rejected by %s (status %s): %s", host, exit_status, message)
+            return jsonify(
+                {"ok": False, "error": message, "output": output.strip()}
+            ), 502
+        return jsonify({"ok": True, "output": output.strip(), "error": error.strip()})
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        logger.warning("Commit confirmation failed for %s: %s", host, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if client is not None:
+            client.close()
+
+
+if __name__ == "__main__":
+    app.run(
+        host=os.getenv("JUNOS_BIND_HOST", "127.0.0.1"),
+        port=int(os.getenv("JUNOS_BIND_PORT", "8000")),
+        debug=_env_flag("JUNOS_DEBUG"),
+    )
