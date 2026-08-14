@@ -2,6 +2,8 @@
 
 A local Flask web app for discovering Junos switch ports and VLANs, selecting ports visually, generating `set`/`delete` commands, and applying interface changes with rollback protection.
 
+Release history is maintained in the [changelog](CHANGELOG.md).
+
 ## Change workflows
 
 - Select one port, a two-click contiguous range, or an arbitrary multi-selection.
