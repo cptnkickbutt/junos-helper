@@ -4,15 +4,53 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import sys
+import threading
+import webbrowser
 from pathlib import Path
 from typing import Any
 
 import paramiko
 from dotenv import dotenv_values, load_dotenv, set_key
 from flask import Flask, jsonify, request, send_from_directory
+from mac_vendor_lookup import BaseMacLookup, InvalidMacError, MacLookup, VendorNotFoundError
 
 APP_DIR = Path(__file__).resolve().parent
-ENV_PATH = APP_DIR / ".env"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+VENDOR_DATABASE = RESOURCE_DIR / "mac-vendors.txt"
+if not VENDOR_DATABASE.is_file():
+    VENDOR_DATABASE = Path(sys.prefix) / "cache" / "mac-vendors.txt"
+BaseMacLookup.cache_path = str(VENDOR_DATABASE)
+MAC_LOOKUP = MacLookup() if VENDOR_DATABASE.is_file() else None
+
+
+def _environment_path() -> Path:
+    """Keep mutable configuration outside a frozen executable."""
+    override = os.getenv("JUNOS_HELPER_ENV_PATH")
+    if override:
+        return Path(override).expanduser().resolve()
+    if not IS_FROZEN:
+        return APP_DIR / ".env"
+    local_app_data = os.getenv("LOCALAPPDATA")
+    base_dir = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    return base_dir / "Junos Helper" / ".env"
+
+
+def _prepare_environment(path: Path) -> None:
+    if not IS_FROZEN or path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for seed_path in (RESOURCE_DIR / "seed.env", RESOURCE_DIR / ".env"):
+        if seed_path.is_file():
+            shutil.copyfile(seed_path, path)
+            return
+    path.touch()
+
+
+ENV_PATH = _environment_path()
+_prepare_environment(ENV_PATH)
 load_dotenv(ENV_PATH)
 
 logging.basicConfig(level=logging.INFO)
@@ -20,13 +58,16 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-API_VERSION = 7
+API_VERSION = 12
 COMMIT_COMMENT = "Applied by Junos Helper"
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
 SAVED_DEVICE_PREFIX = "JUNOS_DEVICE_"
 
 DISCOVERY_COMMANDS = (
     "show interfaces terse",
+    "show interfaces media",
+    "show ethernet-switching table",
+    "show lldp neighbors detail",
     "show vlans",
     "show configuration vlans | display set",
     "show version",
@@ -156,6 +197,149 @@ def _parse_interface_details(output: str) -> list[dict[str, str]]:
     return list(details_by_name.values())
 
 
+def _normalize_interface_speed(value: str) -> str:
+    speed = value.strip()
+    speed = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", speed)
+    speed = re.sub(r"\bmbps\b", "Mbps", speed, flags=re.IGNORECASE)
+    speed = re.sub(r"\bgbps\b", "Gbps", speed, flags=re.IGNORECASE)
+    speed = re.sub(r"\btbps\b", "Tbps", speed, flags=re.IGNORECASE)
+    if speed.lower() in {"", "unknown", "unspecified", "auto"}:
+        return ""
+    numeric_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s+(Mbps|Gbps|Tbps)", speed, re.IGNORECASE)
+    if not numeric_match:
+        return speed
+    amount = float(numeric_match.group(1))
+    unit = numeric_match.group(2).lower()
+    if unit == "mbps" and amount >= 1000:
+        amount /= 1000
+        unit = "gbps"
+    elif unit == "gbps" and amount >= 1000:
+        amount /= 1000
+        unit = "tbps"
+    formatted_amount = f"{amount:g}"
+    display_unit = {"mbps": "Mbps", "gbps": "Gbps", "tbps": "Tbps"}[unit]
+    return f"{formatted_amount} {display_unit}"
+
+
+def _parse_interface_speeds(output: str) -> dict[str, dict[str, str]]:
+    """Collect configured/capable and negotiated rates for physical interfaces."""
+    speeds: dict[str, dict[str, str]] = {}
+    current_interface = ""
+    for raw_line in output.splitlines():
+        physical_match = re.match(r"^\s*Physical interface\s*:\s*(\S+)", raw_line, re.IGNORECASE)
+        if physical_match:
+            candidate = physical_match.group(1).rstrip(",").split(".")[0]
+            current_interface = candidate if INTERFACE_RE.fullmatch(candidate) else ""
+            if current_interface:
+                speeds.setdefault(current_interface, {})
+        if not current_interface:
+            continue
+        configured_match = re.search(r"(?:^|,)\s*Speed\s*:\s*([^,]+)", raw_line, re.IGNORECASE)
+        partner_match = re.search(r"Link partner Speed\s*:\s*([^,]+)", raw_line, re.IGNORECASE)
+        if configured_match:
+            configured = _normalize_interface_speed(configured_match.group(1))
+            if configured:
+                speeds[current_interface]["capability"] = configured
+        if partner_match:
+            negotiated = _normalize_interface_speed(partner_match.group(1))
+            if negotiated:
+                speeds[current_interface]["negotiated"] = negotiated
+    return {name: rates for name, rates in speeds.items() if rates}
+
+
+MAC_RE = re.compile(r"\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b", re.IGNORECASE)
+
+
+def _mac_manufacturer(mac: str) -> str:
+    """Resolve a globally assigned MAC against the bundled offline OUI database."""
+    if not MAC_LOOKUP or not MAC_RE.fullmatch(mac):
+        return ""
+    first_octet = int(mac[:2], 16)
+    if first_octet & 0b10:
+        return ""
+    try:
+        return MAC_LOOKUP.lookup(mac)
+    except (InvalidMacError, VendorNotFoundError):
+        return ""
+
+
+def _parse_ethernet_switching_table(output: str) -> dict[str, list[dict[str, str]]]:
+    """Collect learned MAC entries by physical interface from common Junos table formats."""
+    entries: dict[str, list[dict[str, str]]] = {}
+    for raw_line in output.splitlines():
+        mac_match = MAC_RE.search(raw_line)
+        interface_matches = list(INTERFACE_RE.finditer(raw_line))
+        if not mac_match or not interface_matches:
+            continue
+        interface_name = interface_matches[-1].group(1).split(".")[0]
+        before_mac = [token for token in raw_line[:mac_match.start()].split() if token not in {"*", "-"}]
+        vlan = before_mac[-1] if before_mac else ""
+        entry = {"mac": mac_match.group(0).lower()}
+        manufacturer = _mac_manufacturer(entry["mac"])
+        if manufacturer:
+            entry["manufacturer"] = manufacturer
+        if vlan and vlan.lower() not in {"mac", "address"}:
+            entry["vlan"] = vlan
+        interface_entries = entries.setdefault(interface_name, [])
+        if entry not in interface_entries:
+            interface_entries.append(entry)
+    return entries
+
+
+def _parse_lldp_neighbors(output: str) -> dict[str, dict[str, str]]:
+    """Parse the labeled blocks returned by `show lldp neighbors detail`."""
+    neighbors: dict[str, dict[str, str]] = {}
+    current_interface = ""
+    field_names = {
+        "chassis id": "chassisId",
+        "port id": "portId",
+        "port description": "portDescription",
+        "system name": "systemName",
+        "system description": "systemDescription",
+        "system capabilities": "systemCapabilities",
+        "enabled capabilities": "enabledCapabilities",
+        "med manufacturer name": "manufacturer",
+        "manufacturer name": "manufacturer",
+        "med model name": "model",
+        "model name": "model",
+    }
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        local_match = re.match(r"^Local interface\s*:\s*(\S+)", line, re.IGNORECASE)
+        if local_match:
+            candidate = local_match.group(1).split(".")[0]
+            current_interface = candidate if INTERFACE_RE.fullmatch(candidate) else ""
+            if current_interface:
+                neighbors.setdefault(current_interface, {})
+            continue
+        if not current_interface:
+            continue
+        field_match = re.match(r"^([^:]+?)\s*:\s*(.*)$", line)
+        if not field_match:
+            continue
+        target = field_names.get(field_match.group(1).strip().lower())
+        value = field_match.group(2).strip()
+        if target and value and value != "-":
+            neighbors[current_interface][target] = value
+    return neighbors
+
+
+def _enrich_lldp_neighbor(
+    neighbor: dict[str, str], learned_macs: list[dict[str, str]]
+) -> dict[str, str]:
+    enriched = dict(neighbor)
+    if not enriched.get("manufacturer"):
+        enriched["manufacturer"] = _mac_manufacturer(enriched.get("chassisId", ""))
+    if not enriched.get("manufacturer"):
+        manufacturers = {entry.get("manufacturer", "") for entry in learned_macs}
+        manufacturers.discard("")
+        if len(manufacturers) == 1:
+            enriched["manufacturer"] = manufacturers.pop()
+    if not enriched.get("manufacturer"):
+        enriched.pop("manufacturer", None)
+    return enriched
+
+
 def _parse_vlan_memberships(output: str) -> list[dict[str, str]]:
     memberships: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -277,17 +461,17 @@ def _parse_metadata(results: list[dict[str, str]]) -> dict[str, str]:
 @app.get("/")
 @app.get("/index.html")
 def index() -> Any:
-    return send_from_directory(APP_DIR, "index.html")
+    return send_from_directory(RESOURCE_DIR, "index.html")
 
 
 @app.get("/styles.css")
 def stylesheet() -> Any:
-    return send_from_directory(APP_DIR, "styles.css")
+    return send_from_directory(RESOURCE_DIR, "styles.css")
 
 
 @app.get("/script.js")
 def javascript() -> Any:
-    return send_from_directory(APP_DIR, "script.js")
+    return send_from_directory(RESOURCE_DIR, "script.js")
 
 
 @app.get("/api/health")
@@ -382,12 +566,21 @@ def connect_switch() -> Any:
             results.append({"command": command, "output": output, "error": error})
 
         parsed_interface_names: list[str] = []
-        interface_details: list[dict[str, str]] = []
+        interface_details: list[dict[str, Any]] = []
+        learned_macs_by_interface: dict[str, list[dict[str, str]]] = {}
+        lldp_neighbors_by_interface: dict[str, dict[str, str]] = {}
+        interface_speeds_by_name: dict[str, dict[str, str]] = {}
         vlan_memberships_by_name: dict[str, dict[str, str]] = {}
         for item in results:
             if item["command"].startswith("show interfaces"):
                 parsed_interface_names.extend(_parse_interfaces(item["output"]))
                 interface_details.extend(_parse_interface_details(item["output"]))
+            if item["command"] == "show ethernet-switching table":
+                learned_macs_by_interface = _parse_ethernet_switching_table(item["output"])
+            if item["command"] == "show interfaces media":
+                interface_speeds_by_name = _parse_interface_speeds(item["output"])
+            if item["command"] == "show lldp neighbors detail":
+                lldp_neighbors_by_interface = _parse_lldp_neighbors(item["output"])
             if item["command"] == "show vlans":
                 for vlan in _parse_vlan_memberships(item["output"]):
                     vlan_memberships_by_name[vlan["name"]] = vlan
@@ -415,6 +608,20 @@ def connect_switch() -> Any:
             for field in ("mode", "modeKeyword", "description", "disabled", "setLines"):
                 if field in configured:
                     d[field] = configured[field]
+            d["learnedMacs"] = learned_macs_by_interface.get(name, [])
+            if name in interface_speeds_by_name:
+                rates = interface_speeds_by_name[name]
+                if "capability" in rates:
+                    d["speedCapability"] = rates["capability"]
+                if "negotiated" in rates:
+                    d["negotiatedSpeed"] = rates["negotiated"]
+                elif re.match(r"^(?:xe|et)-", name, re.IGNORECASE) and d.get("oper") == "up":
+                    # Fixed-rate optical interface names reflect the active physical rate.
+                    d["negotiatedSpeed"] = rates.get("capability", "")
+            if name in lldp_neighbors_by_interface:
+                d["lldpNeighbor"] = _enrich_lldp_neighbor(
+                    lldp_neighbors_by_interface[name], d["learnedMacs"]
+                )
 
         metadata = _parse_metadata(results)
         logger.info("Discovery completed for %s: interfaces=%s metadata=%s", host, parsed_interface_names, metadata)
@@ -629,8 +836,13 @@ def confirm_config() -> Any:
 
 
 if __name__ == "__main__":
+    bind_host = os.getenv("JUNOS_BIND_HOST", "127.0.0.1")
+    bind_port = int(os.getenv("JUNOS_BIND_PORT", "8000"))
+    if IS_FROZEN and bind_host in {"127.0.0.1", "localhost"}:
+        threading.Timer(1.0, webbrowser.open, args=(f"http://127.0.0.1:{bind_port}",)).start()
     app.run(
-        host=os.getenv("JUNOS_BIND_HOST", "127.0.0.1"),
-        port=int(os.getenv("JUNOS_BIND_PORT", "8000")),
+        host=bind_host,
+        port=bind_port,
         debug=_env_flag("JUNOS_DEBUG"),
+        use_reloader=False,
     )

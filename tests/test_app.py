@@ -3,14 +3,20 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import app as app_module
 from app import (
     _clean_compare_output,
     _cli_failure_message,
     _connection_values,
     _configured_interface_names,
+    _enrich_lldp_neighbor,
+    _mac_manufacturer,
     _parse_interface_details,
+    _parse_interface_speeds,
     _parse_interface_configuration,
     _parse_interfaces,
+    _parse_ethernet_switching_table,
+    _parse_lldp_neighbors,
     _parse_configured_vlans,
     _parse_vlan_memberships,
     _run_command,
@@ -18,6 +24,36 @@ from app import (
     _validated_config_lines,
     app,
 )
+
+
+class PackagedEnvironmentTests(unittest.TestCase):
+    def test_packaged_environment_uses_local_app_data(self) -> None:
+        with patch.object(app_module, "IS_FROZEN", True), patch.dict(
+            app_module.os.environ, {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}, clear=False
+        ):
+            self.assertEqual(
+                app_module._environment_path(),
+                Path(r"C:\Users\tester\AppData\Local") / "Junos Helper" / ".env",
+            )
+
+    def test_packaged_environment_copies_seed_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            resource_dir = base / "resources"
+            resource_dir.mkdir()
+            seed = resource_dir / ".env"
+            seed.write_text("JUNOS_HOST=192.0.2.10\n", encoding="utf-8")
+            destination = base / "data" / ".env"
+
+            with patch.object(app_module, "IS_FROZEN", True), patch.object(
+                app_module, "RESOURCE_DIR", resource_dir
+            ):
+                app_module._prepare_environment(destination)
+                self.assertEqual(destination.read_text(encoding="utf-8"), "JUNOS_HOST=192.0.2.10\n")
+
+                seed.write_text("JUNOS_HOST=192.0.2.20\n", encoding="utf-8")
+                app_module._prepare_environment(destination)
+                self.assertEqual(destination.read_text(encoding="utf-8"), "JUNOS_HOST=192.0.2.10\n")
 
 
 class RunCommandTests(unittest.TestCase):
@@ -62,6 +98,59 @@ class SSHClientTests(unittest.TestCase):
 
 
 class DiscoveryParsingTests(unittest.TestCase):
+    def test_parse_ethernet_switching_table_groups_macs_by_physical_port(self) -> None:
+        output = "\n".join([
+            "VLAN              MAC address       Type         Age Interfaces",
+            "CAMERAS           00:11:22:33:44:55 Learn          0 ge-0/0/2.0",
+            "VOICE             aa:bb:cc:dd:ee:ff Learn          4 ge-0/0/2.0",
+        ])
+
+        with patch("app._mac_manufacturer", return_value="Test Vendor"):
+            parsed = _parse_ethernet_switching_table(output)
+
+        self.assertEqual(parsed, {
+            "ge-0/0/2": [
+                {"mac": "00:11:22:33:44:55", "manufacturer": "Test Vendor", "vlan": "CAMERAS"},
+                {"mac": "aa:bb:cc:dd:ee:ff", "manufacturer": "Test Vendor", "vlan": "VOICE"},
+            ]
+        })
+
+    def test_parse_lldp_neighbor_detail_collects_device_identity(self) -> None:
+        output = "\n".join([
+            "LLDP Neighbor Information:",
+            "Local interface    : ge-0/0/2.0",
+            "Chassis ID         : 00:11:22:33:44:55",
+            "Port ID            : GigabitEthernet1/0/24",
+            "Port description   : Uplink to closet",
+            "System name        : camera-sw-01",
+            "System description : Juniper Networks EX2300",
+            "System capabilities: Bridge Router",
+            "Enabled capabilities: Bridge",
+            "MED Manufacturer name: Juniper Networks",
+            "MED Model name     : EX2300",
+        ])
+
+        self.assertEqual(_parse_lldp_neighbors(output)["ge-0/0/2"], {
+            "chassisId": "00:11:22:33:44:55",
+            "portId": "GigabitEthernet1/0/24",
+            "portDescription": "Uplink to closet",
+            "systemName": "camera-sw-01",
+            "systemDescription": "Juniper Networks EX2300",
+            "systemCapabilities": "Bridge Router",
+            "enabledCapabilities": "Bridge",
+            "manufacturer": "Juniper Networks",
+            "model": "EX2300",
+        })
+
+    def test_mac_manufacturer_uses_offline_database_and_ignores_private_addresses(self) -> None:
+        self.assertEqual(_mac_manufacturer("00:05:85:00:00:01"), "Juniper Networks")
+        self.assertEqual(_mac_manufacturer("02:00:00:00:00:01"), "")
+
+    @patch("app._mac_manufacturer", return_value="Juniper Networks")
+    def test_lldp_neighbor_manufacturer_falls_back_to_chassis_oui(self, _lookup: Mock) -> None:
+        enriched = _enrich_lldp_neighbor({"chassisId": "00:05:85:00:00:01"}, [])
+        self.assertEqual(enriched["manufacturer"], "Juniper Networks")
+
     def test_parse_interface_details_includes_admin_state(self) -> None:
         output = "\n".join([
             "admin up",
@@ -77,6 +166,23 @@ class DiscoveryParsingTests(unittest.TestCase):
         self.assertEqual(details[1]["name"], "ge-0/0/1")
         self.assertEqual(details[1]["admin"], "down")
         self.assertEqual(details[1]["oper"], "up")
+
+    def test_parse_interface_speeds_collects_physical_media_rate(self) -> None:
+        output = "\n".join([
+            "Physical interface: ge-0/0/0, Enabled, Physical link is Up",
+            "  Link-level type: Ethernet, MTU: 1514, Speed: 1000mbps, BPDU Error: None",
+            "  Link mode: Full-duplex, Flow control: None, Remote fault: OK, Link partner Speed: 100 Mbps",
+            "Physical interface: mge-0/0/1, Enabled, Physical link is Up",
+            "  Link-level type: Ethernet, MTU: 1514, Speed: 2500Mbps, BPDU Error: None",
+            "  Link mode: Full-duplex, Flow control: None, Remote fault: OK, Link partner Speed: 2.5Gbps",
+            "Physical interface: ge-0/0/2, Enabled, Physical link is Down",
+            "  Link-level type: Ethernet, MTU: 1514, Speed: Unspecified, BPDU Error: None",
+        ])
+
+        self.assertEqual(_parse_interface_speeds(output), {
+            "ge-0/0/0": {"capability": "1 Gbps", "negotiated": "100 Mbps"},
+            "mge-0/0/1": {"capability": "2.5 Gbps", "negotiated": "2.5 Gbps"},
+        })
 
     def test_parse_vlan_memberships_extracts_names_and_values(self) -> None:
         output = "\n".join([
@@ -342,6 +448,20 @@ class ApiSafetyTests(unittest.TestCase):
         def discovery_output(_client: Mock, command: str) -> tuple[str, str]:
             if command == "show interfaces terse":
                 return "ge-0/0/1 down down\nge-0/0/2 up up", ""
+            if command == "show interfaces media":
+                return "\n".join([
+                    "Physical interface: ge-0/0/2, Enabled, Physical link is Up",
+                    "  Link-level type: Ethernet, MTU: 1514, Speed: 1000mbps, BPDU Error: None",
+                    "  Link mode: Full-duplex, Flow control: None, Remote fault: OK, Link partner Speed: 100 Mbps",
+                ]), ""
+            if command == "show ethernet-switching table":
+                return "CAMERAS 00:11:22:33:44:55 Learn 0 ge-0/0/2.0", ""
+            if command == "show lldp neighbors detail":
+                return "\n".join([
+                    "Local interface : ge-0/0/2.0",
+                    "System name : camera-01",
+                    "Port description : Lobby camera",
+                ]), ""
             if command == "show configuration interfaces | display set":
                 return "\n".join([
                     'set interfaces ge-0/0/1 description "XX_UNUSED"',
@@ -365,6 +485,12 @@ class ApiSafetyTests(unittest.TestCase):
         self.assertEqual(payload["configuredInterfaces"], ["ge-0/0/2"])
         self.assertFalse(details["ge-0/0/1"]["configured"])
         self.assertTrue(details["ge-0/0/2"]["configured"])
+        self.assertEqual(details["ge-0/0/2"]["negotiatedSpeed"], "100 Mbps")
+        self.assertEqual(details["ge-0/0/2"]["speedCapability"], "1 Gbps")
+        self.assertEqual(details["ge-0/0/2"]["learnedMacs"], [
+            {"mac": "00:11:22:33:44:55", "manufacturer": "CIMSYS Inc", "vlan": "CAMERAS"}
+        ])
+        self.assertEqual(details["ge-0/0/2"]["lldpNeighbor"]["systemName"], "camera-01")
 
     @patch("app._execute_cli")
     @patch("app._ssh_client")

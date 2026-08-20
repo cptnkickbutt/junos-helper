@@ -71,12 +71,22 @@
             <div class="button-row inventory-actions">
               <button id="selectAllBtn">Select all</button>
               <button id="clearSelectionBtn" class="secondary">Clear selection</button>
+              <div class="mac-view-controls">
+                <select id="macViewScope" aria-label="Learned MAC view scope">
+                  <option value="selected">Selected ports</option>
+                  <option value="local" selected>Local switch</option>
+                  <option value="uplinks">Uplink candidates</option>
+                  <option value="all">All learned</option>
+                </select>
+                <button id="viewMacsBtn" class="secondary" type="button" disabled>View MACs</button>
+              </div>
               <button id="richardViewBtn" class="secondary" type="button" aria-pressed="false" title="Because sometimes 108 pixels is simply not enough.">Richard View</button>
             </div>
             <div class="port-legend" aria-label="Port status legend">
-              <span><i class="legend-swatch state-up"></i> Link up</span>
-              <span><i class="legend-swatch state-down"></i> Link down</span>
-              <span><i class="legend-dot"></i> Configured (VLAN assigned)</span>
+              <span title="Operational link is up"><i class="legend-swatch state-up"></i> Up</span>
+              <span title="Operational link is down"><i class="legend-swatch state-down"></i> Down</span>
+              <span title="Port is configured with a VLAN"><i class="legend-dot"></i> VLAN</span>
+              <span title="Port is administratively disabled"><i class="legend-dot disabled"></i> Disabled</span>
             </div>
           </div>
 
@@ -212,6 +222,30 @@
         </section>
       </main>
     </div>
+    <dialog id="learnedMacDialog" class="learned-mac-dialog" aria-labelledby="learnedMacDialogTitle">
+      <div class="dialog-heading">
+        <div>
+          <p class="section-label">Selected interfaces</p>
+          <h2 id="learnedMacDialogTitle">Learned MAC addresses</h2>
+        </div>
+        <button id="closeMacDialogBtn" class="dialog-close secondary" type="button" aria-label="Close learned MAC addresses" title="Close">&times;</button>
+      </div>
+      <p id="learnedMacDialogSummary" class="muted"></p>
+      <div class="learned-mac-filters">
+        <label>Search<input id="learnedMacSearch" type="search" placeholder="MAC, manufacturer, or interface" /></label>
+        <label>VLAN<select id="learnedMacVlanFilter"><option value="">All VLANs</option></select></label>
+        <div class="learned-mac-sort">
+          <label>Sort<select id="learnedMacSort">
+            <option value="port">Port</option>
+            <option value="mac">MAC address</option>
+            <option value="manufacturer">Manufacturer</option>
+            <option value="vlan">VLAN</option>
+          </select></label>
+          <button id="learnedMacSortDirection" class="secondary" type="button" aria-label="Sort descending" title="Sort descending" aria-pressed="false">&uarr;</button>
+        </div>
+      </div>
+      <div id="learnedMacDialogContent" class="learned-mac-content"></div>
+    </dialog>
     <script src="script.js"></script>
   </body>
 </html>

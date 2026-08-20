@@ -10,6 +10,9 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 *.log
+build/
+dist/
+*.spec
 .idea/
 .vscode/
 .DS_Store

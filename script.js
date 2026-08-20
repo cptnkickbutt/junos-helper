@@ -17,7 +17,7 @@ const state = {
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 7;
+const REQUIRED_API_VERSION = 12;
 
 const hostInput = document.getElementById("host");
 const usernameInput = document.getElementById("username");
@@ -45,6 +45,15 @@ const refreshIntervalInput = document.getElementById("refreshInterval");
 const refreshNowBtn = document.getElementById("refreshNowBtn");
 const lastRefresh = document.getElementById("lastRefresh");
 const richardViewBtn = document.getElementById("richardViewBtn");
+const viewMacsBtn = document.getElementById("viewMacsBtn");
+const macViewScopeInput = document.getElementById("macViewScope");
+const learnedMacDialog = document.getElementById("learnedMacDialog");
+const learnedMacDialogSummary = document.getElementById("learnedMacDialogSummary");
+const learnedMacDialogContent = document.getElementById("learnedMacDialogContent");
+const learnedMacSearchInput = document.getElementById("learnedMacSearch");
+const learnedMacVlanFilter = document.getElementById("learnedMacVlanFilter");
+const learnedMacSortInput = document.getElementById("learnedMacSort");
+const learnedMacSortDirectionBtn = document.getElementById("learnedMacSortDirection");
 const pushBtn = document.getElementById("pushBtn");
 const commitTimer = document.getElementById("commitTimer");
 const deploymentHint = document.getElementById("deploymentHint");
@@ -337,6 +346,10 @@ async function connectToSwitch({ isRefresh = false } = {}) {
             currentMode: detail.mode || configuration.mode || "unknown",
             currentDescription: detail.description || configuration.description || "",
             currentDisabled: !!(detail.disabled || configuration.disabled),
+            negotiatedSpeed: detail.negotiatedSpeed || "Unknown",
+            speedCapability: detail.speedCapability || "Unknown",
+            learnedMacs: detail.learnedMacs || [],
+            lldpNeighbor: detail.lldpNeighbor || null,
             currentSetLines: detail.setLines || configuration.setLines || [],
             modeKeyword: detail.modeKeyword || configuration.modeKeyword || "interface-mode"
           };
@@ -416,6 +429,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
 
 function render(updateConfiguration = true) {
   portGrid.innerHTML = "";
+  const macTopology = buildMacTopology();
   state.ports.forEach((port) => {
     const button = document.createElement("button");
     const portName = port.name;
@@ -424,7 +438,7 @@ function render(updateConfiguration = true) {
     const selectedClass = state.selected.has(portName) ? " selected" : "";
     const anchorClass = selectionModeInput.value === "range" && state.lastSelected === port.index ? " range-anchor" : "";
     const statusClass = oper === "up" ? " state-up" : oper === "down" ? " state-down" : "";
-    button.className = `port-tile${selectedClass}${anchorClass}${statusClass}${configured ? " configured" : ""}`;
+    button.className = `port-tile${selectedClass}${anchorClass}${statusClass}${configured ? " configured" : ""}${port.currentDisabled ? " disabled-port" : ""}`;
     button.type = "button";
     const description = port.currentDescription || "";
     const displayDescription = description.replace(/^\d{2}_/, "");
@@ -446,12 +460,57 @@ function render(updateConfiguration = true) {
     const tooltipHeading = document.createElement("strong");
     tooltipHeading.textContent = portName;
     tooltip.appendChild(tooltipHeading);
+    const neighbor = port.lldpNeighbor || {};
+    const learnedMacCount = new Set((port.learnedMacs || []).map((entry) => entry.mac.toLowerCase())).size;
+    const uplinkReason = uplinkCandidateReason(port, macTopology);
+    const learnedManufacturers = Array.from(new Set(
+      (port.learnedMacs || []).map((entry) => entry.manufacturer).filter(Boolean)
+    ));
+    const manufacturerSummary = neighbor.manufacturer
+      || (learnedManufacturers.length === 1 ? learnedManufacturers[0]
+        : learnedManufacturers.length > 1 ? `${learnedManufacturers.length} manufacturers` : "Unknown");
+    const speedSummary = `${port.negotiatedSpeed || "Unknown"} / ${port.speedCapability || "Unknown"}`;
+    const richardDetails = document.createElement("dl");
+    richardDetails.className = "richard-details";
     [
+      ["Admin / link", `${port.currentDisabled ? "disabled" : (port.admin || "unknown")} / ${oper}`],
+      ["Link / max", speedSummary],
+      ["Mode", mode],
+      ["VLANs", vlanSummary],
+      ["MACs", String(learnedMacCount)],
+      ["Neighbor", neighbor.systemName || "None learned"],
+      ["Manufacturer", manufacturerSummary],
+      ["Role", uplinkReason ? "Uplink candidate" : "Local"]
+    ].forEach(([term, value]) => {
+      const key = document.createElement("dt");
+      const detail = document.createElement("dd");
+      key.textContent = term;
+      detail.textContent = value;
+      richardDetails.append(key, detail);
+    });
+    const connectionRows = [
       ["Description", description || "Not set"],
       ["Mode", mode],
       ["VLANs", vlanSummary],
-      ["Admin / link", `${port.admin || "unknown"} / ${oper}`]
-    ].forEach(([term, value]) => {
+      ["Admin / link", `${port.currentDisabled ? "disabled" : (port.admin || "unknown")} / ${oper}`],
+      ["Negotiated rate", port.negotiatedSpeed || "Unknown"],
+      ["Port capability", port.speedCapability || "Unknown"],
+      ["Neighbor", neighbor.systemName],
+      ["Neighbor port", neighbor.portDescription || neighbor.portId],
+      ["Device details", neighbor.systemDescription],
+      ["Manufacturer", manufacturerSummary],
+      ["Port role", uplinkReason ? `Uplink candidate: ${uplinkReason}` : "Local endpoint port"],
+      ["Learned MACs", String(learnedMacCount)],
+      ["Chassis ID", neighbor.chassisId]
+    ];
+    if (port.currentDisabled) {
+      connectionRows.push(["Cable check", learnedMacCount || port.lldpNeighbor
+        ? "Last/retained device evidence; live link cannot be verified while disabled"
+        : "No device evidence; disabled ports cannot verify a live cable"]);
+    } else if (!learnedMacCount && !port.lldpNeighbor) {
+      connectionRows.push(["Connected device", "None learned"]);
+    }
+    connectionRows.filter(([, value]) => value).forEach(([term, value]) => {
       const row = document.createElement("span");
       row.className = "port-tooltip-row";
       const key = document.createElement("b");
@@ -461,12 +520,16 @@ function render(updateConfiguration = true) {
       row.append(key, detail);
       tooltip.appendChild(row);
     });
-    button.append(label, descriptionLabel, tooltip);
+    button.append(label, descriptionLabel, richardDetails, tooltip);
+    const positionTooltip = () => positionPortTooltip(button, tooltip);
+    button.addEventListener("mouseenter", positionTooltip);
+    button.addEventListener("focus", positionTooltip);
     button.addEventListener("click", () => handlePortSelect(portName));
     portGrid.appendChild(button);
   });
 
   updateSelectionSummary();
+  updateViewMacsButton();
   updateIntendedChangeSummary();
   updateMoveSummary();
   if (state.selected.size && !seriesStartPort.value) {
@@ -475,6 +538,256 @@ function render(updateConfiguration = true) {
   updateSeriesDescriptionPreview();
   if (updateConfiguration) updateConfig();
   updateConnectionHint();
+}
+
+function positionPortTooltip(tile, tooltip) {
+  tooltip.classList.remove("positioned");
+  tooltip.style.removeProperty("left");
+  tooltip.style.removeProperty("top");
+
+  const panel = tile.closest(".device-panel");
+  if (!panel) return;
+  const panelRect = panel.getBoundingClientRect();
+  const tileRect = tile.getBoundingClientRect();
+  const tooltipRect = tooltip.getBoundingClientRect();
+  const gutter = 12;
+  const gap = 9;
+  const leftBound = Math.max(panelRect.left, 0) + gutter;
+  const rightBound = Math.min(panelRect.right, window.innerWidth) - gutter;
+  const topBound = Math.max(panelRect.top, 0) + gutter;
+  const bottomBound = Math.min(panelRect.bottom, window.innerHeight) - gutter;
+
+  const preferredLeft = tileRect.left + (tileRect.width - tooltipRect.width) / 2;
+  const left = Math.min(
+    Math.max(preferredLeft, leftBound),
+    Math.max(leftBound, rightBound - tooltipRect.width)
+  );
+  const above = tileRect.top - tooltipRect.height - gap;
+  const below = tileRect.bottom + gap;
+  let top = above;
+  if (above < topBound && below + tooltipRect.height <= bottomBound) top = below;
+  top = Math.min(
+    Math.max(top, topBound),
+    Math.max(topBound, bottomBound - tooltipRect.height)
+  );
+
+  tooltip.style.left = `${left - tileRect.left}px`;
+  tooltip.style.top = `${top - tileRect.top}px`;
+  tooltip.classList.add("positioned");
+}
+
+function buildMacTopology() {
+  const macPorts = new Map();
+  const portCounts = new Map();
+  const explicitUplinks = new Set();
+  state.ports.forEach((port) => {
+    const uniqueMacs = new Set((port.learnedMacs || []).map((entry) => entry.mac.toLowerCase()));
+    portCounts.set(port.name, uniqueMacs.size);
+    uniqueMacs.forEach((mac) => {
+      if (!macPorts.has(mac)) macPorts.set(mac, new Set());
+      macPorts.get(mac).add(port.name);
+    });
+    const description = port.currentDescription || "";
+    if (/(?:^|[^a-z0-9])(?:uplink|upstream|distribution|distro|core)(?:$|[^a-z0-9])/i.test(description)) {
+      explicitUplinks.add(port.name);
+    }
+  });
+  return { macPorts, portCounts, explicitUplinks };
+}
+
+function uplinkCandidateReason(port, topology = buildMacTopology()) {
+  const macCount = topology.portCounts.get(port.name) || 0;
+  const capabilities = `${port.lldpNeighbor?.systemCapabilities || ""} ${port.lldpNeighbor?.enabledCapabilities || ""}`;
+  if (topology.explicitUplinks.has(port.name)) return "interface description";
+  if (/^(?:ae|reth)\d+$/i.test(port.name)) return "aggregated interface";
+
+  const duplicateMacs = new Set((port.learnedMacs || [])
+    .map((entry) => entry.mac.toLowerCase())
+    .filter((mac) => (topology.macPorts.get(mac)?.size || 0) > 1));
+  const duplicatePeers = new Set();
+  duplicateMacs.forEach((mac) => {
+    topology.macPorts.get(mac).forEach((name) => {
+      if (name !== port.name) duplicatePeers.add(name);
+    });
+  });
+  if (!topology.explicitUplinks.size && duplicateMacs.size >= 2 && duplicatePeers.size >= 2) {
+    return `${duplicateMacs.size} MACs repeated across ${duplicatePeers.size} ports`;
+  }
+
+  if (!topology.explicitUplinks.size) {
+    const otherCounts = Array.from(topology.portCounts.entries())
+      .filter(([name]) => name !== port.name)
+      .map(([, count]) => count)
+      .filter(Boolean);
+    const nextHighest = Math.max(0, ...otherCounts);
+    const dominant = otherCounts.length >= 2 && macCount >= 8 && macCount >= Math.max(8, nextHighest * 4);
+    const corroborated = port.currentMode === "trunk" || /\bbridge\b/i.test(capabilities) || macCount >= 32;
+    if (dominant && corroborated) return "dominant learned-MAC count";
+  }
+  return "";
+}
+
+function macRecordsForPorts(ports) {
+  const records = new Map();
+  ports.forEach((port) => {
+    (port.learnedMacs || []).forEach((entry) => {
+      const key = entry.mac.toLowerCase();
+      if (!records.has(key)) {
+        records.set(key, {
+          mac: key,
+          manufacturer: entry.manufacturer || "",
+          interfaces: new Set(),
+          vlans: new Set()
+        });
+      }
+      const record = records.get(key);
+      record.interfaces.add(port.name);
+      if (entry.vlan) record.vlans.add(entry.vlan);
+      if (!record.manufacturer && entry.manufacturer) record.manufacturer = entry.manufacturer;
+    });
+  });
+  return Array.from(records.values());
+}
+
+function macRecordInterfaceNames(record) {
+  const portOrder = new Map(state.ports.map((port, index) => [port.name, index]));
+  return Array.from(record.interfaces).sort((left, right) => {
+    const indexDifference = (portOrder.get(left) ?? Number.MAX_SAFE_INTEGER)
+      - (portOrder.get(right) ?? Number.MAX_SAFE_INTEGER);
+    return indexDifference || left.localeCompare(right, undefined, { numeric: true });
+  });
+}
+
+function sortMacRecords(records) {
+  const portOrder = new Map(state.ports.map((port, index) => [port.name, index]));
+  const direction = learnedMacSortDirectionBtn.getAttribute("aria-pressed") === "true" ? -1 : 1;
+  const valueFor = (record, field) => {
+    if (field === "port") {
+      return Math.min(...macRecordInterfaceNames(record).map((name) => portOrder.get(name) ?? Number.MAX_SAFE_INTEGER));
+    }
+    if (field === "manufacturer") return record.manufacturer || "Unknown";
+    if (field === "vlan") return Array.from(record.vlans).sort()[0] || "Unknown";
+    return record.mac;
+  };
+  const field = learnedMacSortInput.value;
+  return [...records].sort((left, right) => {
+    const leftValue = valueFor(left, field);
+    const rightValue = valueFor(right, field);
+    const primary = typeof leftValue === "number"
+      ? leftValue - rightValue
+      : leftValue.localeCompare(rightValue, undefined, { numeric: true, sensitivity: "base" });
+    if (primary) return primary * direction;
+    const portTie = valueFor(left, "port") - valueFor(right, "port");
+    if (portTie) return portTie * direction;
+    return left.mac.localeCompare(right.mac) * direction;
+  });
+}
+
+function portsForMacScope(scope = macViewScopeInput.value) {
+  const portsWithMacs = state.ports.filter((port) => port.learnedMacs?.length);
+  const topology = buildMacTopology();
+  if (scope === "local") return portsWithMacs.filter((port) => !uplinkCandidateReason(port, topology));
+  if (scope === "uplinks") return portsWithMacs.filter((port) => uplinkCandidateReason(port, topology));
+  if (scope === "all") return portsWithMacs;
+  return portsWithMacs.filter((port) => state.selected.has(port.name));
+}
+
+function updateViewMacsButton() {
+  const scopeCounts = Object.fromEntries(["selected", "local", "uplinks", "all"].map((scope) => {
+    const ports = portsForMacScope(scope);
+    return [scope, macRecordsForPorts(ports).length];
+  }));
+  macViewScopeInput.options[0].textContent = `Selected (${scopeCounts.selected} MACs)`;
+  macViewScopeInput.options[1].textContent = `Local switch (${scopeCounts.local} MACs)`;
+  macViewScopeInput.options[2].textContent = `Uplink candidates (${scopeCounts.uplinks} MACs)`;
+  macViewScopeInput.options[3].textContent = `All learned (${scopeCounts.all} MACs)`;
+  const macCount = scopeCounts[macViewScopeInput.value];
+  viewMacsBtn.disabled = macCount === 0;
+  viewMacsBtn.textContent = macCount ? `View MACs (${macCount})` : "View MACs";
+}
+
+function renderLearnedMacs() {
+  const ports = portsForMacScope();
+  const records = macRecordsForPorts(ports);
+  const query = learnedMacSearchInput.value.trim().toLowerCase();
+  const vlanFilter = learnedMacVlanFilter.value;
+  const filteredRecords = sortMacRecords(records.filter((record) => {
+    const interfaces = Array.from(record.interfaces);
+    const vlans = Array.from(record.vlans);
+    const matchesQuery = !query || record.mac.includes(query)
+      || (record.manufacturer || "").toLowerCase().includes(query)
+      || interfaces.some((name) => name.toLowerCase().includes(query))
+      || vlans.some((vlan) => vlan.toLowerCase().includes(query));
+    return matchesQuery && (!vlanFilter || vlans.includes(vlanFilter));
+  }));
+  learnedMacDialogContent.replaceChildren();
+
+  if (filteredRecords.length) {
+    const table = document.createElement("table");
+    table.className = "learned-mac-table";
+    const tableHead = document.createElement("thead");
+    tableHead.innerHTML = "<tr><th scope=\"col\">Interface</th><th scope=\"col\">MAC address</th><th scope=\"col\">Manufacturer</th><th scope=\"col\">VLAN</th></tr>";
+    const tableBody = document.createElement("tbody");
+    const groupByPort = learnedMacSortInput.value === "port";
+    const interfaceLabels = filteredRecords.map((record) => macRecordInterfaceNames(record).join(", "));
+    const groupSizes = new Map();
+    if (groupByPort) interfaceLabels.forEach((label) => groupSizes.set(label, (groupSizes.get(label) || 0) + 1));
+    let previousInterfaceLabel = null;
+    filteredRecords.forEach((record, recordIndex) => {
+      const row = document.createElement("tr");
+      const mac = document.createElement("td");
+      const manufacturer = document.createElement("td");
+      const vlan = document.createElement("td");
+      const interfaceNames = macRecordInterfaceNames(record);
+      const interfaceLabel = interfaceLabels[recordIndex];
+      const reasons = interfaceNames.map((name) => {
+        const port = state.ports.find((candidate) => candidate.name === name);
+        return port ? uplinkCandidateReason(port) : "";
+      }).filter(Boolean);
+      mac.textContent = record.mac;
+      manufacturer.textContent = record.manufacturer || "Unknown";
+      vlan.textContent = Array.from(record.vlans).sort().join(", ") || "Unknown";
+      if (!groupByPort || interfaceLabel !== previousInterfaceLabel) {
+        const interfaces = document.createElement("th");
+        interfaces.scope = "rowgroup";
+        interfaces.className = "mac-interface-cell";
+        interfaces.textContent = interfaceLabel;
+        if (groupByPort) interfaces.rowSpan = groupSizes.get(interfaceLabel);
+        if (reasons.length) interfaces.title = `Uplink candidate: ${Array.from(new Set(reasons)).join(", ")}`;
+        row.appendChild(interfaces);
+        row.classList.add("mac-port-group-start");
+      }
+      row.append(mac, manufacturer, vlan);
+      tableBody.appendChild(row);
+      previousInterfaceLabel = interfaceLabel;
+    });
+    table.append(tableHead, tableBody);
+    learnedMacDialogContent.appendChild(table);
+  }
+
+  const excludedUplinkCount = macRecordsForPorts(portsForMacScope("uplinks")).length;
+  const scopeNote = macViewScopeInput.value === "local" && excludedUplinkCount
+    ? ` ${excludedUplinkCount} MACs on uplink candidates are excluded.`
+    : "";
+  learnedMacDialogSummary.textContent = `Showing ${filteredRecords.length} of ${records.length} unique learned MAC${records.length === 1 ? "" : "s"}.${scopeNote}`;
+  if (!filteredRecords.length) {
+    const empty = document.createElement("p");
+    empty.className = "learned-mac-empty muted";
+    empty.textContent = "No learned MAC addresses match these filters.";
+    learnedMacDialogContent.appendChild(empty);
+  }
+}
+
+function showLearnedMacs() {
+  const ports = portsForMacScope();
+  const vlans = Array.from(new Set(macRecordsForPorts(ports).flatMap((record) => Array.from(record.vlans))))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  learnedMacSearchInput.value = "";
+  learnedMacVlanFilter.replaceChildren(new Option("All VLANs", ""));
+  vlans.forEach((vlan) => learnedMacVlanFilter.add(new Option(vlan, vlan)));
+  renderLearnedMacs();
+
+  learnedMacDialog.showModal();
 }
 
 function handlePortSelect(portName) {
@@ -556,7 +869,11 @@ function updateSelectionSummary() {
     portName.textContent = name;
     const current = document.createElement("small");
     const currentVlans = port?.currentVlans?.length ? port.currentVlans.join(", ") : "no VLAN membership found";
-    current.textContent = `${port?.currentMode || "unknown"} · ${currentVlans}`;
+    const neighborName = port?.lldpNeighbor?.systemName;
+    const macCount = port?.learnedMacs?.length || 0;
+    const deviceSummary = neighborName || (macCount ? `${macCount} learned MAC${macCount === 1 ? "" : "s"}` : "no connected device learned");
+    const adminSummary = port?.currentDisabled ? "disabled" : (port?.oper || "unknown");
+    current.textContent = `${port?.currentMode || "unknown"} · ${currentVlans} · ${adminSummary} · ${deviceSummary}`;
     row.append(portName, current);
     selectionSummaryBox.appendChild(row);
   });
@@ -1106,6 +1423,23 @@ document.getElementById("clearSelectionBtn").addEventListener("click", () => {
   state.selected = new Set();
   state.lastSelected = null;
   render();
+});
+viewMacsBtn.addEventListener("click", showLearnedMacs);
+macViewScopeInput.addEventListener("change", updateViewMacsButton);
+learnedMacSearchInput.addEventListener("input", renderLearnedMacs);
+learnedMacVlanFilter.addEventListener("change", renderLearnedMacs);
+learnedMacSortInput.addEventListener("change", renderLearnedMacs);
+learnedMacSortDirectionBtn.addEventListener("click", () => {
+  const descending = learnedMacSortDirectionBtn.getAttribute("aria-pressed") !== "true";
+  learnedMacSortDirectionBtn.setAttribute("aria-pressed", String(descending));
+  learnedMacSortDirectionBtn.textContent = descending ? "\u2193" : "\u2191";
+  learnedMacSortDirectionBtn.setAttribute("aria-label", descending ? "Sort ascending" : "Sort descending");
+  learnedMacSortDirectionBtn.title = descending ? "Sort ascending" : "Sort descending";
+  renderLearnedMacs();
+});
+document.getElementById("closeMacDialogBtn").addEventListener("click", () => learnedMacDialog.close());
+learnedMacDialog.addEventListener("click", (event) => {
+  if (event.target === learnedMacDialog) learnedMacDialog.close();
 });
 document.getElementById("moveConfigBtn").addEventListener("click", buildMoveConfiguration);
 document.getElementById("buildSeriesBtn").addEventListener("click", buildSeriesConfiguration);
