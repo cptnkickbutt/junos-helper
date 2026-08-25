@@ -6,7 +6,9 @@ import re
 import shlex
 import shutil
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,69 @@ if not VENDOR_DATABASE.is_file():
     VENDOR_DATABASE = Path(sys.prefix) / "cache" / "mac-vendors.txt"
 BaseMacLookup.cache_path = str(VENDOR_DATABASE)
 MAC_LOOKUP = MacLookup() if VENDOR_DATABASE.is_file() else None
+SAVED_DEVICE_PREFIX = "JUNOS_DEVICE_"
+DEVICE_SEED_HASH_KEY = "JUNOS_DEVICE_SEED_HASH"
+ENV_WRITE_LOCK = threading.Lock()
+
+
+def _replace_environment_path(source: Path, destination: Path) -> None:
+    os.replace(source, destination)
+
+
+def _persist_dotenv_values(path: Path, updates: dict[str, str]) -> None:
+    """Apply several dotenv changes with one OneDrive-friendly destination rewrite."""
+    if not updates:
+        return
+    with ENV_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="junos_helper_env_") as work_directory:
+            work_path = Path(work_directory) / ".env"
+            if path.exists():
+                shutil.copyfile(path, work_path)
+            else:
+                work_path.touch()
+            for key, value in updates.items():
+                set_key(str(work_path), key, value, quote_mode="always")
+            contents = work_path.read_bytes()
+
+        staging_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".junos_helper_env_",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as staging_file:
+                staging_file.write(contents)
+                staging_file.flush()
+                os.fsync(staging_file.fileno())
+                staging_path = Path(staging_file.name)
+
+            replace_error: OSError | None = None
+            for attempt in range(7):
+                try:
+                    _replace_environment_path(staging_path, path)
+                    staging_path = None
+                    replace_error = None
+                    break
+                except OSError as exc:
+                    if not isinstance(exc, PermissionError) and getattr(exc, "winerror", None) not in {5, 32}:
+                        raise
+                    replace_error = exc
+                    time.sleep(min(0.05 * (2 ** attempt), 0.5))
+
+            if replace_error is not None:
+                # OneDrive can permit file writes while temporarily denying rename-overwrite.
+                with path.open("wb") as environment_file:
+                    environment_file.write(contents)
+                    environment_file.flush()
+                    os.fsync(environment_file.fileno())
+        finally:
+            if staging_path is not None:
+                try:
+                    staging_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _environment_path() -> Path:
@@ -39,14 +104,33 @@ def _environment_path() -> Path:
 
 
 def _prepare_environment(path: Path) -> None:
-    if not IS_FROZEN or path.exists():
+    if not IS_FROZEN:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    for seed_path in (RESOURCE_DIR / "seed.env", RESOURCE_DIR / ".env"):
-        if seed_path.is_file():
+    seed_path = next(
+        (candidate for candidate in (RESOURCE_DIR / "seed.env", RESOURCE_DIR / ".env") if candidate.is_file()),
+        None,
+    )
+    if not path.exists():
+        if seed_path is not None:
             shutil.copyfile(seed_path, path)
-            return
-    path.touch()
+        else:
+            path.touch()
+    if seed_path is None:
+        return
+
+    seed_hash = hashlib.sha256(seed_path.read_bytes()).hexdigest()
+    current_values = dotenv_values(path)
+    if current_values.get(DEVICE_SEED_HASH_KEY) == seed_hash:
+        return
+    seed_values = dotenv_values(seed_path)
+    updates = {
+        key: value or ""
+        for key, value in seed_values.items()
+        if key.startswith(SAVED_DEVICE_PREFIX)
+    }
+    updates[DEVICE_SEED_HASH_KEY] = seed_hash
+    _persist_dotenv_values(path, updates)
 
 
 ENV_PATH = _environment_path()
@@ -58,10 +142,9 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-API_VERSION = 12
+API_VERSION = 16
 COMMIT_COMMENT = "Applied by Junos Helper"
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
-SAVED_DEVICE_PREFIX = "JUNOS_DEVICE_"
 
 DISCOVERY_COMMANDS = (
     "show interfaces terse",
@@ -75,9 +158,78 @@ DISCOVERY_COMMANDS = (
     "show configuration system host-name | display set",
 )
 INTERFACE_RE = re.compile(
-    r"(?<![A-Za-z0-9])((?:(?:ge|xe|et|fe|mge)-\d+/\d+/\d+(?:/\d+)?|(?:ae|reth)\d+)(?:\.\d+)?)",
+    r"(?<![A-Za-z0-9])((?:(?:ge|xe|et|fe|mge)-\d+/\d+/\d+(?:/\d+)?(?::\d+)?|(?:ae|reth)\d+)(?:\.\d+)?)",
     re.IGNORECASE,
 )
+PHYSICAL_INTERFACE_NAME_RE = re.compile(
+    r"^(fe|ge|mge|xe|et)-(\d+)/(\d+)/(\d+)(?:/(\d+))?(?::(\d+))?$",
+    re.IGNORECASE,
+)
+
+
+def _interface_sort_key(name: str, model: str = "") -> tuple[Any, ...]:
+    """Sort physical interfaces by chassis location rather than speed prefix."""
+    physical = PHYSICAL_INTERFACE_NAME_RE.fullmatch(name)
+    if physical:
+        prefix, fpc, pic, port, subport, lane = physical.groups()
+        prefix_rank = {"fe": 0, "ge": 1, "mge": 2, "xe": 3, "et": 4}[prefix.lower()]
+        family_group = 0
+        if model.upper().startswith("EX4100") and prefix.lower() in {"xe", "et"}:
+            # EX4100 access and uplink banks can reuse numeric coordinates.
+            family_group = 1
+        return (
+            0,
+            family_group,
+            int(fpc),
+            int(pic),
+            int(port),
+            int(subport) if subport is not None else -1,
+            int(lane) if lane is not None else -1,
+            prefix_rank,
+        )
+    aggregate = re.fullmatch(r"(ae|reth)(\d+)", name, re.IGNORECASE)
+    if aggregate:
+        return (1, 0 if aggregate.group(1).lower() == "ae" else 1, int(aggregate.group(2)))
+    return (2, name.lower())
+
+
+def _preferred_interface_names(names: list[str], model: str = "") -> list[str]:
+    """Hide slower aliases when a platform exposes multiple names for one port."""
+    unique_names = list(dict.fromkeys(names))
+    names_by_location: dict[tuple[str, ...], list[tuple[str, str]]] = {}
+    for name in unique_names:
+        physical = PHYSICAL_INTERFACE_NAME_RE.fullmatch(name)
+        if not physical:
+            continue
+        prefix, *location = physical.groups()
+        names_by_location.setdefault(tuple(value or "" for value in location), []).append(
+            (prefix.lower(), name)
+        )
+
+    hidden_names: set[str] = set()
+    speed_rank = {"fe": 0, "ge": 1, "mge": 2, "xe": 3, "et": 4}
+    for aliases in names_by_location.values():
+        prefixes = {prefix for prefix, _name in aliases}
+        if model.upper().startswith("EX4400") and len(prefixes) > 1:
+            fastest_prefix = max(prefixes, key=speed_rank.__getitem__)
+            hidden_names.update(name for prefix, name in aliases if prefix != fastest_prefix)
+        elif {"xe", "et"}.issubset(prefixes):
+            hidden_names.update(name for prefix, name in aliases if prefix == "xe")
+    return [name for name in unique_names if name not in hidden_names]
+
+
+def _interface_name_capability(name: str) -> str:
+    """Infer the fixed-rate capability represented by a physical interface prefix."""
+    match = PHYSICAL_INTERFACE_NAME_RE.fullmatch(name)
+    if not match:
+        return ""
+    return {
+        "fe": "100 Mbps",
+        "ge": "1 Gbps",
+        "mge": "2.5 Gbps",
+        "xe": "10 Gbps",
+        "et": "100 Gbps",
+    }.get(match.group(1).lower(), "")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -93,10 +245,16 @@ def _saved_device_id(hostname: str) -> str:
     return f"{readable}_{digest}"
 
 
+def _persist_environment_values(updates: dict[str, str]) -> None:
+    _persist_dotenv_values(ENV_PATH, updates)
+    for key, value in updates.items():
+        os.environ[key] = value
+
+
 def _saved_devices() -> dict[str, dict[str, str]]:
     values = dotenv_values(ENV_PATH) if ENV_PATH.exists() else {}
     devices: dict[str, dict[str, str]] = {}
-    suffixes = {"HOSTNAME", "HOST", "USERNAME", "PASSWORD"}
+    suffixes = {"HOSTNAME", "HOST", "USERNAME", "PASSWORD", "GROUP"}
     for key, value in values.items():
         if not key.startswith(SAVED_DEVICE_PREFIX):
             continue
@@ -377,6 +535,58 @@ def _parse_configured_vlans(output: str) -> list[dict[str, str]]:
     return memberships
 
 
+def _parse_vlan_l3_interfaces(output: str) -> dict[str, str]:
+    """Return VLAN-to-IRB bindings from display-set configuration."""
+    bindings: dict[str, str] = {}
+    pattern = re.compile(
+        r"^set vlans\s+(\S+)\s+l3-interface\s+(irb\.\d+)\s*$", re.IGNORECASE
+    )
+    for raw_line in output.splitlines():
+        match = pattern.match(raw_line.strip())
+        if match:
+            bindings[match.group(1)] = match.group(2).lower()
+    return bindings
+
+
+def _parse_vlan_interface_members(output: str) -> list[dict[str, Any]]:
+    """Parse direct logical-interface members used by service-provider VLANs."""
+    services: dict[str, dict[str, Any]] = {}
+    pattern = re.compile(r"^set vlans\s+(\S+)\s+interface\s+(\S+)\s*$", re.IGNORECASE)
+    for raw_line in output.splitlines():
+        match = pattern.match(raw_line.strip())
+        if not match or not INTERFACE_RE.fullmatch(match.group(2)) or "." not in match.group(2):
+            continue
+        service = services.setdefault(match.group(1), {"name": match.group(1), "interfaces": []})
+        if match.group(2) not in service["interfaces"]:
+            service["interfaces"].append(match.group(2))
+    return list(services.values())
+
+
+def _parse_irb_configuration(output: str) -> list[dict[str, Any]]:
+    """Parse IPv4 addresses configured on IRB logical units."""
+    units: dict[int, dict[str, Any]] = {}
+    pattern = re.compile(
+        r"^set interfaces irb unit\s+(\d+)\s+family inet address\s+(\S+)\s*$",
+        re.IGNORECASE,
+    )
+    for raw_line in output.splitlines():
+        match = pattern.match(raw_line.strip())
+        if not match:
+            continue
+        unit = int(match.group(1))
+        try:
+            parsed_address = ipaddress.ip_interface(match.group(2))
+        except ValueError:
+            continue
+        if parsed_address.version != 4:
+            continue
+        address = str(parsed_address)
+        details = units.setdefault(unit, {"unit": unit, "addresses": []})
+        if address not in details["addresses"]:
+            details["addresses"].append(address)
+    return [units[unit] for unit in sorted(units)]
+
+
 def _parse_interface_configuration(output: str) -> dict[str, dict[str, Any]]:
     configuration: dict[str, dict[str, Any]] = {}
     for raw_line in output.splitlines():
@@ -505,6 +715,7 @@ def _public_saved_devices() -> list[dict[str, str]]:
                 "hostname": details["hostname"],
                 "host": details["host"],
                 "username": details["username"],
+                "group": details.get("group", ""),
             }
             for device_id, details in _saved_devices().items()
         ),
@@ -521,11 +732,14 @@ def saved_devices() -> Any:
 def save_device() -> Any:
     payload = request.get_json(silent=True) or {}
     hostname = str(payload.get("hostname") or "").strip()
+    group = str(payload.get("group") or "").strip()
     host, username, password = _connection_values(payload)
     if not hostname or not re.fullmatch(r"[A-Za-z0-9._-]{1,253}", hostname):
         return jsonify({"ok": False, "error": "A valid discovered device hostname is required."}), 400
     if not host or not username or not password:
         return jsonify({"ok": False, "error": "Host, username, and password are required to save a device."}), 400
+    if group and not re.fullmatch(r"[A-Za-z0-9 ._:-]{1,64}", group):
+        return jsonify({"ok": False, "error": "Group names may use letters, numbers, spaces, . _ : and -."}), 400
 
     device_id = _saved_device_id(hostname)
     values = {
@@ -533,12 +747,13 @@ def save_device() -> Any:
         "HOST": host,
         "USERNAME": username,
         "PASSWORD": password,
+        "GROUP": group,
     }
     try:
-        for field, value in values.items():
-            key = f"{SAVED_DEVICE_PREFIX}{device_id}_{field}"
-            set_key(str(ENV_PATH), key, value, quote_mode="always")
-            os.environ[key] = value
+        _persist_environment_values({
+            f"{SAVED_DEVICE_PREFIX}{device_id}_{field}": value
+            for field, value in values.items()
+        })
     except OSError as exc:
         logger.warning("Unable to save device %s: %s", hostname, exc)
         return jsonify({"ok": False, "error": f"Unable to update {ENV_PATH.name}: {exc}"}), 500
@@ -546,6 +761,36 @@ def save_device() -> Any:
     device = next(item for item in _public_saved_devices() if item["id"] == device_id)
     logger.info("Saved local connection profile for %s", hostname)
     return jsonify({"ok": True, "device": device})
+
+
+@app.patch("/api/devices/group")
+def assign_device_group() -> Any:
+    payload = request.get_json(silent=True) or {}
+    raw_device_ids = payload.get("deviceIds")
+    group = str(payload.get("group") or "").strip()
+    if not isinstance(raw_device_ids, list) or not raw_device_ids or len(raw_device_ids) > 500:
+        return jsonify({"ok": False, "error": "Select between 1 and 500 saved devices."}), 400
+    device_ids = list(dict.fromkeys(str(device_id).strip().upper() for device_id in raw_device_ids))
+    if any(not re.fullmatch(r"[A-Z0-9_]{1,64}", device_id) for device_id in device_ids):
+        return jsonify({"ok": False, "error": "An invalid saved-device ID was supplied."}), 400
+    if group and not re.fullmatch(r"[A-Za-z0-9 ._:-]{1,64}", group):
+        return jsonify({"ok": False, "error": "Group names may use letters, numbers, spaces, . _ : and -."}), 400
+    saved = _saved_devices()
+    missing = [device_id for device_id in device_ids if device_id not in saved]
+    if missing:
+        return jsonify({"ok": False, "error": "One or more saved devices no longer exist."}), 400
+
+    try:
+        _persist_environment_values({
+            f"{SAVED_DEVICE_PREFIX}{device_id}_GROUP": group
+            for device_id in device_ids
+        })
+    except OSError as exc:
+        logger.warning("Unable to assign saved-device group: %s", exc)
+        return jsonify({"ok": False, "error": f"Unable to update {ENV_PATH.name}: {exc}"}), 500
+
+    logger.info("Assigned %d saved device(s) to group %s", len(device_ids), group or "Ungrouped")
+    return jsonify({"ok": True, "devices": _public_saved_devices(), "updated": len(device_ids)})
 
 
 @app.post("/api/connect")
@@ -571,6 +816,9 @@ def connect_switch() -> Any:
         lldp_neighbors_by_interface: dict[str, dict[str, str]] = {}
         interface_speeds_by_name: dict[str, dict[str, str]] = {}
         vlan_memberships_by_name: dict[str, dict[str, str]] = {}
+        vlan_l3_interfaces: dict[str, str] = {}
+        irb_units: list[dict[str, Any]] = []
+        bridge_services: list[dict[str, Any]] = []
         for item in results:
             if item["command"].startswith("show interfaces"):
                 parsed_interface_names.extend(_parse_interfaces(item["output"]))
@@ -587,8 +835,11 @@ def connect_switch() -> Any:
             if item["command"].startswith("show configuration vlans"):
                 for vlan in _parse_configured_vlans(item["output"]):
                     vlan_memberships_by_name[vlan["name"]] = vlan
+                vlan_l3_interfaces.update(_parse_vlan_l3_interfaces(item["output"]))
+                bridge_services = _parse_vlan_interface_members(item["output"])
 
-        parsed_interface_names = list(dict.fromkeys(parsed_interface_names))
+        operational_interface_names = set(parsed_interface_names)
+
         # collect configured interfaces from any configuration output
         interface_configuration: dict[str, dict[str, Any]] = {}
         for item in results:
@@ -596,8 +847,48 @@ def connect_switch() -> Any:
             out = item.get("output", "") or ""
             if "show configuration interfaces" in cmd:
                 interface_configuration.update(_parse_interface_configuration(out))
+                irb_units = _parse_irb_configuration(out)
 
-        configured_interfaces = _configured_interface_names(interface_configuration)
+        # Some platforms omit inactive physical ports from operational interface
+        # output even though their configuration remains present. Keep live-output
+        # order, then add any configuration-only ports so they still receive tiles.
+        metadata = _parse_metadata(results)
+        parsed_interface_names = _preferred_interface_names(
+            [*parsed_interface_names, *interface_configuration],
+            metadata.get("model", ""),
+        )
+        parsed_interface_names.sort(
+            key=lambda name: _interface_sort_key(name, metadata.get("model", ""))
+        )
+        details_by_name = {
+            details["name"]: details
+            for details in interface_details
+            if details.get("name") in parsed_interface_names
+        }
+        interface_details = []
+        for name in parsed_interface_names:
+            if name in details_by_name:
+                interface_details.append(details_by_name[name])
+                continue
+            configuration_only = name not in operational_interface_names
+            fallback_details = {
+                "name": name,
+                "admin": "down" if configuration_only else "unknown",
+                "oper": "down" if configuration_only else "unknown",
+                "raw": "",
+            }
+            capability = _interface_name_capability(name)
+            if capability:
+                fallback_details["speedCapability"] = capability
+            interface_details.append(fallback_details)
+
+        for vlan_name, l3_interface in vlan_l3_interfaces.items():
+            if vlan_name in vlan_memberships_by_name:
+                vlan_memberships_by_name[vlan_name]["l3Interface"] = l3_interface
+
+        configured_interfaces = (
+            _configured_interface_names(interface_configuration) & set(parsed_interface_names)
+        )
 
         # mark configured flag on interface details where applicable
         for d in interface_details:
@@ -623,7 +914,6 @@ def connect_switch() -> Any:
                     lldp_neighbors_by_interface[name], d["learnedMacs"]
                 )
 
-        metadata = _parse_metadata(results)
         logger.info("Discovery completed for %s: interfaces=%s metadata=%s", host, parsed_interface_names, metadata)
         return jsonify(
             {
@@ -640,6 +930,8 @@ def connect_switch() -> Any:
                 ),
                 "configuredInterfaces": list(configured_interfaces),
                 "interfaceConfiguration": interface_configuration,
+                "irbUnits": irb_units,
+                "bridgeServices": bridge_services,
                 "debug": {
                     "interfaceCount": len(parsed_interface_names),
                     "vlanCount": len(vlan_memberships_by_name),
@@ -674,16 +966,55 @@ def _validated_config_lines(config_text: str) -> list[str]:
         if len(parts) < 3 or parts[0] not in {"set", "delete"}:
             raise ValueError("Only approved interface and VLAN commands are allowed.")
         if parts[1] == "interfaces":
-            if not INTERFACE_RE.fullmatch(parts[2].split(".")[0]):
+            if parts[2].lower() == "irb":
+                if parts[0] == "set":
+                    valid_irb = (
+                        len(parts) == 9
+                        and parts[3] == "unit"
+                        and parts[4].isdigit()
+                        and 0 <= int(parts[4]) <= 16384
+                        and parts[5:8] == ["family", "inet", "address"]
+                    )
+                    if not valid_irb:
+                        raise ValueError("Only IPv4 IRB address commands are allowed.")
+                    try:
+                        ipaddress.ip_interface(parts[8])
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid IRB IPv4 prefix: {parts[8]}") from exc
+                    if ipaddress.ip_interface(parts[8]).version != 4:
+                        raise ValueError("Only IPv4 IRB address commands are allowed.")
+                else:
+                    valid_irb_delete = (
+                        len(parts) == 5
+                        and parts[3] == "unit"
+                        and parts[4].isdigit()
+                        and 0 <= int(parts[4]) <= 16384
+                    )
+                    if not valid_irb_delete:
+                        raise ValueError("Only complete IRB logical-unit deletion is allowed.")
+            elif not INTERFACE_RE.fullmatch(parts[2].split(".")[0]):
                 raise ValueError(f"Unsupported interface name: {parts[2]}")
-            if len(parts) == 3 and parts[0] != "delete":
+            elif len(parts) == 3 and parts[0] != "delete":
                 raise ValueError("A complete interface command is required.")
         elif parts[1] == "vlans":
-            if parts[0] != "set" or len(parts) != 5 or parts[3] != "vlan-id":
-                raise ValueError("Only 'set vlans NAME vlan-id ID' VLAN commands are allowed.")
             if not re.fullmatch(r"[A-Za-z0-9_.:-]+", parts[2]):
                 raise ValueError(f"Unsupported VLAN name: {parts[2]}")
-            if not parts[4].isdigit() or not 1 <= int(parts[4]) <= 4094:
+            is_vlan_id = parts[0] == "set" and len(parts) == 5 and parts[3] == "vlan-id"
+            is_l3_binding = (
+                len(parts) == 5
+                and parts[3] == "l3-interface"
+                and re.fullmatch(r"irb\.\d+", parts[4], re.IGNORECASE)
+                and 0 <= int(parts[4].split(".")[1]) <= 16384
+            )
+            is_bridge_member = (
+                len(parts) == 5
+                and parts[3] == "interface"
+                and INTERFACE_RE.fullmatch(parts[4])
+                and "." in parts[4]
+            )
+            if not (is_vlan_id or is_l3_binding or is_bridge_member):
+                raise ValueError("Only VLAN IDs, IRB bindings, and logical interface members are allowed.")
+            if is_vlan_id and (not parts[4].isdigit() or not 1 <= int(parts[4]) <= 4094):
                 raise ValueError(f"VLAN ID must be between 1 and 4094: {parts[4]}")
         else:
             raise ValueError("Only approved interface and VLAN commands are allowed.")

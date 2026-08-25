@@ -6,6 +6,8 @@ const state = {
   pendingConfirmation: false,
   pendingTarget: null,
   vlans: [],
+  irbUnits: [],
+  bridgeServices: [],
   configManual: false,
   confirmationDeadline: null,
   confirmationTimer: null,
@@ -13,11 +15,14 @@ const state = {
   lastPreviewConfig: null,
   savedDevices: [],
   savedDeviceId: null,
+  visibleSavedDeviceGroups: null,
   connectionInProgress: false,
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 12;
+const REQUIRED_API_VERSION = 16;
+const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
+const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
 
 const hostInput = document.getElementById("host");
 const usernameInput = document.getElementById("username");
@@ -41,6 +46,17 @@ const connectBtn = document.getElementById("connectBtn");
 const savedDeviceInput = document.getElementById("savedDevice");
 const quickConnectBtn = document.getElementById("quickConnectBtn");
 const saveDeviceBtn = document.getElementById("saveDeviceBtn");
+const savedDeviceGroups = document.getElementById("savedDeviceGroups");
+const connectionForm = document.getElementById("connectionForm");
+const groupAssignmentForm = document.getElementById("groupAssignmentForm");
+const groupAssignmentInput = document.getElementById("groupAssignment");
+const groupDeviceList = document.getElementById("groupDeviceList");
+const groupManagementStatus = document.getElementById("groupManagementStatus");
+const visibleGroupList = document.getElementById("visibleGroupList");
+const visibleGroupStatus = document.getElementById("visibleGroupStatus");
+const autoSaveConnectionsInput = document.getElementById("autoSaveConnections");
+const optionsBtn = document.getElementById("optionsBtn");
+const optionsDialog = document.getElementById("optionsDialog");
 const refreshIntervalInput = document.getElementById("refreshInterval");
 const refreshNowBtn = document.getElementById("refreshNowBtn");
 const lastRefresh = document.getElementById("lastRefresh");
@@ -69,6 +85,19 @@ const seriesIncludePortNumberInput = document.getElementById("seriesIncludePortN
 const seriesDescriptionPreview = document.getElementById("seriesDescriptionPreview");
 const newVlanNameInput = document.getElementById("newVlanName");
 const newVlanIdInput = document.getElementById("newVlanId");
+const irbVlanInput = document.getElementById("irbVlan");
+const irbUnitInput = document.getElementById("irbUnit");
+const irbAddressInput = document.getElementById("irbAddress");
+const irbSummary = document.getElementById("irbSummary");
+const qinqCustomerPortInput = document.getElementById("qinqCustomerPort");
+const qinqUplinkPortInput = document.getElementById("qinqUplinkPort");
+const qinqServiceNameInput = document.getElementById("qinqServiceName");
+const qinqOuterTagInput = document.getElementById("qinqOuterTag");
+const qinqInnerTagInput = document.getElementById("qinqInnerTag");
+const qinqMtuInput = document.getElementById("qinqMtu");
+const qinqSummary = document.getElementById("qinqSummary");
+const logicalServiceSourceInput = document.getElementById("logicalServiceSource");
+const logicalServiceMoveSummary = document.getElementById("logicalServiceMoveSummary");
 const previewBtn = document.getElementById("previewBtn");
 const previewState = document.getElementById("previewState");
 const compareOutput = document.getElementById("compareOutput");
@@ -226,23 +255,213 @@ function connectionPayload(extra = {}) {
   };
 }
 
+function savedDeviceGroup(device) {
+  return device.group?.trim() || "Ungrouped";
+}
+
+function sortedSavedDeviceGroups() {
+  return Array.from(new Set(state.savedDevices.map(savedDeviceGroup)))
+    .sort((left, right) => {
+      if (left === "Ungrouped") return 1;
+      if (right === "Ungrouped") return -1;
+      return left.localeCompare(right, undefined, { numeric: true });
+    });
+}
+
+function savedDeviceGroupIsVisible(device) {
+  return state.visibleSavedDeviceGroups === null
+    || state.visibleSavedDeviceGroups.has(savedDeviceGroup(device));
+}
+
+function renderSavedDeviceChoices(selectedId = state.savedDeviceId) {
+  savedDeviceInput.replaceChildren(new Option("Choose a saved device", ""));
+  const devicesByGroup = new Map();
+  state.savedDevices.filter(savedDeviceGroupIsVisible).forEach((device) => {
+    const group = savedDeviceGroup(device);
+    if (!devicesByGroup.has(group)) devicesByGroup.set(group, []);
+    devicesByGroup.get(group).push(device);
+  });
+  sortedSavedDeviceGroups().forEach((group) => {
+    const devices = devicesByGroup.get(group);
+    if (!devices?.length) return;
+    const optionGroup = document.createElement("optgroup");
+    optionGroup.label = group;
+    devices.forEach((device) => optionGroup.appendChild(new Option(`${device.hostname} — ${device.host}`, device.id)));
+    savedDeviceInput.appendChild(optionGroup);
+  });
+  const selectedIsVisible = selectedId
+    && state.savedDevices.some((device) => device.id === selectedId && savedDeviceGroupIsVisible(device));
+  if (selectedIsVisible) {
+    savedDeviceInput.value = selectedId;
+    state.savedDeviceId = selectedId;
+  } else if (selectedId) {
+    state.savedDeviceId = null;
+  }
+  quickConnectBtn.disabled = !savedDeviceInput.value || state.connectionInProgress;
+}
+
+function renderVisibleGroupChoices() {
+  visibleGroupList.replaceChildren();
+  const groups = sortedSavedDeviceGroups();
+  if (!groups.length) {
+    const empty = document.createElement("span");
+    empty.className = "muted";
+    empty.textContent = "No groups loaded.";
+    visibleGroupList.appendChild(empty);
+    visibleGroupStatus.textContent = "No saved-device groups are available.";
+    return;
+  }
+  groups.forEach((group) => {
+    const count = state.savedDevices.filter((device) => savedDeviceGroup(device) === group).length;
+    const label = document.createElement("label");
+    label.className = "compact-checkbox visible-group-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.name = "visibleSavedGroup";
+    checkbox.value = group;
+    checkbox.checked = state.visibleSavedDeviceGroups === null || state.visibleSavedDeviceGroups.has(group);
+    const name = document.createElement("span");
+    name.textContent = group;
+    const total = document.createElement("small");
+    total.textContent = String(count);
+    label.append(checkbox, name, total);
+    visibleGroupList.appendChild(label);
+  });
+  const visibleCount = visibleGroupList.querySelectorAll('input[name="visibleSavedGroup"]:checked').length;
+  visibleGroupStatus.textContent = state.visibleSavedDeviceGroups === null
+    ? `All ${groups.length} group${groups.length === 1 ? " is" : "s are"} shown.`
+    : `${visibleCount} of ${groups.length} groups shown.`;
+  visibleGroupStatus.className = `tool-summary ${visibleCount ? "valid" : "muted"}`;
+}
+
+function storeVisibleSavedDeviceGroups() {
+  try {
+    if (state.visibleSavedDeviceGroups === null) {
+      window.localStorage.removeItem(VISIBLE_GROUPS_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(
+        VISIBLE_GROUPS_STORAGE_KEY,
+        JSON.stringify(Array.from(state.visibleSavedDeviceGroups))
+      );
+    }
+  } catch (_error) {
+    // The filter remains active for this session if browser storage is unavailable.
+  }
+}
+
 async function loadSavedDevices(selectedId = state.savedDeviceId) {
   try {
     const response = await fetch("/api/devices", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok || !payload.ok) return;
     state.savedDevices = payload.devices || [];
-    savedDeviceInput.replaceChildren(new Option("Choose a saved device", ""));
-    state.savedDevices.forEach((device) => {
-      savedDeviceInput.add(new Option(`${device.hostname} — ${device.host}`, device.id));
-    });
-    if (selectedId && state.savedDevices.some((device) => device.id === selectedId)) {
-      savedDeviceInput.value = selectedId;
-      state.savedDeviceId = selectedId;
-    }
-    quickConnectBtn.disabled = !savedDeviceInput.value || state.connectionInProgress;
+    const groups = Array.from(new Set(state.savedDevices.map((device) => device.group?.trim()).filter(Boolean)))
+      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+    savedDeviceGroups.replaceChildren(...groups.map((group) => {
+      const option = document.createElement("option");
+      option.value = group;
+      return option;
+    }));
+    renderVisibleGroupChoices();
+    renderSavedDeviceChoices(selectedId);
+    renderGroupDeviceList();
   } catch (_error) {
     // Manual connections remain available if saved profiles cannot be loaded.
+  }
+}
+
+function selectedGroupDeviceIds() {
+  return Array.from(groupDeviceList.querySelectorAll('input[name="groupDevice"]:checked'))
+    .map((input) => input.value);
+}
+
+function updateGroupSelectionStatus() {
+  const count = selectedGroupDeviceIds().length;
+  groupManagementStatus.textContent = count
+    ? `${count} saved switch${count === 1 ? "" : "es"} selected`
+    : "Select saved switches to organize.";
+  groupManagementStatus.className = `tool-summary ${count ? "valid" : "muted"}`;
+}
+
+function renderGroupDeviceList() {
+  const previouslySelected = new Set(selectedGroupDeviceIds());
+  groupDeviceList.replaceChildren();
+  if (!state.savedDevices.length) {
+    const empty = document.createElement("span");
+    empty.className = "muted";
+    empty.textContent = "No saved switches available.";
+    groupDeviceList.appendChild(empty);
+    updateGroupSelectionStatus();
+    return;
+  }
+  const devicesByGroup = new Map();
+  state.savedDevices.forEach((device) => {
+    const group = device.group?.trim() || "Ungrouped";
+    if (!devicesByGroup.has(group)) devicesByGroup.set(group, []);
+    devicesByGroup.get(group).push(device);
+  });
+  Array.from(devicesByGroup.entries())
+    .sort(([left], [right]) => {
+      if (left === "Ungrouped") return 1;
+      if (right === "Ungrouped") return -1;
+      return left.localeCompare(right, undefined, { numeric: true });
+    })
+    .forEach(([group, devices]) => {
+      const fieldset = document.createElement("fieldset");
+      fieldset.className = "group-device-section";
+      const legend = document.createElement("legend");
+      legend.textContent = group;
+      fieldset.appendChild(legend);
+      devices.forEach((device) => {
+        const label = document.createElement("label");
+        label.className = "compact-checkbox group-device-option";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.name = "groupDevice";
+        checkbox.value = device.id;
+        checkbox.checked = previouslySelected.has(device.id);
+        const name = document.createElement("span");
+        name.textContent = device.hostname;
+        const host = document.createElement("small");
+        host.textContent = device.host;
+        label.append(checkbox, name, host);
+        fieldset.appendChild(label);
+      });
+      groupDeviceList.appendChild(fieldset);
+    });
+  updateGroupSelectionStatus();
+}
+
+async function assignSelectedDevicesToGroup() {
+  const deviceIds = selectedGroupDeviceIds();
+  if (!deviceIds.length) {
+    updateGroupSelectionStatus();
+    groupManagementStatus.textContent = "Select at least one saved switch first.";
+    groupManagementStatus.className = "tool-summary error-text";
+    return;
+  }
+  const group = groupAssignmentInput.value.trim();
+  const assignButton = document.getElementById("assignGroupBtn");
+  assignButton.disabled = true;
+  assignButton.textContent = "Applying…";
+  try {
+    const response = await fetch("/api/devices/group", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceIds, group })
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "Unable to update switch groups");
+    await loadSavedDevices(state.savedDeviceId);
+    groupAssignmentInput.value = "";
+    groupManagementStatus.textContent = `Moved ${payload.updated} switch${payload.updated === 1 ? "" : "es"} to ${group || "Ungrouped"}`;
+    groupManagementStatus.className = "tool-summary valid";
+  } catch (error) {
+    groupManagementStatus.textContent = `Group update error: ${error.message}`;
+    groupManagementStatus.className = "tool-summary error-text";
+  } finally {
+    assignButton.disabled = false;
+    assignButton.textContent = "Apply group";
   }
 }
 
@@ -259,34 +478,54 @@ function selectSavedDevice() {
   updateConfig();
 }
 
-async function saveCurrentDevice() {
+async function saveCurrentDevice({ automatic = false } = {}) {
   if (!deviceNameInput.value || !hostInput.value.trim() || !usernameInput.value.trim()) {
     connectionStatus.textContent = "Connect and discover a device hostname before saving it";
     connectionStatus.className = "status-pill error";
-    return;
+    return null;
   }
   saveDeviceBtn.disabled = true;
   saveDeviceBtn.textContent = "Saving…";
   try {
+    const existingProfile = state.savedDevices.find((device) => device.id === state.savedDeviceId)
+      || savedProfileForCurrentConnection();
     const response = await fetch("/api/devices", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(connectionPayload({ hostname: deviceNameInput.value }))
+      body: JSON.stringify(connectionPayload({
+        hostname: deviceNameInput.value,
+        group: existingProfile?.group || ""
+      }))
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || "Unable to save device");
     state.savedDeviceId = payload.device.id;
     passwordInput.value = "";
     await loadSavedDevices(payload.device.id);
-    connectionStatus.textContent = `${payload.device.hostname} saved for quick connect`;
+    const groupMessage = payload.device.group ? ` in ${payload.device.group}` : "";
+    connectionStatus.textContent = automatic
+      ? `${payload.device.hostname} connected and auto-saved${groupMessage}`
+      : `${payload.device.hostname} saved${groupMessage} for quick connect`;
     connectionStatus.className = "status-pill connected";
+    return payload.device;
   } catch (error) {
-    connectionStatus.textContent = `Save error: ${error.message}`;
+    connectionStatus.textContent = automatic
+      ? `Connected, but auto-save failed: ${error.message}`
+      : `Save error: ${error.message}`;
     connectionStatus.className = "status-pill error";
+    return null;
   } finally {
     saveDeviceBtn.disabled = !state.ports.length;
     saveDeviceBtn.textContent = "Save device";
   }
+}
+
+function savedProfileForCurrentConnection() {
+  const hostname = deviceNameInput.value.trim().toLowerCase();
+  const host = hostInput.value.trim().toLowerCase();
+  return state.savedDevices.find((device) => (
+    device.hostname.toLowerCase() === hostname || device.host.toLowerCase() === host
+  )) || null;
 }
 
 function configureAutoRefresh() {
@@ -396,7 +635,10 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     }
 
     state.vlans = payload.vlanMemberships || [];
+    state.irbUnits = payload.irbUnits || [];
+    state.bridgeServices = payload.bridgeServices || [];
     renderVlanChoices();
+    populateServiceChoices();
 
     if (payload.debug) {
       const debugText = [
@@ -416,6 +658,16 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     lastRefresh.textContent = `Last refreshed ${new Date().toLocaleTimeString()}`;
     render(!isRefresh);
     configureAutoRefresh();
+    if (!isRefresh) {
+      if (autoSaveConnectionsInput.checked) await loadSavedDevices(state.savedDeviceId);
+      const existingProfile = savedProfileForCurrentConnection();
+      if (existingProfile) {
+        state.savedDeviceId = existingProfile.id;
+        savedDeviceInput.value = existingProfile.id;
+      } else if (autoSaveConnectionsInput.checked) {
+        await saveCurrentDevice({ automatic: true });
+      }
+    }
   } catch (error) {
     connectionStatus.textContent = `${isRefresh ? "Refresh" : "Connection"} error: ${error.message}`;
     connectionStatus.className = "status-pill error";
@@ -427,6 +679,19 @@ async function connectToSwitch({ isRefresh = false } = {}) {
   }
 }
 
+function logicalServicesForPort(portName) {
+  const services = [];
+  state.bridgeServices.forEach((service) => {
+    service.interfaces.forEach((interfaceName) => {
+      const separator = interfaceName.lastIndexOf(".");
+      if (separator > 0 && interfaceName.slice(0, separator) === portName) {
+        services.push(`${service.name} (unit ${interfaceName.slice(separator + 1)})`);
+      }
+    });
+  });
+  return services;
+}
+
 function render(updateConfiguration = true) {
   portGrid.innerHTML = "";
   const macTopology = buildMacTopology();
@@ -434,7 +699,8 @@ function render(updateConfiguration = true) {
     const button = document.createElement("button");
     const portName = port.name;
     const oper = (port.oper || "unknown").toLowerCase();
-    const configured = !!port.configured;
+    const logicalServices = logicalServicesForPort(portName);
+    const configured = !!port.configured || logicalServices.length > 0;
     const selectedClass = state.selected.has(portName) ? " selected" : "";
     const anchorClass = selectionModeInput.value === "range" && state.lastSelected === port.index ? " range-anchor" : "";
     const statusClass = oper === "up" ? " state-up" : oper === "down" ? " state-down" : "";
@@ -477,6 +743,7 @@ function render(updateConfiguration = true) {
       ["Link / max", speedSummary],
       ["Mode", mode],
       ["VLANs", vlanSummary],
+      ["Logical services", logicalServices.length ? logicalServices.join(", ") : "None"],
       ["MACs", String(learnedMacCount)],
       ["Neighbor", neighbor.systemName || "None learned"],
       ["Manufacturer", manufacturerSummary],
@@ -492,6 +759,7 @@ function render(updateConfiguration = true) {
       ["Description", description || "Not set"],
       ["Mode", mode],
       ["VLANs", vlanSummary],
+      ["Logical services", logicalServices.length ? logicalServices.join(", ") : "None"],
       ["Admin / link", `${port.currentDisabled ? "disabled" : (port.admin || "unknown")} / ${oper}`],
       ["Negotiated rate", port.negotiatedSpeed || "Unknown"],
       ["Port capability", port.speedCapability || "Unknown"],
@@ -536,6 +804,9 @@ function render(updateConfiguration = true) {
     seriesStartPort.value = state.ports.find((port) => state.selected.has(port.name))?.name || "";
   }
   updateSeriesDescriptionPreview();
+  updateIrbSummary();
+  updateQinqSummary();
+  updateLogicalServiceMoveSummary();
   if (updateConfiguration) updateConfig();
   updateConnectionHint();
 }
@@ -848,7 +1119,7 @@ function updateSelectionSummary() {
   const list = Array.from(state.selected);
   const configuredCount = list.filter((name) => {
     const p = state.ports.find((port) => port.name === name);
-    return p && p.configured;
+    return p && (p.configured || logicalServicesForPort(name).length > 0);
   }).length;
   selectionSummary.textContent = `${list.length} selected`;
   selectionSummaryBox.replaceChildren();
@@ -869,11 +1140,13 @@ function updateSelectionSummary() {
     portName.textContent = name;
     const current = document.createElement("small");
     const currentVlans = port?.currentVlans?.length ? port.currentVlans.join(", ") : "no VLAN membership found";
+    const logicalServices = logicalServicesForPort(name);
     const neighborName = port?.lldpNeighbor?.systemName;
     const macCount = port?.learnedMacs?.length || 0;
     const deviceSummary = neighborName || (macCount ? `${macCount} learned MAC${macCount === 1 ? "" : "s"}` : "no connected device learned");
     const adminSummary = port?.currentDisabled ? "disabled" : (port?.oper || "unknown");
-    current.textContent = `${port?.currentMode || "unknown"} · ${currentVlans} · ${adminSummary} · ${deviceSummary}`;
+    const serviceSummary = logicalServices.length ? ` · ${logicalServices.join(", ")}` : "";
+    current.textContent = `${port?.currentMode || "unknown"} · ${currentVlans}${serviceSummary} · ${adminSummary} · ${deviceSummary}`;
     row.append(portName, current);
     selectionSummaryBox.appendChild(row);
   });
@@ -1025,11 +1298,31 @@ function buildMoveConfiguration() {
   if (!window.confirm(`Build a move that replaces destination configuration?\n\n${mappingText}${retiredText}\n\nThe preview will clear every destination before copying source configuration. Retired sources will be cleared, disabled, and renamed.`)) return;
 
   const lines = ["# Interface configuration move", ...mappings.map(({ source, destination }) => `# ${source.name} -> ${destination.name}`), ""];
+  const affectedNames = new Set([...sourceNames, ...destinationNames]);
+  const bridgeDeletes = [];
+  state.bridgeServices.forEach((service) => {
+    service.interfaces.forEach((interfaceName) => {
+      const separator = interfaceName.lastIndexOf(".");
+      const portName = separator > 0 ? interfaceName.slice(0, separator) : interfaceName;
+      if (affectedNames.has(portName)) {
+        bridgeDeletes.push(`delete vlans ${service.name} interface ${interfaceName}`);
+      }
+    });
+  });
+  if (bridgeDeletes.length) lines.push("# Remove logical service references from affected ports", ...bridgeDeletes, "");
   destinationNames.forEach((name) => lines.push(`delete interfaces ${name}`));
   lines.push("");
   mappings.forEach(({ source, destination }) => {
     source.currentSetLines.forEach((line) => {
       lines.push(line.replace(/^set interfaces\s+\S+/, `set interfaces ${destination.name}`));
+    });
+    state.bridgeServices.forEach((service) => {
+      service.interfaces.forEach((interfaceName) => {
+        const separator = interfaceName.lastIndexOf(".");
+        if (separator < 1 || interfaceName.slice(0, separator) !== source.name) return;
+        const unit = interfaceName.slice(separator + 1);
+        lines.push(`set vlans ${service.name} interface ${destination.name}.${unit}`);
+      });
     });
   });
   if (retiredSources.length) {
@@ -1148,10 +1441,303 @@ function createVlanCommand() {
   state.vlans.push({ name, value: String(vlanId) });
   state.vlans.sort((a, b) => Number(a.value) - Number(b.value));
   renderVlanChoices();
+  populateServiceChoices();
   newVlanNameInput.value = "";
   newVlanIdInput.value = "";
   connectionStatus.textContent = `Added VLAN ${name} (${vlanId}) to the preview`;
   connectionStatus.className = "status-pill";
+}
+
+function populateServiceChoices() {
+  const selectedVlan = irbVlanInput.value;
+  irbVlanInput.replaceChildren(new Option(state.vlans.length ? "Select a VLAN" : "Connect to discover VLANs", ""));
+  state.vlans.forEach((vlan) => {
+    const routed = vlan.l3Interface ? ` — ${vlan.l3Interface}` : "";
+    irbVlanInput.add(new Option(`${vlan.name} (${vlan.value})${routed}`, vlan.name));
+  });
+  if (state.vlans.some((vlan) => vlan.name === selectedVlan)) irbVlanInput.value = selectedVlan;
+
+  [qinqCustomerPortInput, qinqUplinkPortInput].forEach((select, index) => {
+    const previous = select.value;
+    select.replaceChildren(new Option(index === 0 ? "Select customer port" : "Select uplink port", ""));
+    state.ports.forEach((port) => select.add(new Option(
+      port.currentDescription ? `${port.name} — ${port.currentDescription}` : port.name,
+      port.name
+    )));
+    if (state.ports.some((port) => port.name === previous)) select.value = previous;
+  });
+
+  const previousServiceSource = logicalServiceSourceInput.value;
+  const hasMovableServices = state.bridgeServices.some((service) => service.interfaces.some((interfaceName) => (
+    interfaceName.slice(interfaceName.lastIndexOf(".") + 1) !== "0"
+  )));
+  logicalServiceSourceInput.replaceChildren(new Option(
+    hasMovableServices ? "Select a logical service" : "No nonzero logical services discovered",
+    ""
+  ));
+  state.bridgeServices.forEach((service, serviceIndex) => {
+    service.interfaces.forEach((interfaceName, memberIndex) => {
+      const portName = interfaceName.slice(0, interfaceName.lastIndexOf("."));
+      const unit = interfaceName.slice(interfaceName.lastIndexOf(".") + 1);
+      if (unit === "0") return;
+      const port = state.ports.find((entry) => entry.name === portName);
+      const unitLines = (port?.currentSetLines || []).filter((line) => line.includes(` unit ${unit} `));
+      const role = unitLines.some((line) => line.includes(" vlan-tags outer "))
+        ? "uplink"
+        : unitLines.some((line) => line.includes(" input-vlan-map push")) ? "customer" : "logical";
+      logicalServiceSourceInput.add(new Option(
+        `${service.name} — ${interfaceName} (${role})`,
+        `${serviceIndex}:${memberIndex}`
+      ));
+    });
+  });
+  if (Array.from(logicalServiceSourceInput.options).some((option) => option.value === previousServiceSource)) {
+    logicalServiceSourceInput.value = previousServiceSource;
+  }
+  updateIrbSummary();
+  updateQinqSummary();
+  updateLogicalServiceMoveSummary();
+}
+
+function selectedLogicalServiceMember() {
+  const match = logicalServiceSourceInput.value.match(/^(\d+):(\d+)$/);
+  if (!match) return null;
+  const service = state.bridgeServices[Number(match[1])];
+  const interfaceName = service?.interfaces?.[Number(match[2])];
+  if (!service || !interfaceName || !interfaceName.includes(".")) return null;
+  const separator = interfaceName.lastIndexOf(".");
+  const unit = interfaceName.slice(separator + 1);
+  if (!/^\d+$/.test(unit) || Number(unit) < 1 || Number(unit) > 16384) return null;
+  return {
+    service,
+    interfaceName,
+    portName: interfaceName.slice(0, separator),
+    unit
+  };
+}
+
+function logicalServiceMoveError() {
+  const source = selectedLogicalServiceMember();
+  const destinations = selectedInterfaceNames();
+  if (!source) return "Select a discovered logical service and source unit.";
+  if (destinations.length !== 1) return "Select exactly one destination port in the inventory.";
+  const destination = destinations[0];
+  if (destination === source.portName) return "Select a destination different from the current service port.";
+  const sourcePort = state.ports.find((port) => port.name === source.portName);
+  const unitMarker = ` unit ${source.unit} `;
+  if (!(sourcePort?.currentSetLines || []).some((line) => line.includes(unitMarker))) {
+    return `${source.interfaceName} has no discovered logical-unit configuration to copy.`;
+  }
+  const destinationPort = state.ports.find((port) => port.name === destination);
+  if ((destinationPort?.currentSetLines || []).some((line) => line.includes(unitMarker))) {
+    return `${destination}.${source.unit} already has interface configuration.`;
+  }
+  const destinationMember = `${destination}.${source.unit}`;
+  const existingOwner = state.bridgeServices.find((service) => service.interfaces.includes(destinationMember));
+  if (existingOwner) return `${destinationMember} is already a member of ${existingOwner.name}.`;
+  const incompatibleEncapsulation = (destinationPort?.currentSetLines || []).find((line) => (
+    /^set interfaces\s+\S+\s+encapsulation\s+/.test(line)
+    && !line.endsWith(" encapsulation flexible-ethernet-services")
+  ));
+  if (incompatibleEncapsulation) {
+    return `${destination} uses another physical encapsulation; this move will not replace it.`;
+  }
+  if ((destinationPort?.currentSetLines || []).some((line) => /\s+vlan-tagging$/.test(line))) {
+    return `${destination} uses vlan-tagging instead of flexible-vlan-tagging.`;
+  }
+  return "";
+}
+
+function updateLogicalServiceMoveSummary() {
+  const source = selectedLogicalServiceMember();
+  const destination = selectedInterfaceNames()[0];
+  const error = logicalServiceMoveError();
+  logicalServiceMoveSummary.textContent = error || `${source.service.name}: ${source.interfaceName} → ${destination}.${source.unit}`;
+  logicalServiceMoveSummary.className = `tool-summary ${error ? "muted" : "valid"}`;
+}
+
+function buildLogicalServiceMove() {
+  const source = selectedLogicalServiceMember();
+  const destination = selectedInterfaceNames()[0];
+  const error = logicalServiceMoveError();
+  if (error) {
+    connectionStatus.textContent = error;
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  const sourcePort = state.ports.find((port) => port.name === source.portName);
+  const unitMarker = ` unit ${source.unit} `;
+  const physicalPrerequisites = sourcePort.currentSetLines.filter((line) => {
+    const remainder = line.replace(/^set interfaces\s+\S+\s+/, "");
+    return remainder === "flexible-vlan-tagging"
+      || remainder === "encapsulation flexible-ethernet-services"
+      || /^mtu \d+$/.test(remainder);
+  });
+  const unitLines = sourcePort.currentSetLines.filter((line) => line.includes(unitMarker));
+  const rewrittenLines = [...physicalPrerequisites, ...unitLines]
+    .map((line) => line.replace(/^set interfaces\s+\S+/, `set interfaces ${destination}`));
+  const lines = [
+    `# Move ${source.service.name} logical unit ${source.unit}: ${source.portName} -> ${destination}`,
+    `delete vlans ${source.service.name} interface ${source.interfaceName}`,
+    ...rewrittenLines,
+    `set vlans ${source.service.name} interface ${destination}.${source.unit}`,
+    `delete interfaces ${source.portName} unit ${source.unit}`
+  ];
+  replaceConfig(lines.join("\n"), true);
+  connectionStatus.textContent = `Built logical-unit move for ${source.service.name} to ${destination}.${source.unit}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review");
+}
+
+function validIpv4Prefix(value) {
+  const match = value.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
+  if (!match || Number(match[2]) > 32) return false;
+  return match[1].split(".").every((octet) => Number(octet) <= 255);
+}
+
+function irbConflict() {
+  const vlan = state.vlans.find((entry) => entry.name === irbVlanInput.value);
+  const unit = Number(irbUnitInput.value);
+  if (!vlan || !Number.isInteger(unit)) return "";
+  const intendedInterface = `irb.${unit}`;
+  if (vlan.l3Interface && vlan.l3Interface.toLowerCase() !== intendedInterface) {
+    return `${vlan.name} is already bound to ${vlan.l3Interface}.`;
+  }
+  const owningVlan = state.vlans.find((entry) => entry.name !== vlan.name
+    && entry.l3Interface?.toLowerCase() === intendedInterface);
+  if (owningVlan) return `${intendedInterface} is already bound to ${owningVlan.name}.`;
+  const existingUnit = state.irbUnits.find((entry) => Number(entry.unit) === unit);
+  const address = irbAddressInput.value.trim();
+  if (existingUnit?.addresses?.length && address && !existingUnit.addresses.includes(address)) {
+    return `${intendedInterface} already has ${existingUnit.addresses.join(", ")}; this builder will not add a secondary address.`;
+  }
+  return "";
+}
+
+function updateIrbSummary() {
+  const vlan = state.vlans.find((entry) => entry.name === irbVlanInput.value);
+  if (!vlan) {
+    irbSummary.textContent = state.vlans.length ? "Select a VLAN to begin." : "Connect to discover VLANs first.";
+    irbSummary.className = "tool-summary muted";
+    return;
+  }
+  const unit = irbUnitInput.value;
+  const address = irbAddressInput.value.trim();
+  const conflict = irbConflict();
+  irbSummary.textContent = conflict || `${vlan.name} (${vlan.value}) → irb.${unit || "?"} → ${address || "IPv4 prefix required"}`;
+  irbSummary.className = `tool-summary ${conflict ? "error-text" : (unit && validIpv4Prefix(address) ? "valid" : "muted")}`;
+}
+
+function buildIrbConfiguration() {
+  const vlan = state.vlans.find((entry) => entry.name === irbVlanInput.value);
+  const unit = Number(irbUnitInput.value);
+  const address = irbAddressInput.value.trim();
+  const conflict = irbConflict();
+  if (!vlan || !Number.isInteger(unit) || unit < 0 || unit > 16384 || !validIpv4Prefix(address) || conflict) {
+    connectionStatus.textContent = conflict || "Select a VLAN, enter an IRB unit from 0 to 16384, and enter an IPv4 prefix such as 192.0.2.1/24";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  appendConfigLines([
+    `# IRB gateway for ${vlan.name} (${vlan.value})`,
+    `set interfaces irb unit ${unit} family inet address ${address}`,
+    `set vlans ${vlan.name} l3-interface irb.${unit}`
+  ]);
+  connectionStatus.textContent = `Appended IRB gateway irb.${unit} for ${vlan.name}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review");
+}
+
+function qinqValues() {
+  return {
+    customer: qinqCustomerPortInput.value,
+    uplink: qinqUplinkPortInput.value,
+    serviceName: qinqServiceNameInput.value.trim(),
+    outer: Number(qinqOuterTagInput.value),
+    inner: Number(qinqInnerTagInput.value),
+    mtu: Number(qinqMtuInput.value)
+  };
+}
+
+function qinqValidationError() {
+  const values = qinqValues();
+  if (!values.customer || !values.uplink) return "Choose both the customer-facing and uplink ports.";
+  if (values.customer === values.uplink) return "Customer-facing and uplink ports must be different.";
+  if (!/^[A-Za-z0-9_.:-]+$/.test(values.serviceName)) return "Enter a bridge VLAN name using letters, numbers, . _ : or -.";
+  const existingService = state.bridgeServices.find((service) => service.name === values.serviceName);
+  if (state.vlans.some((vlan) => vlan.name === values.serviceName) && !existingService) {
+    return `${values.serviceName} already exists as a tagged VLAN; use a unique bridge VLAN name.`;
+  }
+  if (![values.outer, values.inner].every((tag) => Number.isInteger(tag) && tag >= 1 && tag <= 4094)) {
+    return "Outer and inner VLAN tags must be from 1 to 4094.";
+  }
+  if (!Number.isInteger(values.mtu) || values.mtu < 1518 || values.mtu > 16384) {
+    return "Physical MTU must be from 1518 to 16384 bytes.";
+  }
+  const intendedMembers = [`${values.customer}.${values.inner}`, `${values.uplink}.${values.inner}`];
+  if (existingService && (existingService.interfaces.length !== intendedMembers.length
+    || existingService.interfaces.some((name) => !intendedMembers.includes(name)))) {
+    return `${values.serviceName} already has different logical interface members.`;
+  }
+  return "";
+}
+
+function buildQinqLines(values) {
+  const customerUnit = `${values.customer}.${values.inner}`;
+  const uplinkUnit = `${values.uplink}.${values.inner}`;
+  return [
+    `# Q-in-Q service ${values.serviceName}: outer ${values.outer}, inner ${values.inner}`,
+    `set interfaces ${values.customer} flexible-vlan-tagging`,
+    `set interfaces ${values.customer} mtu ${values.mtu}`,
+    `set interfaces ${values.customer} encapsulation flexible-ethernet-services`,
+    `set interfaces ${values.customer} unit ${values.inner} encapsulation vlan-bridge`,
+    `set interfaces ${values.customer} unit ${values.inner} vlan-id ${values.inner}`,
+    `set interfaces ${values.customer} unit ${values.inner} input-vlan-map push`,
+    `set interfaces ${values.customer} unit ${values.inner} input-vlan-map vlan-id ${values.outer}`,
+    `set interfaces ${values.customer} unit ${values.inner} output-vlan-map pop`,
+    `set interfaces ${values.uplink} flexible-vlan-tagging`,
+    `set interfaces ${values.uplink} mtu ${values.mtu}`,
+    `set interfaces ${values.uplink} encapsulation flexible-ethernet-services`,
+    `set interfaces ${values.uplink} unit ${values.inner} encapsulation vlan-bridge`,
+    `set interfaces ${values.uplink} unit ${values.inner} vlan-tags outer ${values.outer}`,
+    `set interfaces ${values.uplink} unit ${values.inner} vlan-tags inner ${values.inner}`,
+    `set vlans ${values.serviceName} interface ${customerUnit}`,
+    `set vlans ${values.serviceName} interface ${uplinkUnit}`
+  ];
+}
+
+function qinqUnitConflict(values, expectedLines) {
+  for (const interfaceName of [values.customer, values.uplink]) {
+    const port = state.ports.find((entry) => entry.name === interfaceName);
+    const unitMarker = ` unit ${values.inner} `;
+    const existingLines = (port?.currentSetLines || []).filter((line) => line.includes(unitMarker));
+    const unexpected = existingLines.find((line) => !expectedLines.includes(line));
+    if (unexpected) return `${interfaceName} unit ${values.inner} already has other configuration.`;
+  }
+  return "";
+}
+
+function updateQinqSummary() {
+  const values = qinqValues();
+  const error = qinqValidationError();
+  qinqSummary.textContent = error || `${values.customer}.${values.inner} ↔ ${values.uplink}.${values.inner} · outer ${values.outer} / inner ${values.inner} · MTU ${values.mtu}`;
+  qinqSummary.className = `tool-summary ${error ? "muted" : "valid"}`;
+}
+
+function buildQinqConfiguration() {
+  const values = qinqValues();
+  const validationError = qinqValidationError();
+  const lines = validationError ? [] : buildQinqLines(values);
+  const conflict = validationError ? "" : qinqUnitConflict(values, lines);
+  if (validationError || conflict) {
+    connectionStatus.textContent = conflict || validationError;
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  appendConfigLines(lines);
+  connectionStatus.textContent = `Appended Q-in-Q service ${values.serviceName} on ${values.customer} and ${values.uplink}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review");
 }
 
 function applySelectedPorts() {
@@ -1413,6 +1999,15 @@ selectionModeInput.addEventListener("change", () => {
 shiftOffsetInput.addEventListener("input", updateMoveSummary);
 [seriesConfigurationScopeInput, seriesStartPort, seriesCountInput, seriesStartNumberInput, seriesDescriptionInput, seriesPostfixInput, seriesIncludePortNumberInput]
   .forEach((input) => input.addEventListener("input", updateSeriesDescriptionPreview));
+irbVlanInput.addEventListener("change", () => {
+  const vlan = state.vlans.find((entry) => entry.name === irbVlanInput.value);
+  if (vlan) irbUnitInput.value = vlan.value;
+  updateIrbSummary();
+});
+[irbUnitInput, irbAddressInput].forEach((input) => input.addEventListener("input", updateIrbSummary));
+[qinqCustomerPortInput, qinqUplinkPortInput, qinqServiceNameInput, qinqOuterTagInput, qinqInnerTagInput, qinqMtuInput]
+  .forEach((input) => input.addEventListener("input", updateQinqSummary));
+logicalServiceSourceInput.addEventListener("change", updateLogicalServiceMoveSummary);
 
 document.getElementById("selectAllBtn").addEventListener("click", () => {
   state.selected = new Set(state.ports.map((port) => port.name));
@@ -1444,6 +2039,9 @@ learnedMacDialog.addEventListener("click", (event) => {
 document.getElementById("moveConfigBtn").addEventListener("click", buildMoveConfiguration);
 document.getElementById("buildSeriesBtn").addEventListener("click", buildSeriesConfiguration);
 document.getElementById("createVlanBtn").addEventListener("click", createVlanCommand);
+document.getElementById("buildIrbBtn").addEventListener("click", buildIrbConfiguration);
+document.getElementById("buildQinqBtn").addEventListener("click", buildQinqConfiguration);
+document.getElementById("moveLogicalServiceBtn").addEventListener("click", buildLogicalServiceMove);
 document.getElementById("applyBtn").addEventListener("click", applySelectedPorts);
 document.getElementById("addVlanBtn").addEventListener("click", addVlanToSelected);
 document.getElementById("removeVlanBtn").addEventListener("click", removeVlanFromSelected);
@@ -1451,11 +2049,78 @@ document.getElementById("setDescriptionBtn").addEventListener("click", setDescri
 document.getElementById("enablePortsBtn").addEventListener("click", enableSelectedPorts);
 document.getElementById("disablePortsBtn").addEventListener("click", disableSelectedPorts);
 document.getElementById("clearPortsBtn").addEventListener("click", clearSelectedPortConfiguration);
-connectBtn.addEventListener("click", () => connectToSwitch());
+connectionForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  connectToSwitch();
+});
 savedDeviceInput.addEventListener("change", selectSavedDevice);
-quickConnectBtn.addEventListener("click", () => connectToSwitch());
-saveDeviceBtn.addEventListener("click", saveCurrentDevice);
+savedDeviceInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && savedDeviceInput.value && !state.connectionInProgress) {
+    event.preventDefault();
+    connectToSwitch();
+  }
+});
+quickConnectBtn.addEventListener("click", () => {
+  connectToSwitch();
+});
+saveDeviceBtn.addEventListener("click", () => saveCurrentDevice());
+autoSaveConnectionsInput.addEventListener("change", () => {
+  try {
+    window.localStorage.setItem(AUTO_SAVE_STORAGE_KEY, String(autoSaveConnectionsInput.checked));
+  } catch (_error) {
+    // Auto-save still works for this session if browser storage is unavailable.
+  }
+});
 refreshNowBtn.addEventListener("click", () => connectToSwitch({ isRefresh: true }));
+optionsBtn.addEventListener("click", async () => {
+  await loadSavedDevices(state.savedDeviceId);
+  optionsDialog.showModal();
+  (groupDeviceList.querySelector('input[name="groupDevice"]') || groupAssignmentInput).focus();
+});
+document.getElementById("closeOptionsBtn").addEventListener("click", () => optionsDialog.close());
+optionsDialog.addEventListener("click", (event) => {
+  if (event.target === optionsDialog) optionsDialog.close();
+});
+groupDeviceList.addEventListener("change", updateGroupSelectionStatus);
+visibleGroupList.addEventListener("change", () => {
+  state.visibleSavedDeviceGroups = new Set(
+    Array.from(visibleGroupList.querySelectorAll('input[name="visibleSavedGroup"]:checked'))
+      .map((input) => input.value)
+  );
+  storeVisibleSavedDeviceGroups();
+  renderVisibleGroupChoices();
+  renderSavedDeviceChoices();
+});
+groupAssignmentForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  assignSelectedDevicesToGroup();
+});
+document.getElementById("selectAllGroupDevicesBtn").addEventListener("click", () => {
+  groupDeviceList.querySelectorAll('input[name="groupDevice"]').forEach((input) => { input.checked = true; });
+  updateGroupSelectionStatus();
+});
+document.getElementById("clearGroupDevicesBtn").addEventListener("click", () => {
+  groupDeviceList.querySelectorAll('input[name="groupDevice"]').forEach((input) => { input.checked = false; });
+  updateGroupSelectionStatus();
+});
+document.getElementById("showAllSavedGroupsBtn").addEventListener("click", () => {
+  state.visibleSavedDeviceGroups = null;
+  storeVisibleSavedDeviceGroups();
+  renderVisibleGroupChoices();
+  renderSavedDeviceChoices();
+});
+document.getElementById("hideAllSavedGroupsBtn").addEventListener("click", () => {
+  state.visibleSavedDeviceGroups = new Set();
+  storeVisibleSavedDeviceGroups();
+  renderVisibleGroupChoices();
+  renderSavedDeviceChoices();
+});
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && state.ports.length) {
+    event.preventDefault();
+    saveCurrentDevice();
+  }
+});
 refreshIntervalInput.addEventListener("change", configureAutoRefresh);
 richardViewBtn.addEventListener("click", () => {
   state.richardView = !state.richardView;
@@ -1476,6 +2141,20 @@ tabButtons.forEach((button, index) => {
     activateWorkspaceTab(next.dataset.tab, true);
   });
 });
+
+try {
+  autoSaveConnectionsInput.checked = window.localStorage.getItem(AUTO_SAVE_STORAGE_KEY) === "true";
+  const storedVisibleGroups = window.localStorage.getItem(VISIBLE_GROUPS_STORAGE_KEY);
+  if (storedVisibleGroups !== null) {
+    const parsedVisibleGroups = JSON.parse(storedVisibleGroups);
+    if (Array.isArray(parsedVisibleGroups) && parsedVisibleGroups.every((group) => typeof group === "string")) {
+      state.visibleSavedDeviceGroups = new Set(parsedVisibleGroups);
+    }
+  }
+} catch (_error) {
+  autoSaveConnectionsInput.checked = false;
+  state.visibleSavedDeviceGroups = null;
+}
 
 render();
 activateWorkspaceTab("configure");

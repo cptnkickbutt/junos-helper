@@ -9,9 +9,12 @@
   <body>
     <div class="app-shell">
       <header class="hero">
-        <p class="eyebrow">Visual quick-change tool</p>
-        <h1>Junos switch port configurator</h1>
-        <p class="hero-copy">Discover the switch, select ports visually, build a focused change, and review the live candidate diff before deployment.</p>
+        <div>
+          <p class="eyebrow">Visual quick-change tool</p>
+          <h1>Junos switch port configurator</h1>
+          <p class="hero-copy">Discover the switch, select ports visually, build a focused change, and review the live candidate diff before deployment.</p>
+        </div>
+        <button id="optionsBtn" class="secondary options-trigger" type="button" aria-haspopup="dialog">Options</button>
       </header>
 
       <main class="layout">
@@ -29,18 +32,21 @@
               <h3>Login credentials</h3>
               <div class="saved-device-controls">
                 <label>Saved device<select id="savedDevice"><option value="">Choose a saved device</option></select></label>
-                <button id="quickConnectBtn" class="secondary" disabled>Quick connect</button>
+                <button id="quickConnectBtn" class="secondary" type="button" disabled>Quick connect</button>
               </div>
-              <div class="form-grid login-grid">
-                <label>Host / IP<input id="host" autocomplete="off" /></label>
-                <label>Username<input id="username" autocomplete="username" /></label>
-                <label>Password<input id="password" type="password" autocomplete="current-password" placeholder="Uses local .env when blank" /></label>
-              </div>
-              <div class="button-row connection-actions">
-                <button id="connectBtn">Connect & pull data</button>
-                <button id="saveDeviceBtn" class="secondary" disabled>Save device</button>
-              </div>
-              <p class="credential-note">Saved credentials remain local in <code>.env</code> and passwords are never returned to the browser.</p>
+              <form id="connectionForm">
+                <div class="form-grid login-grid">
+                  <label>Host / IP<input id="host" autocomplete="off" /></label>
+                  <label>Username<input id="username" autocomplete="username" /></label>
+                  <label>Password<input id="password" type="password" autocomplete="current-password" placeholder="Uses local .env when blank" /></label>
+                </div>
+                <div class="button-row connection-actions">
+                  <button id="connectBtn" type="submit" title="Connect (Enter)">Connect & pull data</button>
+                  <button id="saveDeviceBtn" class="secondary" type="button" title="Save connected device (Ctrl/Cmd+S)" disabled>Save device</button>
+                  <label class="compact-checkbox auto-save-control" title="After a successful manual connection, save it when no matching hostname or address is already stored"><input id="autoSaveConnections" type="checkbox" /><span>Auto-save new</span></label>
+                </div>
+              </form>
+              <p class="credential-note">Saved credentials remain local in <code>.env</code>. Manage switch groups under <strong>Options</strong>.</p>
             </div>
 
             <div class="device-identity">
@@ -49,7 +55,7 @@
               <div id="deviceMetadata" class="device-metadata">Connect to load device identity.</div>
               <div class="connection-inline"><strong>SSH</strong><span id="connectionHint">ssh netops@host</span></div>
               <div class="refresh-controls">
-                <label>Auto-refresh<select id="refreshInterval"><option value="0">Off</option><option value="30">Every 30 seconds</option><option value="60">Every minute</option><option value="300">Every 5 minutes</option></select></label>
+                <label>Auto-refresh<select id="refreshInterval"><option value="0">Off</option><option value="30">Every 30 seconds</option><option value="60" selected>Every minute</option><option value="300">Every 5 minutes</option></select></label>
                 <button id="refreshNowBtn" class="secondary" disabled>Refresh now</button>
               </div>
               <small id="lastRefresh" class="muted">Not refreshed yet</small>
@@ -145,6 +151,46 @@
                 </div>
               </div>
             </div>
+            <details class="advanced-service-options">
+              <summary>IRB and Q-in-Q options</summary>
+              <p class="advanced-service-intro">Configure routed VLAN gateways, build new Q-in-Q pairs, or move one discovered logical service without replacing unit 0.</p>
+              <div class="service-card-grid">
+                <section class="feature-focus-card service-builder" aria-labelledby="irbBuilderTitle">
+                  <h4 id="irbBuilderTitle">IRB gateway</h4>
+                  <p>Give an existing VLAN an IPv4 gateway. The VLAN can have only one Layer 3 interface.</p>
+                  <div class="service-controls irb-controls">
+                    <label>VLAN<select id="irbVlan"><option value="">Connect to discover VLANs</option></select></label>
+                    <label>IRB unit<input id="irbUnit" type="number" min="0" max="16384" placeholder="310" /></label>
+                    <label>IPv4 address / prefix<input id="irbAddress" inputmode="decimal" placeholder="192.0.2.1/24" /></label>
+                  </div>
+                  <div id="irbSummary" class="tool-summary muted">Select a VLAN to begin.</div>
+                  <button id="buildIrbBtn">Append IRB configuration</button>
+                </section>
+
+                <section class="feature-focus-card service-builder" aria-labelledby="qinqBuilderTitle">
+                  <h4 id="qinqBuilderTitle">New Q-in-Q service pair</h4>
+                  <p>Push the outer service tag at the customer port and carry the outer/inner pair on the uplink.</p>
+                  <div class="service-controls qinq-controls">
+                    <label>Customer-facing port<select id="qinqCustomerPort"><option value="">Connect to discover ports</option></select></label>
+                    <label>Uplink port<select id="qinqUplinkPort"><option value="">Connect to discover ports</option></select></label>
+                    <label>Bridge VLAN name<input id="qinqServiceName" placeholder="CUSTOMER_QINQ" /></label>
+                    <label>Outer service tag<input id="qinqOuterTag" type="number" min="1" max="4094" placeholder="200" /></label>
+                    <label>Inner customer tag<input id="qinqInnerTag" type="number" min="1" max="4094" placeholder="300" /></label>
+                    <label>Physical MTU<input id="qinqMtu" type="number" min="1518" max="16384" value="9216" /></label>
+                  </div>
+                  <div id="qinqSummary" class="tool-summary muted">Choose two different physical ports and both VLAN tags.</div>
+                  <button id="buildQinqBtn">Append Q-in-Q configuration</button>
+                </section>
+
+                <section class="feature-focus-card service-builder logical-service-move" aria-labelledby="logicalServiceMoveTitle">
+                  <h4 id="logicalServiceMoveTitle">Move a logical service unit</h4>
+                  <p>Copy one discovered nonzero unit and move its bridge-VLAN reference to the single port selected above. Unit 0 and the IRB stay in place.</p>
+                  <label>Source service and unit<select id="logicalServiceSource"><option value="">Connect to discover logical services</option></select></label>
+                  <div id="logicalServiceMoveSummary" class="tool-summary muted">Select one destination port in the inventory.</div>
+                  <button id="moveLogicalServiceBtn">Build logical-unit move</button>
+                </section>
+              </div>
+            </details>
           </div>
 
           <div class="tab-panel" id="panel-move" role="tabpanel" aria-labelledby="tab-move" data-panel="move" hidden>
@@ -222,6 +268,43 @@
         </section>
       </main>
     </div>
+    <dialog id="optionsDialog" class="options-dialog" aria-labelledby="optionsDialogTitle">
+      <div class="dialog-heading">
+        <div>
+          <p class="section-label">Application options</p>
+          <h2 id="optionsDialogTitle">Saved sites</h2>
+        </div>
+        <button id="closeOptionsBtn" class="dialog-close secondary" type="button" aria-label="Close options" title="Close">&times;</button>
+      </div>
+      <p class="options-copy">Select one or more saved switches and assign them to a group together.</p>
+      <section class="options-section">
+        <div class="group-management-heading">
+          <h3>Groups shown in Saved device</h3>
+          <div class="button-row group-selection-actions">
+            <button id="showAllSavedGroupsBtn" class="secondary" type="button">Show all</button>
+            <button id="hideAllSavedGroupsBtn" class="secondary" type="button">Clear</button>
+          </div>
+        </div>
+        <div id="visibleGroupList" class="visible-group-list"><span class="muted">No groups loaded.</span></div>
+        <div id="visibleGroupStatus" class="tool-summary muted" aria-live="polite">All groups are shown by default.</div>
+      </section>
+      <section class="options-section">
+        <div class="group-management-heading">
+          <h3>Switch groups</h3>
+          <div class="button-row group-selection-actions">
+            <button id="selectAllGroupDevicesBtn" class="secondary" type="button">Select all</button>
+            <button id="clearGroupDevicesBtn" class="secondary" type="button">Clear</button>
+          </div>
+        </div>
+        <div id="groupDeviceList" class="group-device-list"><span class="muted">No saved switches loaded.</span></div>
+        <form id="groupAssignmentForm" class="group-assignment-form">
+          <label>Assign selected to group<input id="groupAssignment" list="savedDeviceGroups" maxlength="64" placeholder="Leave blank for Ungrouped" /><datalist id="savedDeviceGroups"></datalist></label>
+          <button id="assignGroupBtn" type="submit" title="Apply group (Enter)">Apply group</button>
+        </form>
+        <div id="groupManagementStatus" class="tool-summary muted" aria-live="polite">Select saved switches to organize.</div>
+      </section>
+      <p class="credential-note">Group changes do not modify connection credentials.</p>
+    </dialog>
     <dialog id="learnedMacDialog" class="learned-mac-dialog" aria-labelledby="learnedMacDialogTitle">
       <div class="dialog-heading">
         <div>

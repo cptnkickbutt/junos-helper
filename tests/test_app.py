@@ -10,15 +10,21 @@ from app import (
     _connection_values,
     _configured_interface_names,
     _enrich_lldp_neighbor,
+    _interface_name_capability,
+    _interface_sort_key,
     _mac_manufacturer,
     _parse_interface_details,
     _parse_interface_speeds,
     _parse_interface_configuration,
+    _parse_irb_configuration,
     _parse_interfaces,
     _parse_ethernet_switching_table,
     _parse_lldp_neighbors,
+    _preferred_interface_names,
     _parse_configured_vlans,
     _parse_vlan_memberships,
+    _parse_vlan_l3_interfaces,
+    _parse_vlan_interface_members,
     _run_command,
     _ssh_client,
     _validated_config_lines,
@@ -36,24 +42,42 @@ class PackagedEnvironmentTests(unittest.TestCase):
                 Path(r"C:\Users\tester\AppData\Local") / "Junos Helper" / ".env",
             )
 
-    def test_packaged_environment_copies_seed_only_once(self) -> None:
+    def test_packaged_environment_merges_new_device_seed_without_replacing_local_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             resource_dir = base / "resources"
             resource_dir.mkdir()
             seed = resource_dir / ".env"
-            seed.write_text("JUNOS_HOST=192.0.2.10\n", encoding="utf-8")
+            seed.write_text(
+                "JUNOS_HOST=192.0.2.10\n"
+                "JUNOS_DEVICE_SHARED_GROUP='Original'\n",
+                encoding="utf-8",
+            )
             destination = base / "data" / ".env"
 
             with patch.object(app_module, "IS_FROZEN", True), patch.object(
                 app_module, "RESOURCE_DIR", resource_dir
             ):
                 app_module._prepare_environment(destination)
-                self.assertEqual(destination.read_text(encoding="utf-8"), "JUNOS_HOST=192.0.2.10\n")
+                first_values = app_module.dotenv_values(destination)
+                self.assertEqual(first_values["JUNOS_HOST"], "192.0.2.10")
+                self.assertEqual(first_values["JUNOS_DEVICE_SHARED_GROUP"], "Original")
+                self.assertIn(app_module.DEVICE_SEED_HASH_KEY, first_values)
 
-                seed.write_text("JUNOS_HOST=192.0.2.20\n", encoding="utf-8")
+                app_module._persist_dotenv_values(destination, {
+                    "JUNOS_DEVICE_COWORKER_HOSTNAME": "coworker-only",
+                })
+
+                seed.write_text(
+                    "JUNOS_HOST=192.0.2.20\n"
+                    "JUNOS_DEVICE_SHARED_GROUP='Updated'\n",
+                    encoding="utf-8",
+                )
                 app_module._prepare_environment(destination)
-                self.assertEqual(destination.read_text(encoding="utf-8"), "JUNOS_HOST=192.0.2.10\n")
+                updated_values = app_module.dotenv_values(destination)
+                self.assertEqual(updated_values["JUNOS_HOST"], "192.0.2.10")
+                self.assertEqual(updated_values["JUNOS_DEVICE_SHARED_GROUP"], "Updated")
+                self.assertEqual(updated_values["JUNOS_DEVICE_COWORKER_HOSTNAME"], "coworker-only")
 
 
 class RunCommandTests(unittest.TestCase):
@@ -225,6 +249,28 @@ class DiscoveryParsingTests(unittest.TestCase):
             {"name": "TEST_ENV", "value": "23"},
         ])
 
+    def test_parse_irb_addresses_and_vlan_bindings(self) -> None:
+        interface_output = "\n".join([
+            "set interfaces irb unit 310 family inet address 192.0.2.1/24",
+            "set interfaces irb unit 310 family inet address 192.0.2.2/24",
+            "set interfaces irb unit 999 family inet6 address 2001:db8::1/64",
+        ])
+        vlan_output = "\n".join([
+            "set vlans TEST_MGMT vlan-id 310",
+            "set vlans TEST_MGMT l3-interface irb.310",
+            "set vlans TEST_QINQ interface ge-0/0/17.300",
+            "set vlans TEST_QINQ interface xe-0/2/0.300",
+        ])
+
+        self.assertEqual(_parse_irb_configuration(interface_output), [
+            {"unit": 310, "addresses": ["192.0.2.1/24", "192.0.2.2/24"]},
+        ])
+        self.assertEqual(_parse_vlan_l3_interfaces(vlan_output), {"TEST_MGMT": "irb.310"})
+        self.assertEqual(_parse_vlan_interface_members(vlan_output), [{
+            "name": "TEST_QINQ",
+            "interfaces": ["ge-0/0/17.300", "xe-0/2/0.300"],
+        }])
+
     def test_parse_interface_configuration_uses_exact_names(self) -> None:
         output = "\n".join([
             'set interfaces ge-0/0/1 description "Camera #1"',
@@ -276,6 +322,117 @@ class DiscoveryParsingTests(unittest.TestCase):
 
         self.assertEqual(_parse_interfaces(output), ["ae0", "mge-0/0/0"])
 
+    def test_parse_interfaces_keeps_ex4650_channelized_ports_distinct(self) -> None:
+        output = "\n".join([
+            "Interface               Admin Link Proto    Local                 Remote",
+            "et-0/0/0:0             up    up",
+            "et-0/0/0:0.0           up    up   eth-switch",
+            "et-0/0/0:1             up    down",
+            "et-0/0/0:2             up    up",
+            "et-0/0/0:3             down  down",
+            "et-0/0/1               up    up",
+        ])
+
+        self.assertEqual(_parse_interfaces(output), [
+            "et-0/0/0:0",
+            "et-0/0/0:1",
+            "et-0/0/0:2",
+            "et-0/0/0:3",
+            "et-0/0/1",
+        ])
+        self.assertEqual(
+            [(detail["name"], detail["admin"], detail["oper"])
+             for detail in _parse_interface_details(output)],
+            [
+                ("et-0/0/0:0", "up", "up"),
+                ("et-0/0/0:1", "up", "down"),
+                ("et-0/0/0:2", "up", "up"),
+                ("et-0/0/0:3", "down", "down"),
+                ("et-0/0/1", "up", "up"),
+            ],
+        )
+
+        configuration = _parse_interface_configuration("\n".join([
+            'set interfaces et-0/0/0:0 description "Lane zero"',
+            'set interfaces et-0/0/0:1 description "Lane one"',
+        ]))
+        self.assertEqual(set(configuration), {"et-0/0/0:0", "et-0/0/0:1"})
+
+        macs = _parse_ethernet_switching_table("\n".join([
+            "DATA 00:11:22:33:44:55 Learn 0 et-0/0/0:0.0",
+            "DATA 00:11:22:33:44:66 Learn 0 et-0/0/0:1.0",
+        ]))
+        self.assertEqual(set(macs), {"et-0/0/0:0", "et-0/0/0:1"})
+
+    def test_interface_inventory_sort_uses_physical_port_order(self) -> None:
+        interfaces = [
+            "et-0/0/55",
+            "xe-0/0/12",
+            "et-0/0/48",
+            "xe-0/0/2",
+            "xe-0/0/0",
+            "ae0",
+        ]
+
+        self.assertEqual(sorted(interfaces, key=_interface_sort_key), [
+            "xe-0/0/0",
+            "xe-0/0/2",
+            "xe-0/0/12",
+            "et-0/0/48",
+            "et-0/0/55",
+            "ae0",
+        ])
+
+    def test_ex4100_inventory_keeps_access_and_uplink_banks_separate(self) -> None:
+        interfaces = [
+            "xe-0/2/0",
+            "ge-0/0/16",
+            "xe-0/0/1",
+            "mge-0/0/1",
+            "xe-0/1/0",
+            "mge-0/0/0",
+        ]
+
+        self.assertEqual(
+            sorted(interfaces, key=lambda name: _interface_sort_key(name, "EX4100-48MP")),
+            [
+                "mge-0/0/0",
+                "mge-0/0/1",
+                "ge-0/0/16",
+                "xe-0/0/1",
+                "xe-0/1/0",
+                "xe-0/2/0",
+            ],
+        )
+
+    def test_faster_et_alias_replaces_xe_without_collapsing_mge(self) -> None:
+        self.assertEqual(_preferred_interface_names([
+            "xe-0/1/0",
+            "et-0/1/0",
+            "mge-0/0/1",
+            "xe-0/0/1",
+        ]), [
+            "et-0/1/0",
+            "mge-0/0/1",
+            "xe-0/0/1",
+        ])
+
+    def test_ex4400_uses_fastest_prefix_for_each_physical_port(self) -> None:
+        self.assertEqual(_preferred_interface_names([
+            "ge-0/0/0",
+            "xe-0/0/0",
+            "xe-0/1/0",
+            "et-0/1/0",
+        ], "EX4400-24X"), [
+            "xe-0/0/0",
+            "et-0/1/0",
+        ])
+
+    def test_interface_name_capability_infers_fixed_rate_prefixes(self) -> None:
+        self.assertEqual(_interface_name_capability("xe-0/0/47"), "10 Gbps")
+        self.assertEqual(_interface_name_capability("et-0/0/48"), "100 Gbps")
+        self.assertEqual(_interface_name_capability("mge-0/0/0"), "2.5 Gbps")
+
 
 class ConfigValidationTests(unittest.TestCase):
     def test_accepts_interface_set_and_delete_commands(self) -> None:
@@ -298,6 +455,24 @@ class ConfigValidationTests(unittest.TestCase):
             _validated_config_lines("set vlans CAMERAS vlan-id 325"),
             ["set vlans CAMERAS vlan-id 325"],
         )
+
+    def test_accepts_irb_and_qinq_service_commands(self) -> None:
+        config = "\n".join([
+            "set interfaces irb unit 310 family inet address 192.0.2.1/24",
+            "set vlans TEST_MGMT l3-interface irb.310",
+            "set interfaces ge-0/0/17 unit 300 encapsulation vlan-bridge",
+            "set interfaces xe-0/2/0 unit 300 vlan-tags outer 200",
+            "set vlans TEST_QINQ interface ge-0/0/17.300",
+            "set vlans TEST_QINQ interface xe-0/2/0.300",
+        ])
+
+        self.assertEqual(len(_validated_config_lines(config)), 6)
+
+    def test_rejects_invalid_irb_prefix_and_unscoped_vlan_edit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Invalid IRB"):
+            _validated_config_lines("set interfaces irb unit 310 family inet address nope")
+        with self.assertRaisesRegex(ValueError, "Only VLAN"):
+            _validated_config_lines("delete vlans TEST_MGMT")
 
     def test_rejects_out_of_range_vlan(self) -> None:
         with self.assertRaisesRegex(ValueError, "between 1 and 4094"):
@@ -360,6 +535,7 @@ class ApiSafetyTests(unittest.TestCase):
                     "host": "192.0.2.20",
                     "username": "netops",
                     "password": "local-secret",
+                    "group": "Boston Access",
                 })
                 self.assertEqual(save_response.status_code, 200)
                 device = save_response.get_json()["device"]
@@ -367,6 +543,7 @@ class ApiSafetyTests(unittest.TestCase):
                 list_response = app.test_client().get("/api/devices")
                 listed_device = list_response.get_json()["devices"][0]
                 self.assertEqual(listed_device["hostname"], "access-sw-01")
+                self.assertEqual(listed_device["group"], "Boston Access")
                 self.assertNotIn("password", listed_device)
 
                 self.assertEqual(
@@ -379,9 +556,14 @@ class ApiSafetyTests(unittest.TestCase):
                     "host": "192.0.2.21",
                     "username": "automation",
                     "password": "updated-secret",
+                    "group": "Boston Core",
                 })
                 self.assertEqual(update_response.status_code, 200)
                 self.assertEqual(len(app.test_client().get("/api/devices").get_json()["devices"]), 1)
+                self.assertEqual(
+                    app.test_client().get("/api/devices").get_json()["devices"][0]["group"],
+                    "Boston Core",
+                )
                 self.assertEqual(
                     _connection_values({"deviceId": device["id"]}),
                     ("192.0.2.21", "automation", "updated-secret"),
@@ -393,6 +575,17 @@ class ApiSafetyTests(unittest.TestCase):
             "host": "192.0.2.20",
             "username": "netops",
             "password": "test",
+        })
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_saved_device_rejects_unsafe_group_name(self) -> None:
+        response = app.test_client().post("/api/devices", json={
+            "hostname": "access-sw-01",
+            "host": "192.0.2.20",
+            "username": "netops",
+            "password": "test",
+            "group": "Boston <script>",
         })
 
         self.assertEqual(response.status_code, 400)
@@ -419,6 +612,45 @@ class ApiSafetyTests(unittest.TestCase):
                     [device["host"] for device in devices],
                     ["10.0.0.9", "10.0.0.20", "10.0.0.100"],
                 )
+
+    def test_assigns_multiple_saved_devices_to_a_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            with patch("app.ENV_PATH", env_path):
+                device_ids = []
+                for hostname, host in (("switch-a", "10.0.0.1"), ("switch-b", "10.0.0.2")):
+                    response = app.test_client().post("/api/devices", json={
+                        "hostname": hostname,
+                        "host": host,
+                        "username": "netops",
+                        "password": "test",
+                    })
+                    device_ids.append(response.get_json()["device"]["id"])
+
+                with patch("app._replace_environment_path", side_effect=PermissionError(5, "denied")), \
+                     patch("app.time.sleep"):
+                    group_response = app.test_client().patch("/api/devices/group", json={
+                        "deviceIds": device_ids,
+                        "group": "Boston Access",
+                    })
+
+                self.assertEqual(group_response.status_code, 200)
+                self.assertEqual(group_response.get_json()["updated"], 2)
+                self.assertEqual(
+                    {device["group"] for device in group_response.get_json()["devices"]},
+                    {"Boston Access"},
+                )
+
+                clear_response = app.test_client().patch("/api/devices/group", json={
+                    "deviceIds": [device_ids[0]],
+                    "group": "",
+                })
+                self.assertEqual(clear_response.status_code, 200)
+                groups_by_id = {
+                    device["id"]: device["group"] for device in clear_response.get_json()["devices"]
+                }
+                self.assertEqual(groups_by_id[device_ids[0]], "")
+                self.assertEqual(groups_by_id[device_ids[1]], "Boston Access")
 
     @patch("app._run_command")
     @patch("app._ssh_client")
@@ -468,6 +700,16 @@ class ApiSafetyTests(unittest.TestCase):
                     "set interfaces ge-0/0/1 disable",
                     'set interfaces ge-0/0/2 description "01_Camera"',
                     "set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members CAMERAS",
+                    'set interfaces ge-0/0/3 description "Configured but absent from terse"',
+                    "set interfaces ge-0/0/3 disable",
+                    "set interfaces irb unit 325 family inet address 192.0.2.1/24",
+                ]), ""
+            if command == "show configuration vlans | display set":
+                return "\n".join([
+                    "set vlans CAMERAS vlan-id 325",
+                    "set vlans CAMERAS l3-interface irb.325",
+                    "set vlans CUSTOMER_QINQ interface ge-0/0/1.3013",
+                    "set vlans CUSTOMER_QINQ interface ge-0/0/2.3013",
                 ]), ""
             return "", ""
 
@@ -481,10 +723,29 @@ class ApiSafetyTests(unittest.TestCase):
 
         payload = response.get_json()
         details = {item["name"]: item for item in payload["interfaceDetails"]}
-        self.assertEqual(payload["interfaces"], ["ge-0/0/1", "ge-0/0/2"])
+        self.assertEqual(payload["interfaces"], ["ge-0/0/1", "ge-0/0/2", "ge-0/0/3"])
         self.assertEqual(payload["configuredInterfaces"], ["ge-0/0/2"])
+        self.assertEqual(payload["vlanMemberships"], [
+            {"name": "CAMERAS", "value": "325", "l3Interface": "irb.325"},
+        ])
+        self.assertEqual(payload["irbUnits"], [
+            {"unit": 325, "addresses": ["192.0.2.1/24"]},
+        ])
+        self.assertEqual(payload["bridgeServices"], [{
+            "name": "CUSTOMER_QINQ",
+            "interfaces": ["ge-0/0/1.3013", "ge-0/0/2.3013"],
+        }])
         self.assertFalse(details["ge-0/0/1"]["configured"])
         self.assertTrue(details["ge-0/0/2"]["configured"])
+        self.assertFalse(details["ge-0/0/3"]["configured"])
+        self.assertEqual(details["ge-0/0/3"]["admin"], "down")
+        self.assertEqual(details["ge-0/0/3"]["oper"], "down")
+        self.assertEqual(details["ge-0/0/3"]["speedCapability"], "1 Gbps")
+        self.assertTrue(details["ge-0/0/3"]["disabled"])
+        self.assertEqual(
+            details["ge-0/0/3"]["description"],
+            "Configured but absent from terse",
+        )
         self.assertEqual(details["ge-0/0/2"]["negotiatedSpeed"], "100 Mbps")
         self.assertEqual(details["ge-0/0/2"]["speedCapability"], "1 Gbps")
         self.assertEqual(details["ge-0/0/2"]["learnedMacs"], [

@@ -11,6 +11,35 @@ Add new entries here under `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`,
 or `Security`. When publishing a release, move those entries into a dated version
 section and update the comparison links at the bottom of this file.
 
+## [v1.2] - 2026-08-25
+
+### Added
+
+- Added a guarded IPv4 IRB builder that discovers existing VLAN bindings and IRB addresses before generating gateway configuration.
+- Added a paired Q-in-Q builder for customer-facing push/pop translation and outer/inner-tagged uplink services.
+- Added a Configure-tab logical-service move that copies an exact nonzero unit and rewrites its bridge-VLAN membership on one selected destination port.
+- Added an opt-in browser-persisted checkbox for automatically saving successful connections that are not already known.
+- Added persistent switch groups with grouped saved-device selection and multi-device group assignment.
+- Added native Enter-key form submission, Enter-to-Quick-Connect, and Ctrl/Cmd+S profile saving.
+- Added a browser-persisted group visibility filter for the login card's saved-device selector.
+
+### Changed
+
+- Expanded configuration validation to admit only the new IRB address, VLAN binding, and logical bridge-member command shapes.
+- Moved the IRB and Q-in-Q controls into an expandable advanced section on the Configure tab.
+- Updated whole-port moves to carry discovered Q-in-Q bridge references instead of leaving them attached to old logical interfaces.
+- Kept saved-site selection, Quick Connect, profile saving, and auto-save on the login card while dedicating the top-right Options panel to multi-select group management.
+- Changed the initial auto-refresh interval from Off to one minute.
+- Changed seeded coworker builds to merge each new saved-device seed revision into existing local profiles while preserving coworker-only devices and unrelated settings.
+
+### Fixed
+
+- Collapsed EX4400 multi-prefix identities at each physical coordinate to the fastest tile (`xe` over `ge`, `et` over `xe`), while keeping EX4100 `mge/ge` access banks ahead of separately numbered `xe/et` uplink banks.
+- Sorted the combined port inventory by physical FPC/PIC/port location across interface prefixes, and represented configuration-only ports as unconfigured `down/down` interfaces with name-derived capability, including 2.5 Gbps for EX4100 `mge` ports.
+- Added physical interfaces found only in `show configuration interfaces` to the tile inventory when Junos omits them from operational interface output.
+- Kept EX4650 channelized interfaces such as `et-0/0/0:0` through `et-0/0/0:3` distinct during discovery instead of collapsing them into a single displayed port.
+- Batched `.env` profile changes into one process-locked write with retry and in-place fallback for transient Windows/OneDrive rename locks.
+
 ## [v1.1] - 2026-08-20
 
 ### Added
@@ -55,6 +84,7 @@ section and update the comparison links at the bottom of this file.
 - Restricted web-served files to the three required frontend assets so `.env` and source files cannot be downloaded.
 - Excluded credentials, virtual environments, caches, logs, coverage output, and editor metadata from Git.
 
-[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.1...HEAD
+[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.2...HEAD
+[v1.2]: https://github.com/cptnkickbutt/junos-helper/compare/v1.1...v1.2
 [v1.1]: https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.1
 [v1.0]: https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.0
