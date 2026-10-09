@@ -11,6 +11,35 @@ Add new entries here under `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`,
 or `Security`. When publishing a release, move those entries into a dated version
 section and update the comparison links at the bottom of this file.
 
+## [v1.3] - 2026-10-09
+
+### Added
+
+- Added selected-port description transforms with unlimited named sections, live before/after previews, reusable or removable captures, and safe skipping of nonmatching descriptions.
+- Added a one-click description-only quick commit for the combined queue and current editor. It runs `commit check`, commits immediately without requiring `show | compare`, and is guarded by matching browser and server validation that rejects every non-description command.
+- Added an eight-batch, browser-memory configuration queue so separate port workflows can share one `show | compare`, confirmed commit, and final confirmation cycle.
+- Added discovery and trunk-only configuration of physical-interface `native-vlan-id`, including automatic trunk membership.
+- Added multi-select focused appends for port mode, VLAN membership, native VLAN, and description.
+- Added additive Shift+click range selection in Multi-select mode so multiple separate port ranges can be configured together.
+- Added optional automatic zero-padding for numbered series, using at least two digits and expanding to three when the range reaches 100.
+- Added an opt-in move action that replaces a source description's leading port number with the destination port number.
+- Added a packaged-only **Stop app** action that shuts down the local server and allows the PyInstaller launcher to exit.
+- Added packaged single-instance protection and existing-server detection so repeated launches do not create competing listeners on port 8000.
+
+### Changed
+
+- Active port tiles now use their negotiated link rate for the existing bold-outline and light-fill accent: amber at 100 Mbps, green at 1 Gbps, cyan at 2.5 Gbps, blue at 10 Gbps, and purple at 100 Gbps. Unknown or other active rates use neutral slate, and down links remain red.
+- Richard View cards now grow with wrapped content, while their mouseover shows only supplemental description and neighbor details.
+
+### Fixed
+
+- Focused append actions now discard an untouched auto-generated full draft instead of silently including every Configure-tab field.
+
+### Security
+
+- Restricted the quick-commit endpoint to complete physical-interface description set/delete commands, with full combined-payload revalidation before opening SSH.
+- Restricted packaged shutdown to loopback requests carrying a same-origin-only custom header; source-mode shutdown remains unavailable.
+
 ## [v1.2] - 2026-08-25
 
 ### Added
@@ -84,7 +113,8 @@ section and update the comparison links at the bottom of this file.
 - Restricted web-served files to the three required frontend assets so `.env` and source files cannot be downloaded.
 - Excluded credentials, virtual environments, caches, logs, coverage output, and editor metadata from Git.
 
-[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.2...HEAD
+[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.3...HEAD
+[v1.3]: https://github.com/cptnkickbutt/junos-helper/compare/v1.2...v1.3
 [v1.2]: https://github.com/cptnkickbutt/junos-helper/compare/v1.1...v1.2
 [v1.1]: https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.1
 [v1.0]: https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.0

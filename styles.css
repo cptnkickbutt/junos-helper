@@ -36,7 +36,14 @@ textarea {
   margin-bottom: 20px;
 }
 
-.options-trigger {
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.options-trigger,
+.stop-app-trigger {
   flex: 0 0 auto;
   min-width: 104px;
 }
@@ -447,7 +454,8 @@ button:disabled {
 
 .port-grid.richard-view .port-tile {
   width: 100%;
-  height: 295px;
+  height: auto;
+  min-height: 295px;
   padding: 20px 18px;
   border-radius: 8px;
 }
@@ -457,10 +465,14 @@ button:disabled {
 }
 
 .port-grid.richard-view .port-description {
-  min-height: 1.5rem;
+  min-height: 0;
   margin-top: 8px;
+  overflow: visible;
   font-size: 1rem;
   line-height: 1.5rem;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .richard-details {
@@ -485,15 +497,18 @@ button:disabled {
 
 .richard-details dd {
   margin: 0;
-  overflow: hidden;
   color: #e2e8f0;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .port-grid.richard-view .port-tooltip {
-  width: min(320px, calc(100vw - 48px));
-  font-size: 0.9rem;
+  width: min(280px, calc(100vw - 48px));
+  font-size: 0.8rem;
+}
+
+.port-grid.richard-view .port-tooltip > strong,
+.port-grid.richard-view .port-tooltip-row:not(.richard-tooltip-supplemental) {
+  display: none;
 }
 
 .port-tile:hover {
@@ -838,10 +853,30 @@ button:disabled {
 }
 
 .port-tile.state-up {
-  --port-status-color: 16, 185, 129;
+  --port-status-color: 148, 163, 184;
   --port-status-opacity: 0.13;
-  border-color: rgba(16, 185, 129, 0.9);
-  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.06) inset;
+  border-color: rgba(var(--port-status-color), 0.9);
+  box-shadow: 0 0 0 3px rgba(var(--port-status-color), 0.06) inset;
+}
+
+.port-tile.speed-100m {
+  --port-status-color: 250, 204, 21;
+}
+
+.port-tile.speed-1g {
+  --port-status-color: 16, 185, 129;
+}
+
+.port-tile.speed-2-5g {
+  --port-status-color: 34, 211, 238;
+}
+
+.port-tile.speed-10g {
+  --port-status-color: 59, 130, 246;
+}
+
+.port-tile.speed-100g {
+  --port-status-color: 192, 132, 252;
 }
 
 .port-tile.state-down {
@@ -1080,7 +1115,7 @@ button:disabled {
 }
 
 .workspace-panel .configuration-tools {
-  grid-template-columns: minmax(150px, 0.6fr) minmax(300px, 1.4fr) minmax(220px, 1fr);
+  grid-template-columns: minmax(130px, 0.5fr) minmax(150px, 0.65fr) minmax(300px, 1.4fr) minmax(220px, 1fr);
 }
 
 .workspace-panel .deployment-stage {
@@ -1151,6 +1186,45 @@ button:disabled {
   margin-bottom: 0;
 }
 
+.quick-commit-note {
+  margin: 8px 0 0;
+  color: #94a3b8;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.append-field-picker {
+  margin: 0 0 10px;
+  padding: 9px 10px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+}
+
+.append-field-picker legend {
+  padding: 0 5px;
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.append-field-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.append-field-options label {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.84rem;
+}
+
+.append-field-options input {
+  width: auto;
+  margin: 0;
+}
+
 .tool-group {
   min-width: 0;
   padding: 12px;
@@ -1197,6 +1271,80 @@ button:disabled {
   padding: 14px;
 }
 
+.description-transform-group {
+  max-width: 900px;
+  margin-top: 14px;
+}
+
+.series-group h4,
+.description-transform-group h4 {
+  margin: 0 0 4px;
+}
+
+.series-group > p,
+.description-transform-group > p:first-of-type {
+  margin: 0 0 14px;
+  color: #94a3b8;
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.description-transform-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.description-transform-controls input,
+.description-transform-example code {
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.pattern-help {
+  margin: 9px 0 0;
+  color: #94a3b8;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.pattern-help code {
+  color: #bae6fd;
+}
+
+.description-transform-example {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 6px;
+}
+
+.description-transform-example strong {
+  color: #c4b5fd;
+}
+
+.description-transform-example code {
+  overflow-wrap: anywhere;
+  color: #e2e8f0;
+}
+
+.description-transform-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.description-transform-footer > span {
+  color: #64748b;
+  font-size: 0.76rem;
+}
+
+.transform-counts.valid {
+  color: #a7f3d0;
+}
+
 .series-controls {
   display: grid;
   grid-template-columns: minmax(210px, 1.5fr) repeat(2, minmax(100px, 0.55fr));
@@ -1213,6 +1361,13 @@ button:disabled {
   flex-wrap: wrap;
   gap: 7px;
   margin-bottom: 10px;
+}
+
+.move-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 10px 0;
 }
 
 .compact-checkbox {
@@ -1386,8 +1541,33 @@ button:disabled {
 }
 
 .legend-swatch.state-up {
+  border-color: #94a3b8;
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.legend-swatch.speed-100m {
+  border-color: #facc15;
+  background: rgba(250, 204, 21, 0.1);
+}
+
+.legend-swatch.speed-1g {
   border-color: #10b981;
-  background: rgba(16, 185, 129, 0.08);
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.legend-swatch.speed-2-5g {
+  border-color: #22d3ee;
+  background: rgba(34, 211, 238, 0.1);
+}
+
+.legend-swatch.speed-10g {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.legend-swatch.speed-100g {
+  border-color: #c084fc;
+  background: rgba(192, 132, 252, 0.1);
 }
 
 .legend-swatch.state-down {
@@ -1419,6 +1599,106 @@ button:disabled {
 
 .config-workspace textarea {
   min-height: 320px;
+}
+
+.config-queue-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid rgba(56, 189, 248, 0.22);
+  border-radius: 12px;
+  background: rgba(8, 47, 73, 0.18);
+}
+
+.config-queue-heading,
+.config-queue-item-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.config-queue-heading h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.config-queue-heading p,
+.config-queue-note {
+  margin: 3px 0 0;
+  color: #94a3b8;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.queue-count {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: #bae6fd;
+  background: rgba(14, 165, 233, 0.14);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.config-queue-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  align-items: end;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.config-queue-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.config-queue-list > li {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 9px;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.config-queue-item-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.config-queue-item-heading strong,
+.config-queue-item-heading small {
+  overflow-wrap: anywhere;
+}
+
+.config-queue-item-heading small {
+  color: #94a3b8;
+}
+
+.config-queue-list details {
+  margin-top: 8px;
+  color: #bae6fd;
+  font-size: 0.78rem;
+}
+
+.config-queue-list pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 9px;
+  border-radius: 7px;
+  background: #08111f;
+  color: #dbeafe;
+  white-space: pre-wrap;
+}
+
+.compact-button {
+  min-height: 30px;
+  padding: 5px 9px;
 }
 
 .port-summary-panel {
@@ -1545,6 +1825,14 @@ pre {
     grid-template-columns: 1fr;
   }
 
+  .config-queue-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .config-queue-heading {
+    flex-direction: column;
+  }
+
   .device-connection-layout,
   .tab-card-grid,
   .service-card-grid {
@@ -1582,6 +1870,7 @@ pre {
   .operation-groups,
   .shift-controls,
   .series-controls,
+  .description-transform-controls,
   .vlan-create-controls,
   .irb-controls,
   .qinq-controls,
@@ -1611,6 +1900,15 @@ pre {
   .series-footer {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .description-transform-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .description-transform-example {
+    grid-template-columns: 1fr;
   }
 
   .device-topbar,

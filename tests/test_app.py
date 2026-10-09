@@ -28,6 +28,7 @@ from app import (
     _run_command,
     _ssh_client,
     _validated_config_lines,
+    _validated_description_only_lines,
     app,
 )
 
@@ -277,6 +278,7 @@ class DiscoveryParsingTests(unittest.TestCase):
             "set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access",
             "set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members TEST_ENV",
             "set interfaces xe-0/2/0 unit 0 family ethernet-switching interface-mode trunk",
+            "set interfaces xe-0/2/0 native-vlan-id 25",
             "set interfaces xe-0/2/0 unit 0 family ethernet-switching vlan members [ TEST_AV TEST_GUEST ]",
         ])
 
@@ -287,6 +289,7 @@ class DiscoveryParsingTests(unittest.TestCase):
         self.assertEqual(parsed["ge-0/0/1"]["vlans"], ["TEST_ENV"])
         self.assertEqual(len(parsed["ge-0/0/1"]["setLines"]), 3)
         self.assertEqual(parsed["xe-0/2/0"]["mode"], "trunk")
+        self.assertEqual(parsed["xe-0/2/0"]["nativeVlanId"], "25")
         self.assertEqual(parsed["xe-0/2/0"]["vlans"], ["TEST_AV", "TEST_GUEST"])
 
     def test_configured_interfaces_require_vlan_membership(self) -> None:
@@ -444,6 +447,49 @@ class ConfigValidationTests(unittest.TestCase):
 
         self.assertEqual(len(_validated_config_lines(config)), 2)
 
+    def test_accepts_combined_queued_batches_with_comment_boundaries(self) -> None:
+        config = "\n".join([
+            "# Queued batch 1: Hallway AP descriptions",
+            'set interfaces ge-0/0/1 description "Hallway AP 1"',
+            "# Queued batch 2: Hallway AP port setup",
+            "set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode trunk",
+            "set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members AP_MGMT",
+        ])
+
+        self.assertEqual(len(_validated_config_lines(config)), 3)
+
+    def test_description_quick_commit_accepts_queued_set_and_delete_commands(self) -> None:
+        config = "\n".join([
+            "# Queued batch 1: Hallway AP descriptions",
+            'set interfaces ge-0/0/1 description "Hallway AP 01"',
+            "# Queued batch 2: Clear old label",
+            "delete interfaces mge-0/0/2 description",
+        ])
+
+        self.assertEqual(_validated_description_only_lines(config), [
+            'set interfaces ge-0/0/1 description "Hallway AP 01"',
+            "delete interfaces mge-0/0/2 description",
+        ])
+
+    def test_description_quick_commit_rejects_mixed_or_logical_commands(self) -> None:
+        invalid_configs = (
+            'set interfaces ge-0/0/1 description "Camera"\nset interfaces ge-0/0/1 disable',
+            'set interfaces ge-0/0/1.0 description "Logical unit"',
+            "delete interfaces ge-0/0/1",
+        )
+
+        for config in invalid_configs:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "description"):
+                _validated_description_only_lines(config)
+
+    def test_accepts_native_vlan_set_and_delete_commands(self) -> None:
+        config = "\n".join([
+            "set interfaces ge-0/0/1 native-vlan-id 325",
+            "delete interfaces ge-0/0/2 native-vlan-id",
+        ])
+
+        self.assertEqual(len(_validated_config_lines(config)), 2)
+
     def test_accepts_full_interface_configuration_delete(self) -> None:
         self.assertEqual(
             _validated_config_lines("delete interfaces xe-0/2/0"),
@@ -525,6 +571,56 @@ class ApiSafetyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("password", response.get_json())
+
+    def test_health_reports_whether_shutdown_is_available(self) -> None:
+        with patch.object(app_module, "IS_FROZEN", False):
+            source_health = app.test_client().get("/api/health").get_json()
+        with patch.object(app_module, "IS_FROZEN", True):
+            packaged_health = app.test_client().get("/api/health").get_json()
+
+        self.assertEqual(source_health["apiVersion"], app_module.API_VERSION)
+        self.assertFalse(source_health["packaged"])
+        self.assertTrue(packaged_health["packaged"])
+
+    def test_shutdown_is_packaged_local_and_same_origin_only(self) -> None:
+        client = app.test_client()
+        headers = {"X-Junos-Helper": "shutdown"}
+        with patch.object(app_module, "_schedule_process_shutdown") as schedule_shutdown:
+            with patch.object(app_module, "IS_FROZEN", False):
+                source_response = client.post(
+                    "/api/shutdown",
+                    headers=headers,
+                    environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                )
+            with patch.object(app_module, "IS_FROZEN", True):
+                missing_header_response = client.post(
+                    "/api/shutdown",
+                    environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                )
+                remote_response = client.post(
+                    "/api/shutdown",
+                    headers=headers,
+                    environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+                )
+
+            self.assertEqual(source_response.status_code, 404)
+            self.assertEqual(missing_header_response.status_code, 403)
+            self.assertEqual(remote_response.status_code, 403)
+            schedule_shutdown.assert_not_called()
+
+    def test_packaged_local_shutdown_schedules_process_exit(self) -> None:
+        with patch.object(app_module, "IS_FROZEN", True), patch.object(
+            app_module, "_schedule_process_shutdown"
+        ) as schedule_shutdown:
+            response = app.test_client().post(
+                "/api/shutdown",
+                headers={"X-Junos-Helper": "shutdown"},
+                environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        schedule_shutdown.assert_called_once_with()
 
     def test_saved_device_password_stays_server_side_and_supports_quick_connect(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -699,6 +795,7 @@ class ApiSafetyTests(unittest.TestCase):
                     'set interfaces ge-0/0/1 description "XX_UNUSED"',
                     "set interfaces ge-0/0/1 disable",
                     'set interfaces ge-0/0/2 description "01_Camera"',
+                    "set interfaces ge-0/0/2 native-vlan-id 325",
                     "set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members CAMERAS",
                     'set interfaces ge-0/0/3 description "Configured but absent from terse"',
                     "set interfaces ge-0/0/3 disable",
@@ -737,6 +834,7 @@ class ApiSafetyTests(unittest.TestCase):
         }])
         self.assertFalse(details["ge-0/0/1"]["configured"])
         self.assertTrue(details["ge-0/0/2"]["configured"])
+        self.assertEqual(details["ge-0/0/2"]["nativeVlanId"], "325")
         self.assertFalse(details["ge-0/0/3"]["configured"])
         self.assertEqual(details["ge-0/0/3"]["admin"], "down")
         self.assertEqual(details["ge-0/0/3"]["oper"], "down")
@@ -752,6 +850,70 @@ class ApiSafetyTests(unittest.TestCase):
             {"mac": "00:11:22:33:44:55", "manufacturer": "CIMSYS Inc", "vlan": "CAMERAS"}
         ])
         self.assertEqual(details["ge-0/0/2"]["lldpNeighbor"]["systemName"], "camera-01")
+
+    @patch("app._execute_cli")
+    @patch("app._ssh_client")
+    def test_quick_description_commit_checks_then_commits_combined_queue(
+        self, ssh_client: Mock, execute_cli: Mock
+    ) -> None:
+        ssh_client.return_value = Mock()
+        execute_cli.return_value = ("commit complete\n", "", 0)
+
+        response = app.test_client().post("/api/quick-description-commit", json={
+            "host": "192.0.2.10",
+            "username": "netops",
+            "password": "test",
+            "config": "\n".join([
+                "# Queued batch 1: Floor 1",
+                'set interfaces ge-0/0/1 description "01_AP"',
+                "# Queued batch 2: Floor 2",
+                'set interfaces ge-0/0/2 description "02_AP"',
+            ]),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload["pendingConfirmation"])
+        self.assertEqual(payload["commandCount"], 2)
+        cli = execute_cli.call_args.args[1]
+        self.assertTrue(cli.startswith("configure exclusive;"))
+        self.assertIn("commit check;", cli)
+        self.assertIn('commit comment "Description update by Junos Helper"', cli)
+        self.assertNotIn("commit confirmed", cli)
+
+    @patch("app._ssh_client")
+    def test_quick_description_commit_rejects_mixed_config_before_ssh(self, ssh_client: Mock) -> None:
+        response = app.test_client().post("/api/quick-description-commit", json={
+            "host": "192.0.2.10",
+            "username": "netops",
+            "password": "test",
+            "config": "\n".join([
+                'set interfaces ge-0/0/1 description "Camera"',
+                "set interfaces ge-0/0/1 disable",
+            ]),
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("description", response.get_json()["error"])
+        ssh_client.assert_not_called()
+
+    @patch("app._execute_cli")
+    @patch("app._ssh_client")
+    def test_quick_description_commit_surfaces_junos_stdout_error(
+        self, ssh_client: Mock, execute_cli: Mock
+    ) -> None:
+        ssh_client.return_value = Mock()
+        execute_cli.return_value = ("error: permission denied\n", "", 1)
+
+        response = app.test_client().post("/api/quick-description-commit", json={
+            "host": "192.0.2.10",
+            "username": "netops",
+            "password": "test",
+            "config": 'set interfaces ge-0/0/1 description "Camera"',
+        })
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.get_json()["error"], "error: permission denied")
 
     @patch("app._execute_cli")
     @patch("app._ssh_client")

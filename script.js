@@ -13,16 +13,22 @@ const state = {
   confirmationTimer: null,
   modeKeyword: "interface-mode",
   lastPreviewConfig: null,
+  configQueue: [],
+  nextQueueId: 1,
+  queueTargetHost: null,
   savedDevices: [],
   savedDeviceId: null,
   visibleSavedDeviceGroups: null,
   connectionInProgress: false,
+  deploymentInProgress: false,
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 16;
+const REQUIRED_API_VERSION = 18;
 const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
 const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
+const MAX_CONFIG_QUEUE_BATCHES = 8;
+const MAX_DEPLOYMENT_CONFIG_CHARS = 64 * 1024;
 
 const hostInput = document.getElementById("host");
 const usernameInput = document.getElementById("username");
@@ -31,6 +37,12 @@ const deviceNameInput = document.getElementById("deviceName");
 const selectionModeInput = document.getElementById("selectionMode");
 const shiftOffsetInput = document.getElementById("shiftOffset");
 const portModeInput = document.getElementById("portMode");
+const nativeVlanInput = document.getElementById("nativeVlan");
+const appendModeFieldInput = document.getElementById("appendModeField");
+const appendVlanFieldInput = document.getElementById("appendVlanField");
+const appendNativeVlanFieldInput = document.getElementById("appendNativeVlanField");
+const appendDescriptionFieldInput = document.getElementById("appendDescriptionField");
+const appendSelectedFieldsBtn = document.getElementById("appendSelectedFieldsBtn");
 const vlanMembershipInput = document.getElementById("vlanMembership");
 const descriptionInput = document.getElementById("description");
 const selectionSummary = document.getElementById("selectionSummary");
@@ -55,6 +67,7 @@ const groupManagementStatus = document.getElementById("groupManagementStatus");
 const visibleGroupList = document.getElementById("visibleGroupList");
 const visibleGroupStatus = document.getElementById("visibleGroupStatus");
 const autoSaveConnectionsInput = document.getElementById("autoSaveConnections");
+const stopAppBtn = document.getElementById("stopAppBtn");
 const optionsBtn = document.getElementById("optionsBtn");
 const optionsDialog = document.getElementById("optionsDialog");
 const refreshIntervalInput = document.getElementById("refreshInterval");
@@ -71,10 +84,12 @@ const learnedMacVlanFilter = document.getElementById("learnedMacVlanFilter");
 const learnedMacSortInput = document.getElementById("learnedMacSort");
 const learnedMacSortDirectionBtn = document.getElementById("learnedMacSortDirection");
 const pushBtn = document.getElementById("pushBtn");
+const quickDescriptionCommitBtn = document.getElementById("quickDescriptionCommitBtn");
 const commitTimer = document.getElementById("commitTimer");
 const deploymentHint = document.getElementById("deploymentHint");
 const intendedChangeSummary = document.getElementById("intendedChangeSummary");
 const moveSummary = document.getElementById("moveSummary");
+const moveUpdateDescriptionNumberInput = document.getElementById("moveUpdateDescriptionNumber");
 const seriesConfigurationScopeInput = document.getElementById("seriesConfigurationScope");
 const seriesStartPort = document.getElementById("seriesStartPort");
 const seriesCountInput = document.getElementById("seriesCount");
@@ -82,7 +97,12 @@ const seriesStartNumberInput = document.getElementById("seriesStartNumber");
 const seriesDescriptionInput = document.getElementById("seriesDescription");
 const seriesPostfixInput = document.getElementById("seriesPostfix");
 const seriesIncludePortNumberInput = document.getElementById("seriesIncludePortNumber");
+const seriesPadNumbersInput = document.getElementById("seriesPadNumbers");
 const seriesDescriptionPreview = document.getElementById("seriesDescriptionPreview");
+const descriptionTransformSourceInput = document.getElementById("descriptionTransformSource");
+const descriptionTransformTargetInput = document.getElementById("descriptionTransformTarget");
+const descriptionTransformPreview = document.getElementById("descriptionTransformPreview");
+const buildDescriptionTransformBtn = document.getElementById("buildDescriptionTransformBtn");
 const newVlanNameInput = document.getElementById("newVlanName");
 const newVlanIdInput = document.getElementById("newVlanId");
 const irbVlanInput = document.getElementById("irbVlan");
@@ -101,6 +121,11 @@ const logicalServiceMoveSummary = document.getElementById("logicalServiceMoveSum
 const previewBtn = document.getElementById("previewBtn");
 const previewState = document.getElementById("previewState");
 const compareOutput = document.getElementById("compareOutput");
+const configQueueLabelInput = document.getElementById("configQueueLabel");
+const queueCurrentConfigBtn = document.getElementById("queueCurrentConfigBtn");
+const clearConfigQueueBtn = document.getElementById("clearConfigQueueBtn");
+const configQueueSummary = document.getElementById("configQueueSummary");
+const configQueueList = document.getElementById("configQueueList");
 const selectionModeHint = document.getElementById("selectionModeHint");
 const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
 const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
@@ -123,26 +148,49 @@ function updateSelectionModeHint() {
   const messages = {
     single: "Single mode keeps one port selected at a time.",
     range: "Range mode uses two clicks to select every port between them.",
-    multi: "Multi-select toggles ports independently in any order."
+    multi: "Multi-select toggles individual ports; Shift+click adds a range from the last clicked port."
   };
   selectionModeHint.textContent = messages[selectionModeInput.value] || "";
 }
 
+function isDescriptionOnlyDeployment(config) {
+  const commands = config.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const descriptionCommand = /^(set|delete) interfaces ((?:(?:ge|xe|et|fe|mge)-\d+\/\d+\/\d+(?:\/\d+)?(?::\d+)?|(?:ae|reth)\d+)) description(?:\s+(.+))?$/i;
+  return commands.length > 0 && commands.every((line) => {
+    const match = line.match(descriptionCommand);
+    if (!match) return false;
+    return match[1].toLowerCase() === "set" ? !!match[3] : !match[3];
+  });
+}
+
 function updatePushAvailability() {
+  const deploymentConfig = combinedDeploymentConfig();
   pushBtn.disabled = state.pendingConfirmation
-    || !configOutput.value.trim()
-    || state.lastPreviewConfig !== configOutput.value;
+    || state.deploymentInProgress
+    || !deploymentConfig
+    || state.lastPreviewConfig !== deploymentConfig;
+  previewBtn.disabled = state.pendingConfirmation || state.deploymentInProgress || !deploymentConfig;
+  quickDescriptionCommitBtn.disabled = state.pendingConfirmation
+    || state.deploymentInProgress
+    || !queueMatchesCurrentTarget()
+    || !isDescriptionOnlyDeployment(deploymentConfig);
+  quickDescriptionCommitBtn.title = isDescriptionOnlyDeployment(deploymentConfig)
+    ? "Commit all queued and current description changes after a commit check."
+    : "Available only when every queued and current command changes a physical-interface description.";
 }
 
 function invalidatePreview() {
   state.lastPreviewConfig = null;
   previewState.textContent = "Preview required";
   previewState.className = "preview-state stale";
-  document.getElementById("tab-review").classList.toggle("needs-review", !!configOutput.value.trim());
+  document.getElementById("tab-review").classList.toggle("needs-review", !!combinedDeploymentConfig());
   updatePushAvailability();
 }
 
 function replaceConfig(text, manual = true) {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const normalized = text.trim();
   if (configOutput.value === normalized) {
     state.configManual = manual;
@@ -151,17 +199,166 @@ function replaceConfig(text, manual = true) {
   configOutput.value = normalized;
   state.configManual = manual;
   invalidatePreview();
+  renderConfigQueue();
 }
 
 function appendConfigLines(lines) {
   if (!lines.length) return;
-  replaceConfig(`${configOutput.value}\n${lines.join("\n")}`, true);
+  const existingConfig = state.configManual ? configOutput.value.trim() : "";
+  replaceConfig([existingConfig, lines.join("\n")].filter(Boolean).join("\n"), true);
+}
+
+function configCommandCount(config) {
+  return config.split(/\r?\n/).filter((line) => {
+    const trimmed = line.trim();
+    return trimmed && !trimmed.startsWith("#");
+  }).length;
+}
+
+function safeQueueLabel(value) {
+  return value.replace(/[\r\n#]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 64);
+}
+
+function composeDeploymentConfig(queue = state.configQueue, current = configOutput.value) {
+  const currentConfig = current.trim();
+  if (!queue.length) return currentConfig;
+  const sections = queue.map((batch, index) => (
+    `# Queued batch ${index + 1}: ${batch.label}\n${batch.config}`
+  ));
+  if (currentConfig) sections.push(`# Current batch\n${currentConfig}`);
+  return sections.join("\n\n").trim();
+}
+
+function combinedDeploymentConfig() {
+  return composeDeploymentConfig();
+}
+
+function queueMatchesCurrentTarget() {
+  return !state.queueTargetHost
+    || state.queueTargetHost === hostInput.value.trim().toLowerCase();
+}
+
+function renderConfigQueue() {
+  const queuedCommands = state.configQueue.reduce(
+    (total, batch) => total + configCommandCount(batch.config),
+    0
+  );
+  configQueueSummary.textContent = state.configQueue.length
+    ? `${state.configQueue.length} of ${MAX_CONFIG_QUEUE_BATCHES} batches · ${queuedCommands} commands`
+    : "No queued batches";
+  configQueueList.replaceChildren();
+  if (!state.configQueue.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "Nothing is queued. The current editor will deploy by itself.";
+    configQueueList.appendChild(empty);
+  } else {
+    state.configQueue.forEach((batch, index) => {
+      const item = document.createElement("li");
+      const row = document.createElement("div");
+      row.className = "config-queue-item-heading";
+      const identity = document.createElement("div");
+      const label = document.createElement("strong");
+      label.textContent = `${index + 1}. ${batch.label}`;
+      const count = document.createElement("small");
+      const commandCount = configCommandCount(batch.config);
+      count.textContent = `${commandCount} command${commandCount === 1 ? "" : "s"}`;
+      identity.append(label, count);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "secondary compact-button";
+      remove.textContent = "Remove";
+      remove.disabled = state.pendingConfirmation || state.deploymentInProgress;
+      remove.addEventListener("click", () => removeQueuedConfig(batch.id));
+      row.append(identity, remove);
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "View queued commands";
+      const commands = document.createElement("pre");
+      commands.textContent = batch.config;
+      details.append(summary, commands);
+      item.append(row, details);
+      configQueueList.appendChild(item);
+    });
+  }
+  const queueFull = state.configQueue.length >= MAX_CONFIG_QUEUE_BATCHES;
+  queueCurrentConfigBtn.disabled = state.pendingConfirmation || state.deploymentInProgress || queueFull || !configOutput.value.trim();
+  clearConfigQueueBtn.disabled = state.pendingConfirmation || state.deploymentInProgress || !state.configQueue.length;
+  configQueueLabelInput.disabled = state.pendingConfirmation || state.deploymentInProgress;
+  configOutput.disabled = state.pendingConfirmation || state.deploymentInProgress;
+  updatePushAvailability();
+}
+
+function queueCurrentConfig() {
+  const currentConfig = configOutput.value.trim();
+  if (!currentConfig || state.pendingConfirmation || state.deploymentInProgress) return;
+  if (!queueMatchesCurrentTarget()) {
+    connectionStatus.textContent = "The queued batches belong to another switch. Clear the queue before changing targets.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  if (state.configQueue.length >= MAX_CONFIG_QUEUE_BATCHES) {
+    connectionStatus.textContent = `The queue is limited to ${MAX_CONFIG_QUEUE_BATCHES} batches.`;
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  const batchNumber = state.nextQueueId;
+  const batch = {
+    id: batchNumber,
+    label: safeQueueLabel(configQueueLabelInput.value) || `Batch ${batchNumber}`,
+    config: currentConfig
+  };
+  const prospectiveConfig = composeDeploymentConfig([...state.configQueue, batch], "");
+  if (prospectiveConfig.length > MAX_DEPLOYMENT_CONFIG_CHARS) {
+    connectionStatus.textContent = "The combined queue would exceed the 64 KB deployment limit.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  state.configQueue.push(batch);
+  state.nextQueueId += 1;
+  state.queueTargetHost ||= hostInput.value.trim().toLowerCase();
+  configQueueLabelInput.value = "";
+  replaceConfig("", false);
+  renderConfigQueue();
+  connectionStatus.textContent = isDescriptionOnlyDeployment(combinedDeploymentConfig())
+    ? `${batch.label} queued. Build the next batch or quick commit the combined descriptions.`
+    : `${batch.label} queued. Build the next batch or run the combined comparison.`;
+  connectionStatus.className = "status-pill connected";
+}
+
+function removeQueuedConfig(batchId) {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
+  state.configQueue = state.configQueue.filter((batch) => batch.id !== batchId);
+  if (!state.configQueue.length) state.queueTargetHost = null;
+  invalidatePreview();
+  renderConfigQueue();
+}
+
+function clearConfigQueue() {
+  if (!state.configQueue.length || state.pendingConfirmation || state.deploymentInProgress) return;
+  if (!window.confirm("Remove every queued configuration batch? The current editor will be kept.")) return;
+  state.configQueue = [];
+  state.queueTargetHost = null;
+  invalidatePreview();
+  renderConfigQueue();
+}
+
+function clearDeploymentWorkspace() {
+  state.configQueue = [];
+  state.nextQueueId = 1;
+  state.queueTargetHost = null;
+  configQueueLabelInput.value = "";
+  configOutput.value = "";
+  state.configManual = false;
+  compareOutput.textContent = "No device comparison loaded.";
+  renderConfigQueue();
 }
 
 async function checkBackendCompatibility() {
   try {
     const response = await fetch("/api/health", { cache: "no-store" });
     const health = await response.json();
+    stopAppBtn.hidden = health.packaged !== true;
     if (!response.ok || health.apiVersion !== REQUIRED_API_VERSION) {
       connectionStatus.textContent = `Backend restart required (need API ${REQUIRED_API_VERSION}, found ${health.apiVersion ?? "legacy"})`;
       connectionStatus.className = "status-pill error";
@@ -171,10 +368,36 @@ async function checkBackendCompatibility() {
     connectBtn.textContent = "Connect & pull data";
     return true;
   } catch (_error) {
+    stopAppBtn.hidden = true;
     connectionStatus.textContent = "Backend is unavailable; start or restart Flask";
     connectionStatus.className = "status-pill error";
     connectBtn.textContent = "Retry backend connection";
     return false;
+  }
+}
+
+async function stopPackagedApp() {
+  const pendingWarning = state.pendingConfirmation
+    ? "\n\nA confirmed commit is awaiting confirmation and will roll back automatically unless it has already been confirmed."
+    : "";
+  if (!window.confirm(`Stop Junos Helper and release its background processes?${pendingWarning}`)) return;
+  stopAppBtn.disabled = true;
+  stopAppBtn.textContent = "Stopping…";
+  try {
+    const response = await fetch("/api/shutdown", {
+      method: "POST",
+      headers: { "X-Junos-Helper": "shutdown" }
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "Shutdown failed");
+    connectionStatus.textContent = "Junos Helper stopped; you can close this browser tab";
+    connectionStatus.className = "status-pill";
+    stopAppBtn.textContent = "Stopped";
+  } catch (error) {
+    connectionStatus.textContent = `Shutdown error: ${error.message}`;
+    connectionStatus.className = "status-pill error";
+    stopAppBtn.disabled = false;
+    stopAppBtn.textContent = "Stop app";
   }
 }
 
@@ -185,7 +408,7 @@ function clearConfirmationTimer() {
   }
 }
 
-function setDeploymentReady(message = "Run show | compare for the current preview before pushing with rollback protection.") {
+function setDeploymentReady(message = "Run show | compare before a rollback-protected push. Description-only commands can use Quick commit.") {
   clearConfirmationTimer();
   state.pendingConfirmation = false;
   state.pendingTarget = null;
@@ -193,13 +416,14 @@ function setDeploymentReady(message = "Run show | compare for the current previe
   state.lastPreviewConfig = null;
   previewState.textContent = "Preview required";
   previewState.className = "preview-state stale";
-  updatePushAvailability();
   pushBtn.textContent = "Push with rollback protection";
+  quickDescriptionCommitBtn.textContent = "Quick commit descriptions";
   confirmBtn.disabled = true;
   confirmBtn.textContent = "Confirm committed change";
   commitTimer.textContent = "Ready";
   commitTimer.className = "commit-timer ready";
   deploymentHint.textContent = message;
+  renderConfigQueue();
 }
 
 function updateConfirmationTimer() {
@@ -227,6 +451,7 @@ function startConfirmationWindow(minutes) {
   confirmBtn.disabled = false;
   commitTimer.className = "commit-timer active";
   deploymentHint.textContent = "The change is active with rollback protection. Verify service, then confirm before time runs out.";
+  renderConfigQueue();
   updateConfirmationTimer();
   state.confirmationTimer = window.setInterval(updateConfirmationTimer, 1000);
 }
@@ -474,6 +699,7 @@ function selectSavedDevice() {
   usernameInput.value = device.username;
   passwordInput.value = "";
   deviceNameInput.value = device.hostname;
+  invalidatePreview();
   updateConnectionHint();
   updateConfig();
 }
@@ -583,6 +809,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
             configured: currentVlans.length > 0,
             currentVlans,
             currentMode: detail.mode || configuration.mode || "unknown",
+            currentNativeVlanId: detail.nativeVlanId || configuration.nativeVlanId || "",
             currentDescription: detail.description || configuration.description || "",
             currentDisabled: !!(detail.disabled || configuration.disabled),
             negotiatedSpeed: detail.negotiatedSpeed || "Unknown",
@@ -692,6 +919,22 @@ function logicalServicesForPort(portName) {
   return services;
 }
 
+function negotiatedSpeedClass(speed) {
+  const match = String(speed || "").trim().match(/^(\d+(?:\.\d+)?)\s*(Mbps|Gbps|Tbps)$/i);
+  if (!match) return "speed-other";
+  const amount = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  const rateMbps = amount * ({ mbps: 1, gbps: 1000, tbps: 1000000 }[unit] || 0);
+  const speedClasses = new Map([
+    [100, "speed-100m"],
+    [1000, "speed-1g"],
+    [2500, "speed-2-5g"],
+    [10000, "speed-10g"],
+    [100000, "speed-100g"]
+  ]);
+  return speedClasses.get(rateMbps) || "speed-other";
+}
+
 function render(updateConfiguration = true) {
   portGrid.innerHTML = "";
   const macTopology = buildMacTopology();
@@ -702,12 +945,14 @@ function render(updateConfiguration = true) {
     const logicalServices = logicalServicesForPort(portName);
     const configured = !!port.configured || logicalServices.length > 0;
     const selectedClass = state.selected.has(portName) ? " selected" : "";
-    const anchorClass = selectionModeInput.value === "range" && state.lastSelected === port.index ? " range-anchor" : "";
-    const statusClass = oper === "up" ? " state-up" : oper === "down" ? " state-down" : "";
+    const anchorClass = selectionModeInput.value !== "single" && state.lastSelected === port.index ? " range-anchor" : "";
+    const statusClass = oper === "up"
+      ? ` state-up ${negotiatedSpeedClass(port.negotiatedSpeed)}`
+      : oper === "down" ? " state-down" : "";
     button.className = `port-tile${selectedClass}${anchorClass}${statusClass}${configured ? " configured" : ""}${port.currentDisabled ? " disabled-port" : ""}`;
     button.type = "button";
     const description = port.currentDescription || "";
-    const displayDescription = description.replace(/^\d{2}_/, "");
+    const displayDescription = description.replace(/^\d{1,3}_/, "");
     const mode = ["access", "trunk"].includes(port.currentMode) ? port.currentMode : "not set";
     const vlanSummary = port.currentVlans?.length ? port.currentVlans.join(", ") : "None";
     const tooltipId = `port-tooltip-${port.index}`;
@@ -742,6 +987,7 @@ function render(updateConfiguration = true) {
       ["Admin / link", `${port.currentDisabled ? "disabled" : (port.admin || "unknown")} / ${oper}`],
       ["Link / max", speedSummary],
       ["Mode", mode],
+      ["Native VLAN", port.currentNativeVlanId || "None"],
       ["VLANs", vlanSummary],
       ["Logical services", logicalServices.length ? logicalServices.join(", ") : "None"],
       ["MACs", String(learnedMacCount)],
@@ -758,6 +1004,7 @@ function render(updateConfiguration = true) {
     const connectionRows = [
       ["Description", description || "Not set"],
       ["Mode", mode],
+      ["Native VLAN", port.currentNativeVlanId || "None"],
       ["VLANs", vlanSummary],
       ["Logical services", logicalServices.length ? logicalServices.join(", ") : "None"],
       ["Admin / link", `${port.currentDisabled ? "disabled" : (port.admin || "unknown")} / ${oper}`],
@@ -781,6 +1028,9 @@ function render(updateConfiguration = true) {
     connectionRows.filter(([, value]) => value).forEach(([term, value]) => {
       const row = document.createElement("span");
       row.className = "port-tooltip-row";
+      if (["Description", "Neighbor port", "Device details", "Cable check"].includes(term)) {
+        row.classList.add("richard-tooltip-supplemental");
+      }
       const key = document.createElement("b");
       key.textContent = `${term}:`;
       const detail = document.createElement("span");
@@ -792,7 +1042,7 @@ function render(updateConfiguration = true) {
     const positionTooltip = () => positionPortTooltip(button, tooltip);
     button.addEventListener("mouseenter", positionTooltip);
     button.addEventListener("focus", positionTooltip);
-    button.addEventListener("click", () => handlePortSelect(portName));
+    button.addEventListener("click", (event) => handlePortSelect(portName, event));
     portGrid.appendChild(button);
   });
 
@@ -804,6 +1054,7 @@ function render(updateConfiguration = true) {
     seriesStartPort.value = state.ports.find((port) => state.selected.has(port.name))?.name || "";
   }
   updateSeriesDescriptionPreview();
+  updateDescriptionTransformPreview();
   updateIrbSummary();
   updateQinqSummary();
   updateLogicalServiceMoveSummary();
@@ -1061,7 +1312,7 @@ function showLearnedMacs() {
   learnedMacDialog.showModal();
 }
 
-function handlePortSelect(portName) {
+function handlePortSelect(portName, event) {
   const mode = selectionModeInput.value;
   const currentIndex = state.ports.findIndex((port) => port.name === portName);
   const selectedPort = state.ports[currentIndex];
@@ -1076,10 +1327,16 @@ function handlePortSelect(portName) {
       : new Set([portName]);
     state.lastSelected = currentIndex;
   } else if (mode === "multi") {
-    if (state.selected.has(portName)) {
-      state.selected.delete(portName);
+    if (event?.shiftKey && state.lastSelected !== null) {
+      const start = Math.min(state.lastSelected, currentIndex);
+      const end = Math.max(state.lastSelected, currentIndex);
+      state.ports.slice(start, end + 1).forEach((port) => state.selected.add(port.name));
     } else {
-      state.selected.add(portName);
+      if (state.selected.has(portName)) {
+        state.selected.delete(portName);
+      } else {
+        state.selected.add(portName);
+      }
     }
     state.lastSelected = currentIndex;
   } else if (state.lastSelected === null) {
@@ -1104,6 +1361,7 @@ function hydrateDesiredConfigurationFromSelection() {
     portModeInput.value = port.currentMode;
   }
   renderVlanChoices();
+  renderNativeVlanChoices(port.currentNativeVlanId || "");
   const desiredVlans = new Set(port.currentVlans || []);
   let accessSelected = false;
   vlanMembershipInput.querySelectorAll('input[name="vlanMembership"]').forEach((input) => {
@@ -1166,6 +1424,8 @@ function updateIntendedChangeSummary() {
   const downCount = ports.filter((port) => port.oper === "down").length;
   const rows = [
     ["Mode", portModeInput.value === "access" ? "Access" : "Trunk"],
+    ["Native VLAN", portModeInput.value === "trunk" && nativeVlanInput.value
+      ? `VLAN ${nativeVlanInput.value}` : "None"],
     ["VLANs", vlanLabels.length ? vlanLabels.join(", ") : "None selected"],
     ["Link state", `${upCount} up · ${downCount} down · ${ports.length - upCount - downCount} unknown`],
     ["Description", descriptionInput.value.trim() || "No change"]
@@ -1187,6 +1447,20 @@ function parseMembershipInput() {
     .map((input) => input.value);
 }
 
+function renderNativeVlanChoices(preferredValue = nativeVlanInput.value) {
+  const desiredValue = String(preferredValue || "");
+  nativeVlanInput.replaceChildren(new Option("None (tagged traffic only)", ""));
+  state.vlans.forEach((vlan) => {
+    nativeVlanInput.add(new Option(`${vlan.name} (VLAN ${vlan.value})`, String(vlan.value)));
+  });
+  if (desiredValue && !Array.from(nativeVlanInput.options).some((option) => option.value === desiredValue)) {
+    nativeVlanInput.add(new Option(`VLAN ${desiredValue} (not discovered)`, desiredValue));
+  }
+  const isTrunk = portModeInput.value === "trunk";
+  nativeVlanInput.disabled = !isTrunk;
+  nativeVlanInput.value = isTrunk ? desiredValue : "";
+}
+
 function renderVlanChoices() {
   const selectedValues = new Set(parseMembershipInput());
   const isAccess = portModeInput.value === "access";
@@ -1197,25 +1471,25 @@ function renderVlanChoices() {
     empty.className = "muted";
     empty.textContent = "No VLANs discovered";
     vlanMembershipInput.appendChild(empty);
-    return;
+  } else {
+    state.vlans.forEach((vlan, index) => {
+      const label = document.createElement("label");
+      label.className = "vlan-option";
+      const input = document.createElement("input");
+      input.type = isAccess ? "radio" : "checkbox";
+      input.name = "vlanMembership";
+      input.value = vlan.name;
+      input.checked = selectedValues.has(vlan.name) && (!isAccess || !vlanMembershipInput.querySelector("input:checked"));
+      input.id = `vlan-${index}`;
+      const text = document.createElement("span");
+      text.textContent = vlan.name;
+      const tag = document.createElement("small");
+      tag.textContent = `VLAN ${vlan.value}`;
+      label.append(input, text, tag);
+      vlanMembershipInput.appendChild(label);
+    });
   }
-
-  state.vlans.forEach((vlan, index) => {
-    const label = document.createElement("label");
-    label.className = "vlan-option";
-    const input = document.createElement("input");
-    input.type = isAccess ? "radio" : "checkbox";
-    input.name = "vlanMembership";
-    input.value = vlan.name;
-    input.checked = selectedValues.has(vlan.name) && (!isAccess || !vlanMembershipInput.querySelector("input:checked"));
-    input.id = `vlan-${index}`;
-    const text = document.createElement("span");
-    text.textContent = vlan.name;
-    const tag = document.createElement("small");
-    tag.textContent = `VLAN ${vlan.value}`;
-    label.append(input, text, tag);
-    vlanMembershipInput.appendChild(label);
-  });
+  renderNativeVlanChoices();
 }
 
 function updateConfig(force = false) {
@@ -1254,9 +1528,14 @@ function descriptionSiteCode(description) {
   return description.match(/^\d{1,3}_([^_]+)_/)?.[1]?.toUpperCase() || "";
 }
 
-function physicalPortNumber(interfaceName) {
+function rawPhysicalPortNumber(interfaceName) {
   const match = interfaceName.match(/\/(\d+)(?::\d+)?(?:\.\d+)?$/);
-  return match ? match[1].padStart(2, "0") : "";
+  return match ? match[1] : "";
+}
+
+function physicalPortNumber(interfaceName) {
+  const portNumber = rawPhysicalPortNumber(interfaceName);
+  return portNumber ? portNumber.padStart(2, "0") : "";
 }
 
 function interfacePortNumber(interfaceName) {
@@ -1269,9 +1548,37 @@ function unusedDescription(port, fallbackSiteCode) {
   return `${interfacePortNumber(port.name)}_${siteCode}_UNUSED`;
 }
 
+function movedDescription(description, destinationName) {
+  const descriptionNumber = description.match(/^(\d+)(?=_)/)?.[1] || "";
+  const destinationNumber = rawPhysicalPortNumber(destinationName);
+  if (!descriptionNumber || !destinationNumber) return description;
+  const replacement = destinationNumber.padStart(
+    Math.max(descriptionNumber.length, destinationNumber.length),
+    "0"
+  );
+  return `${replacement}${description.slice(descriptionNumber.length)}`;
+}
+
+function moveDescriptionChanges(mappings) {
+  if (!moveUpdateDescriptionNumberInput.checked) return [];
+  return mappings.flatMap(({ source, destination }) => {
+    const currentDescription = source.currentDescription || "";
+    const destinationDescription = movedDescription(currentDescription, destination.name);
+    return destinationDescription && destinationDescription !== currentDescription
+      ? [{ source, destination, currentDescription, destinationDescription }]
+      : [];
+  });
+}
+
 function updateMoveSummary() {
   const { error, mappings } = getMoveMappings();
-  moveSummary.textContent = error || mappings.map(({ source, destination }) => `${source.name} → ${destination.name}`).join(" · ");
+  const descriptionChanges = error ? [] : moveDescriptionChanges(mappings);
+  const renumberSummary = moveUpdateDescriptionNumberInput.checked
+    ? descriptionChanges.length
+      ? ` · ${descriptionChanges.length} destination description${descriptionChanges.length === 1 ? "" : "s"} will be renumbered`
+      : " · no destination description numbers would change"
+    : "";
+  moveSummary.textContent = error || `${mappings.map(({ source, destination }) => `${source.name} → ${destination.name}`).join(" · ")}${renumberSummary}`;
   moveSummary.className = `tool-summary ${error ? "muted" : "valid"}`;
 }
 
@@ -1288,6 +1595,7 @@ function buildMoveConfiguration() {
   const fallbackSiteCode = mappings
     .map(({ source }) => descriptionSiteCode(source.currentDescription || ""))
     .find(Boolean) || "";
+  const descriptionChanges = moveDescriptionChanges(mappings);
   const mappingText = mappings.map(({ source, destination }) => `${source.name} → ${destination.name}`).join("\n");
   const retiredText = retiredSources.length
     ? `\n\nRetired: ${retiredSources.map((name) => {
@@ -1295,7 +1603,12 @@ function buildMoveConfiguration() {
       return `${name} → ${unusedDescription(source, fallbackSiteCode)}`;
     }).join(", ")}`
     : "";
-  if (!window.confirm(`Build a move that replaces destination configuration?\n\n${mappingText}${retiredText}\n\nThe preview will clear every destination before copying source configuration. Retired sources will be cleared, disabled, and renamed.`)) return;
+  const descriptionText = moveUpdateDescriptionNumberInput.checked
+    ? descriptionChanges.length
+      ? `\n\nDescriptions:\n${descriptionChanges.map(({ currentDescription, destinationDescription }) => `${currentDescription} → ${destinationDescription}`).join("\n")}`
+      : "\n\nNo destination description numbers would change."
+    : "";
+  if (!window.confirm(`Build a move that replaces destination configuration?\n\n${mappingText}${descriptionText}${retiredText}\n\nThe preview will clear every destination before copying source configuration. Retired sources will be cleared, disabled, and renamed.`)) return;
 
   const lines = ["# Interface configuration move", ...mappings.map(({ source, destination }) => `# ${source.name} -> ${destination.name}`), ""];
   const affectedNames = new Set([...sourceNames, ...destinationNames]);
@@ -1314,7 +1627,14 @@ function buildMoveConfiguration() {
   lines.push("");
   mappings.forEach(({ source, destination }) => {
     source.currentSetLines.forEach((line) => {
-      lines.push(line.replace(/^set interfaces\s+\S+/, `set interfaces ${destination.name}`));
+      const destinationDescription = movedDescription(source.currentDescription || "", destination.name);
+      if (moveUpdateDescriptionNumberInput.checked
+          && destinationDescription !== (source.currentDescription || "")
+          && /^set interfaces\s+\S+\s+description\b/.test(line)) {
+        lines.push(buildDescriptionLine(destination, destinationDescription));
+      } else {
+        lines.push(line.replace(/^set interfaces\s+\S+/, `set interfaces ${destination.name}`));
+      }
     });
     state.bridgeServices.forEach((service) => {
       service.interfaces.forEach((interfaceName) => {
@@ -1351,29 +1671,228 @@ function escapeDescription(value) {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
-function seriesDescription(port, seriesNumber) {
+function seriesNumberWidth(firstNumber, count) {
+  if (!seriesPadNumbersInput.checked) return 0;
+  const finalNumber = firstNumber + Math.max(count, 1) - 1;
+  return Math.max(2, String(Math.max(Math.abs(firstNumber), Math.abs(finalNumber))).length);
+}
+
+function seriesDescription(port, seriesNumber, numberWidth = 0) {
   const portNumber = seriesIncludePortNumberInput.checked ? physicalPortNumber(port.name) : "";
   const portPrefix = portNumber ? `${portNumber}_` : "";
-  return `${portPrefix}${seriesDescriptionInput.value.trim()}${seriesNumber}${seriesPostfixInput.value.trim()}`;
+  const formattedNumber = numberWidth ? String(seriesNumber).padStart(numberWidth, "0") : String(seriesNumber);
+  return `${portPrefix}${seriesDescriptionInput.value.trim()}${formattedNumber}${seriesPostfixInput.value.trim()}`;
 }
 
 function updateSeriesDescriptionPreview() {
   const port = state.ports.find((candidate) => candidate.name === seriesStartPort.value) || { name: "ge-0/0/1" };
   const firstNumber = parseInt(seriesStartNumberInput.value || "0", 10);
+  const count = parseInt(seriesCountInput.value || "1", 10);
+  const numberWidth = seriesNumberWidth(firstNumber, count);
   const scopeText = seriesConfigurationScopeInput.checked
-    ? "description plus Configure-tab mode/VLAN commands"
+    ? "description plus Configure-tab mode/VLAN/native VLAN commands"
     : "description command only";
   seriesDescriptionPreview.replaceChildren(
     "Example description: ",
-    Object.assign(document.createElement("code"), { textContent: seriesDescription(port, firstNumber) }),
+    Object.assign(document.createElement("code"), { textContent: seriesDescription(port, firstNumber, numberWidth) }),
     ` — ${scopeText}`
   );
 }
 
+function parseDescriptionPattern(pattern) {
+  const tokens = [];
+  let literal = "";
+  const flushLiteral = () => {
+    if (!literal) return;
+    tokens.push({ type: "literal", value: literal });
+    literal = "";
+  };
+
+  for (let index = 0; index < pattern.length;) {
+    const character = pattern[index];
+    if (character === "{") {
+      if (pattern[index + 1] === "{") {
+        literal += "{";
+        index += 2;
+        continue;
+      }
+      const closingBrace = pattern.indexOf("}", index + 1);
+      if (closingBrace < 0) throw new Error("The pattern has an opening brace without a closing brace.");
+      const name = pattern.slice(index + 1, closingBrace);
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(name)) {
+        throw new Error("Section names must start with a letter and contain only letters, numbers, or underscores.");
+      }
+      flushLiteral();
+      tokens.push({ type: "section", name });
+      index = closingBrace + 1;
+      continue;
+    }
+    if (character === "}") {
+      if (pattern[index + 1] === "}") {
+        literal += "}";
+        index += 2;
+        continue;
+      }
+      throw new Error("The pattern has a closing brace without an opening brace.");
+    }
+    literal += character;
+    index += 1;
+  }
+  flushLiteral();
+  return tokens;
+}
+
+function escapeRegularExpression(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function compileDescriptionTransform(sourcePattern, targetPattern) {
+  if (!sourcePattern) throw new Error("Enter a current description pattern.");
+  const sourceTokens = parseDescriptionPattern(sourcePattern);
+  const targetTokens = parseDescriptionPattern(targetPattern);
+  const sectionNames = sourceTokens
+    .filter((token) => token.type === "section")
+    .map((token) => token.name);
+  if (new Set(sectionNames).size !== sectionNames.length) {
+    throw new Error("Each named section can appear only once in the current pattern.");
+  }
+  if (sourceTokens.some((token, index) => (
+    token.type === "section" && sourceTokens[index + 1]?.type === "section"
+  ))) {
+    throw new Error("Put literal text between adjacent named sections so their boundary is unambiguous.");
+  }
+  const unknownSection = targetTokens.find((token) => (
+    token.type === "section" && !sectionNames.includes(token.name)
+  ));
+  if (unknownSection) {
+    throw new Error(`The new pattern uses {${unknownSection.name}}, which is not captured by the current pattern.`);
+  }
+
+  const expression = sourceTokens.map((token) => (
+    token.type === "literal" ? escapeRegularExpression(token.value) : "(.+?)"
+  )).join("");
+  const matcher = new RegExp(`^${expression}$`);
+  return (description) => {
+    const match = description.match(matcher);
+    if (!match) return null;
+    const sections = new Map(sectionNames.map((name, index) => [name, match[index + 1]]));
+    return targetTokens.map((token) => (
+      token.type === "literal" ? token.value : sections.get(token.name)
+    )).join("");
+  };
+}
+
+function transformDescriptionSections(description, sourcePattern, targetPattern) {
+  return compileDescriptionTransform(sourcePattern, targetPattern)(description);
+}
+
+function descriptionTransformPlan() {
+  const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
+  try {
+    const transform = compileDescriptionTransform(
+      descriptionTransformSourceInput.value,
+      descriptionTransformTargetInput.value
+    );
+    const changes = [];
+    const unchanged = [];
+    const unmatched = [];
+    selectedPorts.forEach((port) => {
+      const currentDescription = port.currentDescription || "";
+      const transformedDescription = transform(currentDescription);
+      if (transformedDescription === null) {
+        unmatched.push(port);
+      } else if (transformedDescription === currentDescription) {
+        unchanged.push(port);
+      } else {
+        changes.push({ port, currentDescription, transformedDescription });
+      }
+    });
+    return { selectedPorts, changes, unchanged, unmatched, error: "" };
+  } catch (error) {
+    return { selectedPorts, changes: [], unchanged: [], unmatched: [], error: error.message };
+  }
+}
+
+function updateDescriptionTransformPreview() {
+  const plan = descriptionTransformPlan();
+  descriptionTransformPreview.replaceChildren();
+  descriptionTransformPreview.className = "tool-summary";
+  buildDescriptionTransformBtn.disabled = !!plan.error || !plan.changes.length;
+
+  if (plan.error) {
+    descriptionTransformPreview.classList.add("error-text");
+    descriptionTransformPreview.textContent = plan.error;
+    return;
+  }
+  if (!plan.selectedPorts.length) {
+    descriptionTransformPreview.classList.add("muted");
+    descriptionTransformPreview.append(
+      "Select ports to preview. Example: ",
+      Object.assign(document.createElement("code"), { textContent: "01*EWT_317 → 01_WT_*317" })
+    );
+    return;
+  }
+
+  const summary = document.createElement("div");
+  summary.className = plan.changes.length ? "transform-counts valid" : "transform-counts";
+  summary.textContent = `${plan.changes.length} change${plan.changes.length === 1 ? "" : "s"} · ${plan.unchanged.length} unchanged · ${plan.unmatched.length} skipped`;
+  descriptionTransformPreview.appendChild(summary);
+  plan.changes.slice(0, 4).forEach(({ port, currentDescription, transformedDescription }) => {
+    const example = document.createElement("div");
+    example.className = "description-transform-example";
+    const portName = document.createElement("strong");
+    portName.textContent = port.name;
+    const before = document.createElement("code");
+    before.textContent = currentDescription || "(no description)";
+    const after = document.createElement("code");
+    after.textContent = transformedDescription || "(delete description)";
+    example.append(portName, before, document.createTextNode("→"), after);
+    descriptionTransformPreview.appendChild(example);
+  });
+  if (plan.changes.length > 4) {
+    const remaining = document.createElement("div");
+    remaining.className = "muted";
+    remaining.textContent = `...and ${plan.changes.length - 4} more change${plan.changes.length - 4 === 1 ? "" : "s"}`;
+    descriptionTransformPreview.appendChild(remaining);
+  }
+  if (!plan.changes.length) descriptionTransformPreview.classList.add("muted");
+}
+
+function buildDescriptionTransformConfiguration() {
+  const plan = descriptionTransformPlan();
+  if (plan.error || !plan.changes.length) {
+    connectionStatus.textContent = plan.error || "No selected descriptions would change";
+    connectionStatus.className = "status-pill error";
+    updateDescriptionTransformPreview();
+    return;
+  }
+  const lines = ["# Description section transform", ""];
+  plan.changes.forEach(({ port, transformedDescription }) => {
+    lines.push(
+      transformedDescription
+        ? buildDescriptionLine(port, transformedDescription)
+        : `delete interfaces ${port.name} description`,
+      ""
+    );
+  });
+  replaceConfig(lines.join("\n"), true);
+  const skippedText = plan.unmatched.length ? `; skipped ${plan.unmatched.length} nonmatching port${plan.unmatched.length === 1 ? "" : "s"}` : "";
+  connectionStatus.textContent = `Built ${plan.changes.length} description change${plan.changes.length === 1 ? "" : "s"}${skippedText}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review");
+}
+
 function buildDesiredLines(port, description) {
   const vlanMembers = parseMembershipInput();
+  const nativeVlanId = portModeInput.value === "trunk" ? nativeVlanInput.value : "";
+  const nativeVlan = state.vlans.find((vlan) => String(vlan.value) === nativeVlanId);
+  if (nativeVlan && !vlanMembers.includes(nativeVlan.name)) vlanMembers.push(nativeVlan.name);
   const modeKeyword = port.modeKeyword || state.modeKeyword || "interface-mode";
   const lines = [`set interfaces ${port.name} unit 0 family ethernet-switching ${modeKeyword} ${portModeInput.value}`];
+  if (port.currentNativeVlanId && port.currentNativeVlanId !== nativeVlanId) {
+    lines.push(`delete interfaces ${port.name} native-vlan-id`);
+  }
+  if (nativeVlanId) lines.push(`set interfaces ${port.name} native-vlan-id ${nativeVlanId}`);
   if (port.currentVlans?.length) {
     lines.push(`delete interfaces ${port.name} unit 0 family ethernet-switching vlan members`);
   }
@@ -1408,9 +1927,10 @@ function buildSeriesConfiguration() {
   }
   const includeSharedConfiguration = seriesConfigurationScopeInput.checked;
   const scopeLabel = includeSharedConfiguration ? "descriptions and shared switching config" : "descriptions only";
+  const numberWidth = seriesNumberWidth(firstNumber, count);
   const lines = [`# Numbered series (${scopeLabel}): ${prefix || "Port"} ${firstNumber}-${firstNumber + count - 1}`, ""];
   ports.forEach((port, index) => {
-    const description = seriesDescription(port, firstNumber + index);
+    const description = seriesDescription(port, firstNumber + index, numberWidth);
     const portLines = includeSharedConfiguration
       ? buildDesiredLines(port, description)
       : [buildDescriptionLine(port, description)];
@@ -1742,26 +2262,94 @@ function buildQinqConfiguration() {
 
 function applySelectedPorts() {
   updateConfig(true);
+  state.configManual = true;
 }
 
-function addVlanToSelected() {
+function appendSelectedFields() {
   const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
+  if (!selectedPorts.length) {
+    connectionStatus.textContent = "Select at least one port first";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  const fields = {
+    mode: appendModeFieldInput.checked,
+    vlans: appendVlanFieldInput.checked,
+    nativeVlan: appendNativeVlanFieldInput.checked,
+    description: appendDescriptionFieldInput.checked
+  };
+  if (!Object.values(fields).some(Boolean)) {
+    connectionStatus.textContent = "Choose at least one field to append";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
   const vlanList = parseMembershipInput();
+  if (fields.vlans && !vlanList.length) {
+    connectionStatus.textContent = "Select at least one VLAN membership to append";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  const nativeVlanId = nativeVlanInput.value;
+  const nativeVlan = state.vlans.find((vlan) => String(vlan.value) === nativeVlanId);
+  if (fields.nativeVlan && portModeInput.value === "trunk" && (!nativeVlanId || !nativeVlan)) {
+    connectionStatus.textContent = "Select a discovered native VLAN first";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+
   const lines = [];
-
   selectedPorts.forEach((port) => {
-    const iface = port.name;
-    vlanList.forEach((vlan) => {
-      lines.push(`set interfaces ${iface} unit 0 family ethernet-switching vlan members ${vlan}`);
-    });
+    const portLines = new Set();
+    const modeKeyword = port.modeKeyword || state.modeKeyword || "interface-mode";
+    if (fields.mode) {
+      portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching ${modeKeyword} ${portModeInput.value}`);
+    }
+    if (fields.nativeVlan) {
+      if (portModeInput.value === "trunk") {
+        portLines.add(`set interfaces ${port.name} native-vlan-id ${nativeVlanId}`);
+        portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching vlan members ${nativeVlan.name}`);
+      } else {
+        portLines.add(`delete interfaces ${port.name} native-vlan-id`);
+      }
+    }
+    if (fields.vlans) {
+      vlanList.forEach((vlan) => {
+        portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching vlan members ${vlan}`);
+      });
+    }
+    if (fields.description) {
+      const description = descriptionInput.value.trim();
+      portLines.add(description
+        ? buildDescriptionLine(port, description)
+        : `delete interfaces ${port.name} description`);
+    }
+    lines.push(...portLines);
   });
-
   appendConfigLines(lines);
+  const fieldLabels = [
+    fields.mode && "mode",
+    fields.vlans && "VLAN membership",
+    fields.nativeVlan && "native VLAN",
+    fields.description && "description"
+  ].filter(Boolean);
+  connectionStatus.textContent = `Appended ${fieldLabels.join(", ")} for ${selectedPorts.length} port${selectedPorts.length === 1 ? "" : "s"}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review");
 }
 
 function removeVlanFromSelected() {
   const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
   const vlanList = parseMembershipInput();
+  if (!selectedPorts.length) {
+    connectionStatus.textContent = "Select at least one port first";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  if (!vlanList.length) {
+    connectionStatus.textContent = "Select at least one VLAN membership to remove";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
   const lines = [];
 
   selectedPorts.forEach((port) => {
@@ -1772,20 +2360,9 @@ function removeVlanFromSelected() {
   });
 
   appendConfigLines(lines);
-}
-
-function setDescriptionForSelected() {
-  const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
-  const description = descriptionInput.value.trim();
-  const lines = [];
-
-  selectedPorts.forEach((port) => {
-    const iface = port.name;
-    const escapedDescription = description.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-    lines.push(`set interfaces ${iface} description \"${escapedDescription}\"`);
-  });
-
-  appendConfigLines(lines);
+  connectionStatus.textContent = `Appended VLAN removal for ${selectedPorts.length} port${selectedPorts.length === 1 ? "" : "s"}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review");
 }
 
 function selectedInterfaceNames() {
@@ -1836,12 +2413,24 @@ function clearSelectedPortConfiguration() {
 }
 
 async function previewDeviceDiff() {
-  if (!configOutput.value.trim()) {
+  const previewedConfig = combinedDeploymentConfig();
+  if (!previewedConfig) {
     connectionStatus.textContent = "Build a configuration before requesting a device comparison";
     connectionStatus.className = "status-pill error";
     return;
   }
-  const previewedConfig = configOutput.value;
+  if (!queueMatchesCurrentTarget()) {
+    connectionStatus.textContent = "The queued batches belong to another switch. Clear the queue before previewing this target.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  if (previewedConfig.length > MAX_DEPLOYMENT_CONFIG_CHARS) {
+    connectionStatus.textContent = "The combined configuration exceeds the 64 KB deployment limit.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  state.deploymentInProgress = true;
+  renderConfigQueue();
   previewBtn.disabled = true;
   previewBtn.textContent = "Loading comparison…";
   previewState.textContent = "Previewing";
@@ -1855,7 +2444,7 @@ async function previewDeviceDiff() {
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || "Preview failed");
     compareOutput.textContent = payload.compare || "No differences returned by Junos.";
-    if (configOutput.value === previewedConfig) {
+    if (combinedDeploymentConfig() === previewedConfig) {
       state.lastPreviewConfig = previewedConfig;
       previewState.textContent = "Preview current";
       previewState.className = "preview-state current";
@@ -1873,9 +2462,64 @@ async function previewDeviceDiff() {
     connectionStatus.textContent = `Preview error: ${error.message}`;
     connectionStatus.className = "status-pill error";
   } finally {
-    previewBtn.disabled = false;
+    state.deploymentInProgress = false;
     previewBtn.textContent = "Run show | compare";
-    updatePushAvailability();
+    renderConfigQueue();
+  }
+}
+
+async function quickCommitDescriptions() {
+  if (state.pendingConfirmation) {
+    connectionStatus.textContent = "Confirm the pending commit before committing another change";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  const deploymentConfig = combinedDeploymentConfig();
+  if (!queueMatchesCurrentTarget()) {
+    connectionStatus.textContent = "The queued batches belong to another switch. Clear the queue before committing to this target.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  if (!isDescriptionOnlyDeployment(deploymentConfig)) {
+    connectionStatus.textContent = "Quick commit is available only when every queued and current command changes an interface description";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  if (deploymentConfig.length > MAX_DEPLOYMENT_CONFIG_CHARS) {
+    connectionStatus.textContent = "The combined configuration exceeds the 64 KB deployment limit.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+
+  state.deploymentInProgress = true;
+  quickDescriptionCommitBtn.textContent = "Committing descriptions...";
+  connectionStatus.textContent = "Checking and committing description changes...";
+  connectionStatus.className = "status-pill";
+  renderConfigQueue();
+
+  try {
+    const response = await fetch("/api/quick-description-commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(connectionPayload({ config: deploymentConfig }))
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "Description commit failed");
+    }
+
+    clearDeploymentWorkspace();
+    setDeploymentReady("Description-only changes committed directly after a successful commit check.");
+    const commandCount = payload.commandCount || configCommandCount(deploymentConfig);
+    connectionStatus.textContent = `${commandCount} description change${commandCount === 1 ? "" : "s"} committed successfully`;
+    connectionStatus.className = "status-pill connected";
+  } catch (error) {
+    connectionStatus.textContent = `Description commit error: ${error.message}`;
+    connectionStatus.className = "status-pill error";
+  } finally {
+    state.deploymentInProgress = false;
+    quickDescriptionCommitBtn.textContent = "Quick commit descriptions";
+    renderConfigQueue();
   }
 }
 
@@ -1885,7 +2529,13 @@ async function pushToSwitch() {
     connectionStatus.className = "status-pill error";
     return;
   }
-  if (state.lastPreviewConfig !== configOutput.value) {
+  const deploymentConfig = combinedDeploymentConfig();
+  if (!queueMatchesCurrentTarget()) {
+    connectionStatus.textContent = "The queued batches belong to another switch. Clear the queue before pushing this target.";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  if (state.lastPreviewConfig !== deploymentConfig) {
     connectionStatus.textContent = "Run show | compare for the current configuration before pushing";
     connectionStatus.className = "status-pill error";
     return;
@@ -1893,6 +2543,8 @@ async function pushToSwitch() {
   if (!window.confirm("Apply this configuration using a 5-minute confirmed commit? It will roll back unless you confirm it afterward.")) {
     return;
   }
+  state.deploymentInProgress = true;
+  renderConfigQueue();
   pushBtn.disabled = true;
   pushBtn.textContent = "Pushing configuration…";
   confirmBtn.disabled = true;
@@ -1903,7 +2555,7 @@ async function pushToSwitch() {
     const response = await fetch("/api/push", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(connectionPayload({ config: configOutput.value }))
+      body: JSON.stringify(connectionPayload({ config: deploymentConfig }))
     });
 
     const payload = await response.json();
@@ -1911,24 +2563,28 @@ async function pushToSwitch() {
       throw new Error(payload.error || "Push failed");
     }
 
-    state.pendingConfirmation = !!payload.pendingConfirmation;
+    const pendingConfirmation = !!payload.pendingConfirmation;
+    state.pendingConfirmation = pendingConfirmation;
     state.pendingTarget = state.pendingConfirmation
       ? { host: hostInput.value.trim(), username: usernameInput.value.trim(), deviceId: state.savedDeviceId }
       : null;
-    if (state.pendingConfirmation) {
+    if (pendingConfirmation) {
       startConfirmationWindow(payload.confirmMinutes || 5);
     } else {
+      clearDeploymentWorkspace();
       setDeploymentReady("The change completed without a pending confirmation window.");
     }
-    connectionStatus.textContent = state.pendingConfirmation
+    connectionStatus.textContent = pendingConfirmation
       ? `Config applied. Confirm within ${payload.confirmMinutes || 5} minutes or Junos will roll it back.`
       : "Config pushed successfully";
     connectionStatus.className = "status-pill connected";
   } catch (error) {
     pushBtn.textContent = "Push with rollback protection";
-    updatePushAvailability();
     connectionStatus.textContent = `Push error: ${error.message}`;
     connectionStatus.className = "status-pill error";
+  } finally {
+    state.deploymentInProgress = false;
+    renderConfigQueue();
   }
 }
 
@@ -1951,6 +2607,7 @@ async function confirmCommit() {
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || "Confirmation failed");
+    clearDeploymentWorkspace();
     setDeploymentReady("Commit confirmed successfully. Rollback protection is cleared and the workspace is ready for another push.");
     connectionStatus.textContent = "Commit confirmed; automatic rollback canceled";
     connectionStatus.className = "status-pill connected";
@@ -1969,6 +2626,7 @@ async function confirmCommit() {
     savedDeviceInput.value = "";
     quickConnectBtn.disabled = true;
   }
+  invalidatePreview();
   updateConnectionHint();
   updateConfig();
 }));
@@ -1982,6 +2640,17 @@ portModeInput.addEventListener("change", () => {
   updateIntendedChangeSummary();
   updateConfig();
 });
+nativeVlanInput.addEventListener("change", () => {
+  const nativeVlan = state.vlans.find((vlan) => String(vlan.value) === nativeVlanInput.value);
+  if (nativeVlan) {
+    const membership = Array.from(
+      vlanMembershipInput.querySelectorAll('input[name="vlanMembership"]')
+    ).find((input) => input.value === nativeVlan.name);
+    if (membership) membership.checked = true;
+  }
+  updateIntendedChangeSummary();
+  updateConfig();
+});
 vlanMembershipInput.addEventListener("change", () => {
   updateIntendedChangeSummary();
   updateConfig();
@@ -1989,6 +2658,7 @@ vlanMembershipInput.addEventListener("change", () => {
 configOutput.addEventListener("input", () => {
   state.configManual = true;
   invalidatePreview();
+  renderConfigQueue();
 });
 selectionModeInput.addEventListener("change", () => {
   state.lastSelected = null;
@@ -1997,8 +2667,11 @@ selectionModeInput.addEventListener("change", () => {
   render();
 });
 shiftOffsetInput.addEventListener("input", updateMoveSummary);
-[seriesConfigurationScopeInput, seriesStartPort, seriesCountInput, seriesStartNumberInput, seriesDescriptionInput, seriesPostfixInput, seriesIncludePortNumberInput]
+moveUpdateDescriptionNumberInput.addEventListener("input", updateMoveSummary);
+[seriesConfigurationScopeInput, seriesStartPort, seriesCountInput, seriesStartNumberInput, seriesDescriptionInput, seriesPostfixInput, seriesIncludePortNumberInput, seriesPadNumbersInput]
   .forEach((input) => input.addEventListener("input", updateSeriesDescriptionPreview));
+[descriptionTransformSourceInput, descriptionTransformTargetInput]
+  .forEach((input) => input.addEventListener("input", updateDescriptionTransformPreview));
 irbVlanInput.addEventListener("change", () => {
   const vlan = state.vlans.find((entry) => entry.name === irbVlanInput.value);
   if (vlan) irbUnitInput.value = vlan.value;
@@ -2038,14 +2711,14 @@ learnedMacDialog.addEventListener("click", (event) => {
 });
 document.getElementById("moveConfigBtn").addEventListener("click", buildMoveConfiguration);
 document.getElementById("buildSeriesBtn").addEventListener("click", buildSeriesConfiguration);
+buildDescriptionTransformBtn.addEventListener("click", buildDescriptionTransformConfiguration);
 document.getElementById("createVlanBtn").addEventListener("click", createVlanCommand);
 document.getElementById("buildIrbBtn").addEventListener("click", buildIrbConfiguration);
 document.getElementById("buildQinqBtn").addEventListener("click", buildQinqConfiguration);
 document.getElementById("moveLogicalServiceBtn").addEventListener("click", buildLogicalServiceMove);
 document.getElementById("applyBtn").addEventListener("click", applySelectedPorts);
-document.getElementById("addVlanBtn").addEventListener("click", addVlanToSelected);
+appendSelectedFieldsBtn.addEventListener("click", appendSelectedFields);
 document.getElementById("removeVlanBtn").addEventListener("click", removeVlanFromSelected);
-document.getElementById("setDescriptionBtn").addEventListener("click", setDescriptionForSelected);
 document.getElementById("enablePortsBtn").addEventListener("click", enableSelectedPorts);
 document.getElementById("disablePortsBtn").addEventListener("click", disableSelectedPorts);
 document.getElementById("clearPortsBtn").addEventListener("click", clearSelectedPortConfiguration);
@@ -2121,6 +2794,7 @@ document.addEventListener("keydown", (event) => {
     saveCurrentDevice();
   }
 });
+stopAppBtn.addEventListener("click", stopPackagedApp);
 refreshIntervalInput.addEventListener("change", configureAutoRefresh);
 richardViewBtn.addEventListener("click", () => {
   state.richardView = !state.richardView;
@@ -2129,8 +2803,16 @@ richardViewBtn.addEventListener("click", () => {
   richardViewBtn.textContent = state.richardView ? "Exit Richard View" : "Richard View";
 });
 previewBtn.addEventListener("click", previewDeviceDiff);
+quickDescriptionCommitBtn.addEventListener("click", quickCommitDescriptions);
 pushBtn.addEventListener("click", pushToSwitch);
 confirmBtn.addEventListener("click", confirmCommit);
+queueCurrentConfigBtn.addEventListener("click", queueCurrentConfig);
+clearConfigQueueBtn.addEventListener("click", clearConfigQueue);
+configQueueLabelInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  queueCurrentConfig();
+});
 tabButtons.forEach((button, index) => {
   button.addEventListener("click", () => activateWorkspaceTab(button.dataset.tab));
   button.addEventListener("keydown", (event) => {
@@ -2160,6 +2842,7 @@ render();
 activateWorkspaceTab("configure");
 updateSelectionModeHint();
 updateSeriesDescriptionPreview();
+updateDescriptionTransformPreview();
 setDeploymentReady();
 checkBackendCompatibility().then((compatible) => {
   if (compatible) {

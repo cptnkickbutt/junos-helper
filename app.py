@@ -1,5 +1,8 @@
+import atexit
+import ctypes
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -9,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -29,6 +33,7 @@ MAC_LOOKUP = MacLookup() if VENDOR_DATABASE.is_file() else None
 SAVED_DEVICE_PREFIX = "JUNOS_DEVICE_"
 DEVICE_SEED_HASH_KEY = "JUNOS_DEVICE_SEED_HASH"
 ENV_WRITE_LOCK = threading.Lock()
+_SINGLE_INSTANCE_MUTEX: tuple[Any, int] | None = None
 
 
 def _replace_environment_path(source: Path, destination: Path) -> None:
@@ -142,9 +147,10 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-API_VERSION = 16
+API_VERSION = 18
 COMMIT_COMMENT = "Applied by Junos Helper"
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
+QUICK_DESCRIPTION_COMMIT_COMMENT = "Description update by Junos Helper"
 
 DISCOVERY_COMMANDS = (
     "show interfaces terse",
@@ -237,6 +243,67 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _local_app_url(bind_host: str, bind_port: int) -> str:
+    if bind_host not in {"127.0.0.1", "localhost"}:
+        return ""
+    return f"http://127.0.0.1:{bind_port}"
+
+
+def _existing_helper_url(bind_host: str, bind_port: int) -> str:
+    app_url = _local_app_url(bind_host, bind_port)
+    if not app_url:
+        return ""
+    try:
+        with urllib.request.urlopen(f"{app_url}/api/health", timeout=0.4) as response:
+            health = json.load(response)
+    except (OSError, ValueError):
+        return ""
+    return app_url if isinstance(health, dict) and health.get("ok") and health.get("apiVersion") else ""
+
+
+def _release_packaged_instance_mutex() -> None:
+    global _SINGLE_INSTANCE_MUTEX
+    if _SINGLE_INSTANCE_MUTEX is None:
+        return
+    kernel32, handle = _SINGLE_INSTANCE_MUTEX
+    kernel32.CloseHandle(handle)
+    _SINGLE_INSTANCE_MUTEX = None
+
+
+def _acquire_packaged_instance_mutex() -> bool:
+    """Keep one packaged server per signed-in Windows session."""
+    global _SINGLE_INSTANCE_MUTEX
+    if not IS_FROZEN or os.name != "nt":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_bool
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    create_mutex.restype = ctypes.c_void_p
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, False, "Local\\JunosHelper.SingleInstance")
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False
+    _SINGLE_INSTANCE_MUTEX = (kernel32, handle)
+    atexit.register(_release_packaged_instance_mutex)
+    return True
+
+
+def _schedule_process_shutdown() -> None:
+    def terminate() -> None:
+        logger.info("Junos Helper shutdown requested from the local UI")
+        os._exit(0)
+
+    shutdown_timer = threading.Timer(0.35, terminate)
+    shutdown_timer.daemon = True
+    shutdown_timer.start()
 
 
 def _saved_device_id(hostname: str) -> str:
@@ -606,6 +673,10 @@ def _parse_interface_configuration(output: str) -> dict[str, dict[str, Any]]:
             details["modeKeyword"] = mode_match.group(1)
             details["mode"] = mode_match.group(2)
 
+        native_vlan_match = re.search(r"(?:^|\s)native-vlan-id\s+(\d+)\b", remainder)
+        if native_vlan_match:
+            details["nativeVlanId"] = native_vlan_match.group(1)
+
         description_match = re.match(r"description\s+(.+)$", remainder)
         if description_match:
             try:
@@ -686,7 +757,21 @@ def javascript() -> Any:
 
 @app.get("/api/health")
 def health() -> Any:
-    return jsonify({"ok": True, "apiVersion": API_VERSION})
+    return jsonify({"ok": True, "apiVersion": API_VERSION, "packaged": IS_FROZEN})
+
+
+@app.post("/api/shutdown")
+def shutdown() -> Any:
+    if not IS_FROZEN:
+        return jsonify({"ok": False, "error": "Shutdown is available only in the packaged app."}), 404
+    try:
+        is_loopback = ipaddress.ip_address(request.remote_addr or "").is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback or request.headers.get("X-Junos-Helper") != "shutdown":
+        return jsonify({"ok": False, "error": "Local shutdown authorization is required."}), 403
+    _schedule_process_shutdown()
+    return jsonify({"ok": True, "message": "Junos Helper is stopping."})
 
 
 @app.get("/api/defaults")
@@ -896,7 +981,9 @@ def connect_switch() -> Any:
             configured = interface_configuration.get(name, {})
             d["configured"] = name in configured_interfaces
             d["vlans"] = configured.get("vlans", [])
-            for field in ("mode", "modeKeyword", "description", "disabled", "setLines"):
+            for field in (
+                "mode", "modeKeyword", "nativeVlanId", "description", "disabled", "setLines"
+            ):
                 if field in configured:
                     d[field] = configured[field]
             d["learnedMacs"] = learned_macs_by_interface.get(name, [])
@@ -1027,6 +1114,34 @@ def _validated_config_lines(config_text: str) -> list[str]:
     return commands
 
 
+def _validated_description_only_lines(config_text: str) -> list[str]:
+    commands = _validated_config_lines(config_text)
+    for line in commands:
+        parts = shlex.split(line)
+        interface_name = parts[2] if len(parts) > 2 else ""
+        is_physical_interface = bool(
+            INTERFACE_RE.fullmatch(interface_name) and "." not in interface_name
+        )
+        is_set_description = (
+            len(parts) == 5
+            and parts[:2] == ["set", "interfaces"]
+            and is_physical_interface
+            and parts[3] == "description"
+            and bool(parts[4])
+        )
+        is_delete_description = (
+            len(parts) == 4
+            and parts[:2] == ["delete", "interfaces"]
+            and is_physical_interface
+            and parts[3] == "description"
+        )
+        if not (is_set_description or is_delete_description):
+            raise ValueError(
+                "Quick commit accepts only complete physical-interface description set/delete commands."
+            )
+    return commands
+
+
 def _execute_cli(client: paramiko.SSHClient, cli_commands: str) -> tuple[str, str, int]:
     remote_command = f"cli -c {shlex.quote(cli_commands)}"
     _, stdout, stderr = client.exec_command(remote_command, timeout=60)
@@ -1078,6 +1193,57 @@ def preview_config() -> Any:
         return jsonify({"ok": True, "compare": _clean_compare_output(output), "error": error.strip()})
     except (paramiko.SSHException, OSError, ValueError) as exc:
         logger.warning("Preview failed for %s: %s", host, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if client is not None:
+            client.close()
+
+
+@app.post("/api/quick-description-commit")
+def quick_description_commit() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, username, password = _connection_values(payload)
+    config_text = (payload.get("config") or "").strip()
+
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+    if not config_text:
+        return jsonify({"ok": False, "error": "No configuration provided."}), 400
+
+    try:
+        commands = _validated_description_only_lines(config_text)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    client: paramiko.SSHClient | None = None
+    try:
+        client = _ssh_client(host, username, password)
+        combined = "; ".join(commands)
+        output, error, exit_status = _execute_cli(
+            client,
+            f'configure exclusive; {combined}; commit check; commit comment "{QUICK_DESCRIPTION_COMMIT_COMMENT}"; exit',
+        )
+        combined_output = f"{output}\n{error}".lower()
+        failure_markers = ("error:", "commit failed", "configuration check-out failed", "syntax error")
+        success = "commit complete" in combined_output
+        if exit_status != 0 or not success or any(marker in combined_output for marker in failure_markers):
+            message = _cli_failure_message(output, error, "Description commit did not complete.")
+            logger.warning("Description commit rejected by %s (status %s): %s", host, exit_status, message)
+            return jsonify(
+                {"ok": False, "error": message, "output": output.strip()}
+            ), 502
+
+        return jsonify(
+            {
+                "ok": True,
+                "output": output.strip(),
+                "error": error.strip(),
+                "pendingConfirmation": False,
+                "commandCount": len(commands),
+            }
+        )
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        logger.warning("Description commit failed for %s: %s", host, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
     finally:
         if client is not None:
@@ -1166,14 +1332,40 @@ def confirm_config() -> Any:
             client.close()
 
 
-if __name__ == "__main__":
+def _run_local_server() -> None:
     bind_host = os.getenv("JUNOS_BIND_HOST", "127.0.0.1")
     bind_port = int(os.getenv("JUNOS_BIND_PORT", "8000"))
-    if IS_FROZEN and bind_host in {"127.0.0.1", "localhost"}:
-        threading.Timer(1.0, webbrowser.open, args=(f"http://127.0.0.1:{bind_port}",)).start()
-    app.run(
-        host=bind_host,
-        port=bind_port,
-        debug=_env_flag("JUNOS_DEBUG"),
-        use_reloader=False,
-    )
+    app_url = _local_app_url(bind_host, bind_port)
+    existing_url = _existing_helper_url(bind_host, bind_port)
+    if existing_url:
+        logger.warning("Junos Helper is already serving %s; not starting another server", existing_url)
+        if IS_FROZEN:
+            webbrowser.open(existing_url)
+        return
+
+    if not _acquire_packaged_instance_mutex():
+        for _attempt in range(20):
+            existing_url = _existing_helper_url(bind_host, bind_port)
+            if existing_url:
+                break
+            time.sleep(0.1)
+        logger.warning("Another packaged Junos Helper instance is already running")
+        if existing_url:
+            webbrowser.open(existing_url)
+        return
+
+    if IS_FROZEN and app_url:
+        threading.Timer(1.0, webbrowser.open, args=(app_url,)).start()
+    try:
+        app.run(
+            host=bind_host,
+            port=bind_port,
+            debug=_env_flag("JUNOS_DEBUG"),
+            use_reloader=False,
+        )
+    finally:
+        _release_packaged_instance_mutex()
+
+
+if __name__ == "__main__":
+    _run_local_server()

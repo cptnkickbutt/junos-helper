@@ -14,7 +14,10 @@
           <h1>Junos switch port configurator</h1>
           <p class="hero-copy">Discover the switch, select ports visually, build a focused change, and review the live candidate diff before deployment.</p>
         </div>
-        <button id="optionsBtn" class="secondary options-trigger" type="button" aria-haspopup="dialog">Options</button>
+        <div class="hero-actions">
+          <button id="stopAppBtn" class="danger-outline stop-app-trigger" type="button" hidden>Stop app</button>
+          <button id="optionsBtn" class="secondary options-trigger" type="button" aria-haspopup="dialog">Options</button>
+        </div>
       </header>
 
       <main class="layout">
@@ -89,7 +92,12 @@
               <button id="richardViewBtn" class="secondary" type="button" aria-pressed="false" title="Because sometimes 108 pixels is simply not enough.">Richard View</button>
             </div>
             <div class="port-legend" aria-label="Port status legend">
-              <span title="Operational link is up"><i class="legend-swatch state-up"></i> Up</span>
+              <span title="100 Mbps negotiated link"><i class="legend-swatch speed-100m"></i> 100M</span>
+              <span title="1 Gbps negotiated link"><i class="legend-swatch speed-1g"></i> 1G</span>
+              <span title="2.5 Gbps negotiated link"><i class="legend-swatch speed-2-5g"></i> 2.5G</span>
+              <span title="10 Gbps negotiated link"><i class="legend-swatch speed-10g"></i> 10G</span>
+              <span title="100 Gbps negotiated link"><i class="legend-swatch speed-100g"></i> 100G</span>
+              <span title="Operational link is up with another or unknown negotiated rate"><i class="legend-swatch state-up"></i> Other up</span>
               <span title="Operational link is down"><i class="legend-swatch state-down"></i> Down</span>
               <span title="Port is configured with a VLAN"><i class="legend-dot"></i> VLAN</span>
               <span title="Port is administratively disabled"><i class="legend-dot disabled"></i> Disabled</span>
@@ -115,7 +123,7 @@
           <nav class="workspace-tabs" role="tablist" aria-label="Configuration workflows">
             <button class="tab-button active" id="tab-configure" role="tab" aria-selected="true" aria-controls="panel-configure" data-tab="configure">Configure</button>
             <button class="tab-button" id="tab-move" role="tab" aria-selected="false" aria-controls="panel-move" data-tab="move">Move config</button>
-            <button class="tab-button" id="tab-series" role="tab" aria-selected="false" aria-controls="panel-series" data-tab="series">Series</button>
+            <button class="tab-button" id="tab-series" role="tab" aria-selected="false" aria-controls="panel-series" data-tab="series">Series/Descriptions</button>
             <button class="tab-button" id="tab-vlans" role="tab" aria-selected="false" aria-controls="panel-vlans" data-tab="vlans">VLANs</button>
             <button class="tab-button review-tab" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review">Review & deploy</button>
           </nav>
@@ -124,6 +132,7 @@
             <div class="tab-intro"><h3>Configure selected ports</h3><p>Controls hydrate from a single selected port. Use them to build a final switching configuration or append a focused edit.</p></div>
             <div class="configuration-tools">
               <label>Port mode<select id="portMode"><option value="access">Access</option><option value="trunk">Trunk</option></select></label>
+              <label>Native VLAN<select id="nativeVlan" disabled><option value="">Trunk mode only</option></select></label>
               <fieldset class="vlan-picker">
                 <legend>VLAN membership</legend>
                 <div id="vlanMembership" class="vlan-options" role="group" aria-live="polite"><span class="muted">Connect to discover VLANs</span></div>
@@ -133,12 +142,20 @@
             <div class="tab-card-grid">
               <div class="tool-group">
                 <h4>Configuration builder</h4>
-                <p>Regenerate the intended port configuration or append focused edits to the current preview.</p>
+                <p>Regenerate every field, or choose only the fields that should be appended. A focused append replaces an untouched automatic draft.</p>
+                <fieldset class="append-field-picker">
+                  <legend>Fields to append</legend>
+                  <div class="append-field-options">
+                    <label><input id="appendModeField" type="checkbox" />Port mode</label>
+                    <label><input id="appendVlanField" type="checkbox" />VLAN membership</label>
+                    <label><input id="appendNativeVlanField" type="checkbox" />Native VLAN</label>
+                    <label><input id="appendDescriptionField" type="checkbox" />Description</label>
+                  </div>
+                </fieldset>
                 <div class="button-row stage-actions">
                   <button id="applyBtn">Regenerate full config</button>
-                  <button id="addVlanBtn" class="secondary">Append VLAN add</button>
+                  <button id="appendSelectedFieldsBtn" class="secondary">Append selected fields</button>
                   <button id="removeVlanBtn" class="secondary">Append VLAN removal</button>
-                  <button id="setDescriptionBtn" class="secondary">Append description</button>
                 </div>
               </div>
               <div class="tool-group port-admin-group">
@@ -200,13 +217,18 @@
                 <label>Destination offset<input id="shiftOffset" type="number" value="1" /></label>
                 <button id="moveConfigBtn">Build move commands</button>
               </div>
+              <div class="move-options" role="group" aria-label="Optional move behavior">
+                <label class="compact-checkbox" title="When a source description starts with a number and underscore, replace that number with the destination port number"><input id="moveUpdateDescriptionNumber" type="checkbox" /><span>Renumber destination descriptions <small><code>01_BT_...</code> &rarr; <code>02_BT_...</code></small></span></label>
+              </div>
               <div id="moveSummary" class="tool-summary muted">Select configured source ports to preview the mapping.</div>
             </div>
           </div>
 
           <div class="tab-panel" id="panel-series" role="tabpanel" aria-labelledby="tab-series" data-panel="series" hidden>
-            <div class="tab-intro"><h3>Create a numbered series</h3><p>Rename consecutive discovered ports, with the option to also apply one shared switching configuration.</p></div>
+            <div class="tab-intro"><h3>Create or transform descriptions</h3><p>Build an ordered numbered series, or preserve irregular values by capturing and rearranging named sections from existing descriptions.</p></div>
             <div class="feature-focus-card series-group">
+              <h4>Numbered series</h4>
+              <p>Rename consecutive discovered ports, with the option to also apply one shared switching configuration.</p>
               <div class="series-controls">
                 <label class="series-start">Start port<select id="seriesStartPort"><option value="">Select a start port</option></select></label>
                 <label>Port count<input id="seriesCount" type="number" min="1" max="128" value="4" /></label>
@@ -216,6 +238,7 @@
               </div>
               <div class="series-options" role="group" aria-label="Optional series behavior">
                 <label class="compact-checkbox"><input id="seriesIncludePortNumber" type="checkbox" checked /><span>Add <code>##_</code> port prefix</span></label>
+                <label class="compact-checkbox" title="Pads to at least two digits and automatically expands when the last series number reaches three digits"><input id="seriesPadNumbers" type="checkbox" /><span>Zero-pad series numbers <small><code>01</code>&hellip;<code>15</code>, <code>001</code>&hellip;<code>150</code></small></span></label>
                 <label class="compact-checkbox" title="Uses the mode and VLAN selections from the Configure tab"><input id="seriesConfigurationScope" type="checkbox" /><span>Also apply shared port config <small>Configure tab mode + VLANs</small></span></label>
               </div>
               <div class="series-footer">
@@ -223,6 +246,21 @@
                 <button id="buildSeriesBtn">Build series configuration</button>
               </div>
             </div>
+
+            <section class="feature-focus-card description-transform-group" aria-labelledby="descriptionTransformTitle">
+              <h4 id="descriptionTransformTitle">Transform existing descriptions</h4>
+              <p>Match each selected port's current description, then reuse, remove, reorder, or surround any number of named sections.</p>
+              <div class="description-transform-controls">
+                <label>Current pattern<input id="descriptionTransformSource" value="{port}*EWT_{apt}" spellcheck="false" aria-describedby="descriptionTransformHelp" /></label>
+                <label>New pattern<input id="descriptionTransformTarget" value="{port}_WT_*{apt}" spellcheck="false" aria-describedby="descriptionTransformHelp" /></label>
+              </div>
+              <p id="descriptionTransformHelp" class="pattern-help">Names in braces capture text; everything outside braces matches literally. Omit a name to remove that section, or reuse names in any order. Use <code>{{</code> or <code>}}</code> for literal braces.</p>
+              <div id="descriptionTransformPreview" class="tool-summary muted" role="status" aria-live="polite">Select ports to preview description changes.</div>
+              <div class="description-transform-footer">
+                <span>Selected ports that do not match the current pattern are skipped.</span>
+                <button id="buildDescriptionTransformBtn" type="button" disabled>Build selected description changes</button>
+              </div>
+            </section>
           </div>
 
           <div class="tab-panel" id="panel-vlans" role="tabpanel" aria-labelledby="tab-vlans" data-panel="vlans" hidden>
@@ -237,7 +275,7 @@
           </div>
 
           <div class="tab-panel" id="panel-review" role="tabpanel" aria-labelledby="tab-review" data-panel="review" hidden>
-            <div class="tab-intro"><h3>Review and deploy</h3><p>Review generated commands and current port context, then load the live Junos candidate diff before pushing.</p></div>
+            <div class="tab-intro"><h3>Review and deploy</h3><p>Review generated commands and current port context. Description-only work can use the guarded quick commit; other changes require the live Junos candidate diff.</p></div>
             <div class="config-workspace">
               <textarea id="configOutput" spellcheck="false" aria-label="Generated Junos configuration"></textarea>
               <aside class="port-summary-panel">
@@ -247,9 +285,26 @@
               </aside>
             </div>
 
+            <section class="config-queue-panel" aria-labelledby="configQueueTitle">
+              <div class="config-queue-heading">
+                <div>
+                  <h3 id="configQueueTitle">Configuration queue</h3>
+                  <p>Save the current command batch, build another, then compare and deploy them together.</p>
+                </div>
+                <span id="configQueueSummary" class="queue-count">No queued batches</span>
+              </div>
+              <div class="config-queue-controls">
+                <label>Batch label<input id="configQueueLabel" maxlength="64" placeholder="Hallway AP descriptions" /></label>
+                <button id="queueCurrentConfigBtn" type="button">Queue current batch</button>
+                <button id="clearConfigQueueBtn" class="secondary" type="button" disabled>Clear queue</button>
+              </div>
+              <ol id="configQueueList" class="config-queue-list"><li class="muted">Nothing is queued. The current editor will deploy by itself.</li></ol>
+              <p class="config-queue-note">Queued batches stay in this browser tab, are limited to eight, and clear after a successful deployment.</p>
+            </section>
+
             <div class="deployment-stage">
               <div class="stage-heading">
-                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Preview the device diff first. Push then uses a five-minute confirmed commit.</p></div>
+                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Preview before a rollback-protected push, or quick commit when every command is description-only.</p></div>
                 <span id="commitTimer" class="commit-timer ready" aria-live="polite">Ready</span>
               </div>
               <div class="compare-panel">
@@ -260,9 +315,11 @@
                 <pre id="compareOutput">No device comparison loaded.</pre>
               </div>
               <div class="button-row deployment-actions">
+                <button id="quickDescriptionCommitBtn" type="button" disabled title="Available only when every queued and current command changes a physical-interface description.">Quick commit descriptions</button>
                 <button id="pushBtn" class="danger" disabled>Push with rollback protection</button>
                 <button id="confirmBtn" class="confirm" disabled>Confirm committed change</button>
               </div>
+              <p class="quick-commit-note">Quick commit runs a commit check and immediately commits description-only changes without a comparison or rollback confirmation window.</p>
             </div>
           </div>
         </section>

@@ -10,14 +10,20 @@ Release history is maintained in the [changelog](CHANGELOG.md).
 - Preserve channelized EX4650 interface lanes (for example, `et-0/0/0:0`) as distinct discovered ports.
 - Include configured physical ports in the inventory even when Junos omits them from `show interfaces terse` and `show interfaces media`; these fallback tiles are ordered by physical location and shown as unconfigured `down/down` ports with capability inferred for `fe`, `ge`, `mge` (2.5 Gbps on EX4100), `xe`, and `et` names.
 - Collapse EX4400 multi-prefix names for one physical coordinate to the fastest identity (`xe` over `ge`, `et` over `xe`), while keeping EX4100 access-port and uplink-port banks in their physical grouping when their numeric coordinates overlap.
+- In Multi-select mode, Shift+click adds every port from the last clicked tile through the new tile while preserving previously selected ranges.
 - Rebuild switching configuration from discovered mode, VLAN memberships, and descriptions.
-- Move exact interface configuration to ports at a positive or negative offset, including discovered logical-service bridge references. Destinations are cleared first; source-only ports are cleared, disabled, and renamed using the `portNumber_siteCode_UNUSED` convention.
-- Build numbered port series from a start interface and count, with an optional `##_` physical-port prefix, a description prefix/postfix, and an incrementing number. Series default to description-only commands, with an option to also apply the shared mode and VLAN configuration from the Configure tab.
+- Discover existing native VLAN IDs and choose a trunk-only native VLAN from the Configure tab; selecting one includes that VLAN in generated trunk membership.
+- Append any combination of port mode, VLAN membership, native VLAN, and description without carrying along an untouched automatically generated full configuration draft.
+- Move exact interface configuration to ports at a positive or negative offset, including discovered logical-service bridge references. Destination descriptions can optionally replace a leading source-port number with the destination-port number. Destinations are cleared first; source-only ports are cleared, disabled, and renamed using the `portNumber_siteCode_UNUSED` convention.
+- Build numbered port series from a start interface and count, with an optional `##_` physical-port prefix, a description prefix/postfix, and an incrementing number. Series numbers can be zero-padded to at least two digits and automatically expand to three digits when needed. Series default to description-only commands, with an option to also apply the shared mode and VLAN configuration from the Configure tab.
+- Transform existing descriptions on any selected ports with unlimited named sections. A current pattern such as `{port}*EWT_{apt}` can become `{port}_WT_*{apt}`, preserving irregular port and apartment values while literals are added, removed, edited, or reordered; nonmatching descriptions are previewed and skipped.
 - Create named VLANs with validated VLAN IDs.
 - Build an IPv4 IRB gateway for a discovered VLAN with checks for existing VLAN and logical-unit ownership.
 - Build paired customer/uplink Q-in-Q services with flexible Ethernet encapsulation, push/pop tag translation, double-tagged uplink units, jumbo MTU, and bridge membership.
 - Move one discovered Q-in-Q logical unit and its bridge-VLAN membership to a selected destination without replacing unit 0 or moving the global IRB.
 - Load a live `show | compare` candidate diff before Push is enabled.
+- Queue up to eight labeled command batches for one switch and deploy the queued batches plus the current editor together. Queue contents remain in the current browser tab and clear after a successful protected push confirmation or description-only quick commit.
+- Quick commit description-only queued batches plus the current editor in one click. The shortcut skips `show | compare` and the confirmation window, but still runs `commit check` and is rejected by the server if any command is not a physical-interface description set/delete.
 - Save hostname-based local device profiles for one-click reconnects.
 - Optionally auto-save successful new connections, with the preference retained in the browser.
 - Assign several saved switches to a free-form group at once from the top-right Options panel and browse them under grouped headings in the login card's saved-device selector.
@@ -27,9 +33,10 @@ Release history is maintained in the [changelog](CHANGELOG.md).
 - See unique per-switch learned MAC totals that prioritize explicit uplink descriptions, consolidate duplicate entries, and retain selected, uplink, and raw-all scopes for inspection.
 - Group MAC-table rows by discovered port order by default, with ascending or descending sorting by port, MAC, manufacturer, or VLAN.
 - Resolve neighbor and learned-MAC manufacturers from LLDP-MED or the bundled offline IEEE OUI database.
-- Toggle **Richard View** for a three-column operational layout with status, mode, VLAN, learned-MAC, and LLDP neighbor details on each tile.
+- Toggle **Richard View** for a three-column operational layout with status, mode, VLAN, learned-MAC, and LLDP neighbor details on cards that grow with wrapped content and use concise supplemental hovers.
 - Compare the actual negotiated link-partner rate with the configured/capable port speed in compact tile hovers and Richard View details.
-- Use the two-row inventory toolbar as selection, inspection, and display actions expand without crowding the status legend.
+- Read active link rates directly from tile accents: amber for 100 Mbps, green for 1 Gbps, cyan for 2.5 Gbps, blue for 10 Gbps, and purple for 100 Gbps. Other or unavailable active rates use neutral slate, while down links remain red.
+- Use the two-row inventory toolbar as selection, inspection, and display actions expand without crowding the expanded negotiated-rate legend.
 
 Disabled ports remain visible and are labeled explicitly. Junos may retain a previously learned MAC or LLDP neighbor briefly, and the app shows that as retained device evidence. An administratively disabled port cannot provide a reliable live-link check; finding a passive cable with no active endpoint requires platform-specific cable diagnostics (TDR), which this app does not run automatically because it can disrupt a port.
 
@@ -72,6 +79,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 The result is `dist\JunosHelper.exe`. Double-clicking the packaged app starts the local server and opens the browser. Distribute a newly built executable for each upgrade; coworkers can replace their old executable in place.
 
+The packaged app allows one Junos Helper server per Windows sign-in. Launching it again reuses the running server instead of creating another copy. Use **Stop app** in the page header to shut down the packaged server and release both PyInstaller processes; closing only the browser tab does not stop the local server. The button is hidden when running `app.py` directly, which remains under terminal/VS Code process control.
+
 Packaged builds keep their writable configuration at `%LOCALAPPDATA%\Junos Helper\.env`, so saved devices survive executable replacements. To seed a coworker's first run with the devices in this project's current `.env`, build with:
 
 ```powershell
@@ -84,7 +93,9 @@ Important: the saved-device entries contain plaintext passwords. Embedding them 
 
 ## Configuration safety
 
-The push API accepts approved physical-interface changes, IPv4 IRB addresses, VLAN IDs, VLAN-to-IRB bindings, and logical-interface bridge membership. It performs a `commit check` followed by `commit confirmed 5`. After verifying the switch, click **Confirm committed change** within five minutes. Otherwise Junos automatically rolls the change back.
+The normal push API accepts approved physical-interface changes, IPv4 IRB addresses, VLAN IDs, VLAN-to-IRB bindings, and logical-interface bridge membership. It performs a `commit check` followed by `commit confirmed 5`. After verifying the switch, click **Confirm committed change** within five minutes. Otherwise Junos automatically rolls the change back.
+
+**Quick commit descriptions** is intentionally narrower: every actionable line across the queue and current editor must set or delete a physical-interface description. The server independently validates that complete combined payload, runs `commit check`, and then commits immediately. It does not create a rollback confirmation window; use the normal comparison and protected push whenever the workspace includes another type of change.
 
 The IRB workflow covers the default routing instance and IPv4 gateway addressing. Routing-instance placement, VRRP, IPv6, DHCP relay, firewall filters, and routing policy remain outside this focused builder and can require site-specific coordination.
 
@@ -92,6 +103,7 @@ The IRB workflow covers the default routing instance and IPv4 gateway addressing
 
 ```powershell
 python -m unittest discover -s tests -v
+node --test tests\test_frontend_logic.cjs
 ```
 
 ## License
