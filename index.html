@@ -80,6 +80,7 @@
             <div class="button-row inventory-actions">
               <button id="selectAllBtn">Select all</button>
               <button id="clearSelectionBtn" class="secondary">Clear selection</button>
+              <button id="selectEligiblePortsBtn" class="secondary" type="button">Select eligible access ports</button>
               <div class="mac-view-controls">
                 <select id="macViewScope" aria-label="Learned MAC view scope">
                   <option value="selected">Selected ports</option>
@@ -162,10 +163,11 @@
                 <h4>Port administration</h4>
                 <p>Enable, disable, or remove all configuration from the selected interfaces.</p>
                 <div class="button-row stage-actions">
-                  <button id="enablePortsBtn" class="confirm">Enable selected</button>
-                  <button id="disablePortsBtn" class="secondary">Disable selected</button>
+                  <button id="togglePortsBtn" class="secondary" type="button">Disable selected</button>
                   <button id="clearPortsBtn" class="danger-outline">Clear selected configuration</button>
+                  <button id="toggleProtectionBtn" class="secondary" type="button">Protect selected</button>
                 </div>
+                <p id="protectionSummary" role="status">Connect to discover protected ports. Quick enable/disable excludes protected ports and service ports.</p>
               </div>
             </div>
             <details class="advanced-service-options">
@@ -180,7 +182,7 @@
                     <label>IRB unit<input id="irbUnit" type="number" min="0" max="16384" placeholder="310" /></label>
                     <label>IPv4 address / prefix<input id="irbAddress" inputmode="decimal" placeholder="192.0.2.1/24" /></label>
                   </div>
-                  <div id="irbSummary" class="tool-summary muted">Select a VLAN to begin.</div>
+                  <div id="irbSummary" class="tool-summary muted" role="status">Select a VLAN to begin.</div>
                   <button id="buildIrbBtn">Append IRB configuration</button>
                 </section>
 
@@ -195,7 +197,7 @@
                     <label>Inner customer tag<input id="qinqInnerTag" type="number" min="1" max="4094" placeholder="300" /></label>
                     <label>Physical MTU<input id="qinqMtu" type="number" min="1518" max="16384" value="9216" /></label>
                   </div>
-                  <div id="qinqSummary" class="tool-summary muted">Choose two different physical ports and both VLAN tags.</div>
+                  <div id="qinqSummary" class="tool-summary muted" role="status">Choose two different physical ports and both VLAN tags.</div>
                   <button id="buildQinqBtn">Append Q-in-Q configuration</button>
                 </section>
 
@@ -304,7 +306,7 @@
 
             <div class="deployment-stage">
               <div class="stage-heading">
-                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Preview before a rollback-protected push, or quick commit when every command is description-only.</p></div>
+                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Preview before a rollback-protected push, or quick commit eligible tasks.</p></div>
                 <span id="commitTimer" class="commit-timer ready" aria-live="polite">Ready</span>
               </div>
               <div class="compare-panel">
@@ -315,16 +317,23 @@
                 <pre id="compareOutput">No device comparison loaded.</pre>
               </div>
               <div class="button-row deployment-actions">
-                <button id="quickDescriptionCommitBtn" type="button" disabled title="Available only when every queued and current command changes a physical-interface description.">Quick commit descriptions</button>
+                <button id="quickCommitBtn" type="button" disabled>Quick commit</button>
                 <button id="pushBtn" class="danger" disabled>Push with rollback protection</button>
                 <button id="confirmBtn" class="confirm" disabled>Confirm committed change</button>
               </div>
-              <p class="quick-commit-note">Quick commit runs a commit check and immediately commits description-only changes without a comparison or rollback confirmation window.</p>
+              <p id="quickTaskSummary" class="quick-commit-note" role="status">Build a configuration first.</p>
+              <p class="quick-commit-note">Quick commits run commit check and commit immediately without a comparison or rollback confirmation. Eligible tasks: descriptions, new VLANs, and enable/disable on eligible access ports. The entire queue and editor must qualify.</p>
             </div>
           </div>
         </section>
       </main>
     </div>
+    <aside id="floatingSelection" class="floating-selection" aria-label="Selected ports" hidden>
+      <details open>
+        <summary id="floatingSelectionSummary">Selected ports</summary>
+        <ul id="floatingSelectionList"></ul>
+      </details>
+    </aside>
     <dialog id="optionsDialog" class="options-dialog" aria-labelledby="optionsDialogTitle">
       <div class="dialog-heading">
         <div>

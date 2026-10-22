@@ -1949,3 +1949,88 @@ pre {
     grid-template-columns: minmax(0, 1fr) 42px;
   }
 }
+.protected-port-badge {
+  position: absolute;
+  top: -5px;
+  left: -5px;
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 5px;
+  border: 1px solid #a16207;
+  background: #0f172a;
+  font-size: 0.65rem;
+}
+
+.port-tile.selected {
+  outline: 3px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.port-tile.selected.range-anchor {
+  outline: 3px dashed #facc15;
+}
+
+button.action-enable, button.action-protect {
+  background: #166534;
+  border-color: #4ade80;
+  color: #f0fdf4;
+}
+
+button.action-disable, button.action-unprotect {
+  background: #92400e;
+  border-color: #fbbf24;
+  color: #fffbeb;
+}
+
+.floating-selection {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  z-index: 40;
+  width: min(340px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: 1px solid #38bdf8;
+  border-radius: 12px;
+  background: #0f172a;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
+.floating-selection[hidden] {
+  display: none;
+}
+
+.floating-selection summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: #7dd3fc;
+}
+
+.floating-selection ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: min(180px, 23vh);
+  overflow-y: auto;
+  margin: 10px 0 0;
+  padding: 2px;
+  list-style: none;
+}
+
+.floating-selection li {
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: #1e293b;
+  color: #f1f5f9;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .floating-selection {
+    bottom: 8px;
+    left: 8px;
+    width: min(280px, calc(100vw - 16px));
+  }
+}

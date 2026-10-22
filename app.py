@@ -147,7 +147,7 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-API_VERSION = 18
+API_VERSION = 19
 COMMIT_COMMENT = "Applied by Junos Helper"
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
 QUICK_DESCRIPTION_COMMIT_COMMENT = "Description update by Junos Helper"
@@ -1006,6 +1006,7 @@ def connect_switch() -> Any:
             {
                 "ok": True,
                 "host": host,
+                "manualProtectedPorts": _manual_protected_ports(host),
                 "results": results,
                 "interfaces": parsed_interface_names,
                 "portCount": len(parsed_interface_names),
@@ -1199,6 +1200,99 @@ def preview_config() -> Any:
             client.close()
 
 
+def _protection_key(host: str) -> str:
+    return "JUNOS_PROTECTED_" + hashlib.sha256(host.strip().lower().encode()).hexdigest().upper()
+
+
+def _manual_protected_ports(host: str) -> list[str]:
+    values = dotenv_values(ENV_PATH) if ENV_PATH.exists() else {}
+    return (values.get(_protection_key(host)) or "").split()
+
+
+@app.post("/api/protected-ports")
+def save_protected_ports() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, _, _ = _connection_values(payload)
+    ports = payload.get("ports")
+    if not host or not isinstance(ports, list) or len(ports) > 1000 or any(
+        not isinstance(port, str) or not INTERFACE_RE.fullmatch(port) or "." in port for port in ports
+    ):
+        return jsonify({"ok": False, "error": "Supply a host and physical port names."}), 400
+    try:
+        _persist_environment_values({_protection_key(host): " ".join(sorted(set(ports)))})
+    except OSError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "manualProtectedPorts": sorted(set(ports))})
+
+
+def _quick_port_exclusions(configuration: dict, macs: dict, neighbors: dict, manual: list[str]) -> dict[str, str]:
+    reasons = dict.fromkeys(manual, "Manually protected")
+    explicit = {name for name, details in configuration.items() if re.search(
+        r"(?:^|[^a-z0-9])(?:uplink|upstream|distribution|distro|core)(?:$|[^a-z0-9])",
+        details.get("description", ""), re.I
+    )}
+    counts = {name: len({entry["mac"].lower() for entry in entries}) for name, entries in macs.items()}
+    mac_ports: dict[str, set[str]] = {}
+    for name, entries in macs.items():
+        for entry in entries:
+            mac_ports.setdefault(entry["mac"].lower(), set()).add(name)
+    for name, details in configuration.items():
+        lines = details.get("setLines", [])
+        neighbor = neighbors.get(name, {})
+        capabilities = f'{neighbor.get("systemCapabilities", "")} {neighbor.get("enabledCapabilities", "")}'
+        duplicate = {entry["mac"].lower() for entry in macs.get(name, []) if len(mac_ports[entry["mac"].lower()]) > 1}
+        peers = set().union(*(mac_ports[mac] - {name} for mac in duplicate)) if duplicate else set()
+        other_counts = [count for port, count in counts.items() if port != name and count]
+        count = counts.get(name, 0)
+        dominant = len(other_counts) >= 2 and count >= max(8, max(other_counts, default=0) * 4)
+        if name in explicit:
+            reasons[name] = "Uplink description"
+        elif not PHYSICAL_INTERFACE_NAME_RE.fullmatch(name):
+            reasons[name] = "Aggregated interface"
+        elif details.get("mode") != "access":
+            reasons[name] = "Requires explicit access mode"
+        elif re.search(r"\b(?:bridge|router)\b", capabilities, re.I):
+            reasons[name] = "LLDP switch/router neighbor"
+        elif not explicit and (len(duplicate) >= 2 and len(peers) >= 2 or dominant):
+            reasons[name] = "Uplink MAC pattern"
+        elif any(re.search(r"\b(?:802\.3ad|native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b", line)
+                 or re.search(r"\bunit (?!0\b)\d+\b", line)
+                 or re.search(r"\bfamily (?!ethernet-switching\b)\S+", line) for line in lines):
+            reasons[name] = "Aggregate membership or logical service configuration"
+    return reasons
+
+
+def _validated_quick_task_lines(config_text: str, configuration: dict, vlan_output: str,
+                                macs: dict, neighbors: dict, manual: list[str]) -> list[str]:
+    commands = _validated_config_lines(config_text)
+    exclusions = _quick_port_exclusions(configuration, macs, neighbors, manual)
+    names = set(re.findall(r"^set vlans (\S+)", vlan_output, re.M))
+    ids = {int(value) for value in re.findall(r"\bvlan-id (\d+)\b", vlan_output)}
+    for command in commands:
+        try:
+            _validated_description_only_lines(command)
+            continue
+        except ValueError:
+            pass
+        parts = shlex.split(command)
+        if len(parts) == 4 and parts[1] == "interfaces" and parts[3] == "disable":
+            name = parts[2]
+            if name not in configuration or name in exclusions:
+                raise ValueError(f"{name}: {exclusions.get(name, 'not discovered as an access port')}. Use rollback protection.")
+            if any(member.split(".")[0] == name for member in re.findall(r"^set vlans \S+ interface (\S+)", vlan_output, re.M)):
+                raise ValueError(f"{name}: bridge service member. Use rollback protection.")
+        elif len(parts) == 5 and parts[:2] == ["set", "vlans"] and parts[3] == "vlan-id":
+            name, vlan_id = parts[2], int(parts[4])
+            if name in names or vlan_id in ids:
+                raise ValueError("Quick VLAN creation requires an unused name and ID, including within this batch.")
+            names.add(name)
+            ids.add(vlan_id)
+        else:
+            raise ValueError("Quick tasks allow only descriptions, new VLAN IDs, and eligible access-port enable/disable commands.")
+    return commands
+
+
+@app.post("/api/quick-task-commit")
 @app.post("/api/quick-description-commit")
 def quick_description_commit() -> Any:
     payload = request.get_json(silent=True) or {}
@@ -1211,17 +1305,37 @@ def quick_description_commit() -> Any:
         return jsonify({"ok": False, "error": "No configuration provided."}), 400
 
     try:
-        commands = _validated_description_only_lines(config_text)
+        if request.path == "/api/quick-task-commit":
+            commands = _validated_config_lines(config_text)
+        else:
+            commands = _validated_description_only_lines(config_text)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     client: paramiko.SSHClient | None = None
     try:
         client = _ssh_client(host, username, password)
+        if request.path == "/api/quick-task-commit":
+            fresh = {}
+            for command in ("show configuration interfaces | display set", "show configuration vlans | display set",
+                            "show ethernet-switching table", "show lldp neighbors detail"):
+                output, error, read_status = _execute_cli(client, command)
+                if read_status != 0 or error.strip() or re.search(
+                    r"(?:error:|syntax error|permission denied|unknown command|command not found)", output, re.I
+                ):
+                    raise ValueError("Fresh quick-task checks failed; refresh or use the protected workflow.")
+                fresh[command] = output
+            commands = _validated_quick_task_lines(
+                config_text, _parse_interface_configuration(fresh["show configuration interfaces | display set"]),
+                fresh["show configuration vlans | display set"],
+                _parse_ethernet_switching_table(fresh["show ethernet-switching table"]),
+                _parse_lldp_neighbors(fresh["show lldp neighbors detail"]), _manual_protected_ports(host)
+            )
         combined = "; ".join(commands)
+        commit_comment = "Quick tasks via Junos Helper" if request.path == "/api/quick-task-commit" else QUICK_DESCRIPTION_COMMIT_COMMENT
         output, error, exit_status = _execute_cli(
             client,
-            f'configure exclusive; {combined}; commit check; commit comment "{QUICK_DESCRIPTION_COMMIT_COMMENT}"; exit',
+            f'configure exclusive; {combined}; commit check; commit comment "{commit_comment}"; exit',
         )
         combined_output = f"{output}\n{error}".lower()
         failure_markers = ("error:", "commit failed", "configuration check-out failed", "syntax error")

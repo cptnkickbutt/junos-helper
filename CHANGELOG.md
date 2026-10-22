@@ -11,6 +11,23 @@ Add new entries here under `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`,
 or `Security`. When publishing a release, move those entries into a dated version
 section and update the comparison links at the bottom of this file.
 
+## [v1.4] - 2026-10-22
+
+### Added
+
+- Added automatic uplink protection, saved manual protected ports, lock badges with protection reasons, and selection of eligible access ports.
+- Added quick commits for new VLANs and eligible access-port enable/disable commands, including mixed description batches. Server checks fresh configuration, MAC and LLDP evidence, protected ports, and VLAN collisions for the entire deployment.
+
+### Changed
+
+- Return to the most recent editing tab after queuing or successfully completing a commit.
+- Consolidate protection, enable/disable, and quick-commit controls. Selection actions adapt their wording and fill color, including mixed selections and staged administrative changes.
+- Move protected-port locks to the top-left tile corner and add persistent selected-port outlines plus a collapsible floating list of selected ports.
+
+### Fixed
+
+- Show IRB and Q-in-Q builder validation errors beside their action buttons; reject blank IRB units.
+
 ## [v1.3] - 2026-10-09
 
 ### Added
@@ -113,7 +130,8 @@ section and update the comparison links at the bottom of this file.
 - Restricted web-served files to the three required frontend assets so `.env` and source files cannot be downloaded.
 - Excluded credentials, virtual environments, caches, logs, coverage output, and editor metadata from Git.
 
-[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.3...HEAD
+[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.4...HEAD
+[v1.4]: https://github.com/cptnkickbutt/junos-helper/compare/v1.3...v1.4
 [v1.3]: https://github.com/cptnkickbutt/junos-helper/compare/v1.2...v1.3
 [v1.2]: https://github.com/cptnkickbutt/junos-helper/compare/v1.1...v1.2
 [v1.1]: https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.1

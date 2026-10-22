@@ -9,6 +9,11 @@ const state = {
   irbUnits: [],
   bridgeServices: [],
   configManual: false,
+  lastEditingTab: "configure",
+  manualProtectedPorts: [],
+  discoveredVlans: [],
+  protectionHost: null,
+  protectionSaving: false,
   confirmationDeadline: null,
   confirmationTimer: null,
   modeKeyword: "interface-mode",
@@ -24,7 +29,7 @@ const state = {
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 18;
+const REQUIRED_API_VERSION = 19;
 const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
 const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
 const MAX_CONFIG_QUEUE_BATCHES = 8;
@@ -84,7 +89,7 @@ const learnedMacVlanFilter = document.getElementById("learnedMacVlanFilter");
 const learnedMacSortInput = document.getElementById("learnedMacSort");
 const learnedMacSortDirectionBtn = document.getElementById("learnedMacSortDirection");
 const pushBtn = document.getElementById("pushBtn");
-const quickDescriptionCommitBtn = document.getElementById("quickDescriptionCommitBtn");
+const quickCommitBtn = document.getElementById("quickCommitBtn");
 const commitTimer = document.getElementById("commitTimer");
 const deploymentHint = document.getElementById("deploymentHint");
 const intendedChangeSummary = document.getElementById("intendedChangeSummary");
@@ -131,6 +136,9 @@ const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
 const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
 
 function activateWorkspaceTab(tabName, focus = false) {
+  if (tabName !== "review" && tabButtons.some((button) => button.dataset.tab === tabName)) {
+    state.lastEditingTab = tabName;
+  }
   tabButtons.forEach((button) => {
     const active = button.dataset.tab === tabName;
     button.classList.toggle("active", active);
@@ -172,13 +180,12 @@ function updatePushAvailability() {
     || !deploymentConfig
     || state.lastPreviewConfig !== deploymentConfig;
   previewBtn.disabled = state.pendingConfirmation || state.deploymentInProgress || !deploymentConfig;
-  quickDescriptionCommitBtn.disabled = state.pendingConfirmation
-    || state.deploymentInProgress
-    || !queueMatchesCurrentTarget()
-    || !isDescriptionOnlyDeployment(deploymentConfig);
-  quickDescriptionCommitBtn.title = isDescriptionOnlyDeployment(deploymentConfig)
-    ? "Commit all queued and current description changes after a commit check."
-    : "Available only when every queued and current command changes a physical-interface description.";
+  const quickError = isDescriptionOnlyDeployment(deploymentConfig) ? "" : quickTaskValidationError(deploymentConfig);
+  quickCommitBtn.disabled = state.pendingConfirmation || state.deploymentInProgress
+    || state.connectionInProgress || state.protectionSaving || !queueMatchesCurrentTarget() || !!quickError;
+  quickCommitBtn.title = quickError || "Commit all queued and current eligible changes after commit check, without rollback confirmation.";
+  document.getElementById("quickTaskSummary").textContent = quickError || "All queued and current commands qualify for quick commit. Fresh switch checks run before committing.";
+  updateProtectionSummary();
 }
 
 function invalidatePreview() {
@@ -324,6 +331,7 @@ function queueCurrentConfig() {
     ? `${batch.label} queued. Build the next batch or quick commit the combined descriptions.`
     : `${batch.label} queued. Build the next batch or run the combined comparison.`;
   connectionStatus.className = "status-pill connected";
+  activateWorkspaceTab(state.lastEditingTab, true);
 }
 
 function removeQueuedConfig(batchId) {
@@ -352,6 +360,7 @@ function clearDeploymentWorkspace() {
   state.configManual = false;
   compareOutput.textContent = "No device comparison loaded.";
   renderConfigQueue();
+  activateWorkspaceTab(state.lastEditingTab, true);
 }
 
 async function checkBackendCompatibility() {
@@ -408,7 +417,7 @@ function clearConfirmationTimer() {
   }
 }
 
-function setDeploymentReady(message = "Run show | compare before a rollback-protected push. Description-only commands can use Quick commit.") {
+function setDeploymentReady(message = "Run show | compare before a rollback-protected push, or quick commit eligible tasks.") {
   clearConfirmationTimer();
   state.pendingConfirmation = false;
   state.pendingTarget = null;
@@ -417,7 +426,7 @@ function setDeploymentReady(message = "Run show | compare before a rollback-prot
   previewState.textContent = "Preview required";
   previewState.className = "preview-state stale";
   pushBtn.textContent = "Push with rollback protection";
-  quickDescriptionCommitBtn.textContent = "Quick commit descriptions";
+  quickCommitBtn.textContent = "Quick commit";
   confirmBtn.disabled = true;
   confirmBtn.textContent = "Confirm committed change";
   commitTimer.textContent = "Ready";
@@ -862,6 +871,9 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     }
 
     state.vlans = payload.vlanMemberships || [];
+    state.discoveredVlans = [...state.vlans];
+    state.manualProtectedPorts = payload.manualProtectedPorts || [];
+    state.protectionHost = payload.host.trim().toLowerCase();
     state.irbUnits = payload.irbUnits || [];
     state.bridgeServices = payload.bridgeServices || [];
     renderVlanChoices();
@@ -903,6 +915,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     connectBtn.disabled = false;
     refreshNowBtn.disabled = !state.ports.length;
     quickConnectBtn.disabled = !savedDeviceInput.value;
+    updatePushAvailability();
   }
 }
 
@@ -974,6 +987,15 @@ function render(updateConfiguration = true) {
     const neighbor = port.lldpNeighbor || {};
     const learnedMacCount = new Set((port.learnedMacs || []).map((entry) => entry.mac.toLowerCase())).size;
     const uplinkReason = uplinkCandidateReason(port, macTopology);
+    const protection = portProtectionReason(port, macTopology);
+    if (protection) {
+      const badge = document.createElement("span");
+      badge.className = "protected-port-badge";
+      badge.textContent = "\u{1F512}";
+      badge.title = `Protected: ${protection}`;
+      badge.setAttribute("aria-label", `Protected: ${protection}`);
+      button.appendChild(badge);
+    }
     const learnedManufacturers = Array.from(new Set(
       (port.learnedMacs || []).map((entry) => entry.manufacturer).filter(Boolean)
     ));
@@ -1002,6 +1024,7 @@ function render(updateConfiguration = true) {
       richardDetails.append(key, detail);
     });
     const connectionRows = [
+      ["Protection", protection],
       ["Description", description || "Not set"],
       ["Mode", mode],
       ["Native VLAN", port.currentNativeVlanId || "None"],
@@ -1028,7 +1051,7 @@ function render(updateConfiguration = true) {
     connectionRows.filter(([, value]) => value).forEach(([term, value]) => {
       const row = document.createElement("span");
       row.className = "port-tooltip-row";
-      if (["Description", "Neighbor port", "Device details", "Cable check"].includes(term)) {
+      if (["Description", "Neighbor port", "Device details", "Cable check", "Protection"].includes(term)) {
         row.classList.add("richard-tooltip-supplemental");
       }
       const key = document.createElement("b");
@@ -1047,6 +1070,7 @@ function render(updateConfiguration = true) {
   });
 
   updateSelectionSummary();
+  updateProtectionSummary();
   updateViewMacsButton();
   updateIntendedChangeSummary();
   updateMoveSummary();
@@ -1145,6 +1169,127 @@ function uplinkCandidateReason(port, topology = buildMacTopology()) {
     const dominant = otherCounts.length >= 2 && macCount >= 8 && macCount >= Math.max(8, nextHighest * 4);
     const corroborated = port.currentMode === "trunk" || /\bbridge\b/i.test(capabilities) || macCount >= 32;
     if (dominant && corroborated) return "dominant learned-MAC count";
+  }
+  return "";
+}
+
+function portProtectionReason(port, topology = buildMacTopology()) {
+  if (state.manualProtectedPorts.includes(port.name)) return "Manually protected";
+  const uplink = uplinkCandidateReason(port, topology);
+  if (uplink) return `Uplink candidate: ${uplink}`;
+  if (port.currentMode === "trunk") return "Trunk port";
+  if (/\b(?:bridge|router)\b/i.test(`${port.lldpNeighbor?.systemCapabilities || ""} ${port.lldpNeighbor?.enabledCapabilities || ""}`)) return "LLDP switch/router neighbor";
+  if ((port.currentSetLines || []).some((line) => /\b802\.3ad\b/.test(line))) return "Aggregate member";
+  return "";
+}
+
+function quickPortExclusion(port, topology = buildMacTopology()) {
+  const protection = portProtectionReason(port, topology);
+  if (protection) return protection;
+  if (port.currentMode !== "access") return "Requires explicit access mode";
+  if ((port.currentSetLines || []).some((line) =>
+    /\b(?:native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b/.test(line)
+    || /\bunit (?!0\b)\d+\b/.test(line)
+    || /\bfamily (?!ethernet-switching\b)\S+/.test(line))) return "Logical service configuration";
+  if (state.bridgeServices.some((service) => service.interfaces.some((name) => name.split(".")[0] === port.name))) return "Bridge service member";
+  return "";
+}
+
+function updateProtectionSummary() {
+  const topology = buildMacTopology();
+  const excluded = state.ports.filter((port) => quickPortExclusion(port, topology));
+  const selectedExcluded = excluded.filter((port) => state.selected.has(port.name));
+  document.getElementById("protectionSummary").textContent = `${state.ports.length - excluded.length} eligible access ports; ${excluded.length} protected/excluded. `
+    + (selectedExcluded.length ? `Selected exclusions: ${selectedExcluded.map((port) => `${port.name}: ${quickPortExclusion(port, topology)}`).join("; ")}.` : "Quick tasks recheck the switch before committing.");
+  const disabled = !state.ports.length || state.connectionInProgress || state.deploymentInProgress || state.pendingConfirmation
+    || state.protectionSaving || state.protectionHost !== hostInput.value.trim().toLowerCase();
+  updateSelectionActions(disabled);
+  document.getElementById("selectEligiblePortsBtn").disabled = disabled;
+}
+
+function selectionActionState() {
+  const selected = state.ports.filter((port) => state.selected.has(port.name));
+  const commands = combinedDeploymentConfig().split(/\r?\n/).map((line) => line.trim());
+  const disabled = (port) => {
+    let value = port.currentDisabled;
+    for (const line of commands) {
+      if (line === `set interfaces ${port.name} disable`) value = true;
+      if (line === `delete interfaces ${port.name} disable` || line === `delete interfaces ${port.name}`) value = false;
+    }
+    return value;
+  };
+  return {
+    enable: selected.length > 0 && selected.every(disabled),
+    unprotect: selected.length > 0 && selected.every((port) => state.manualProtectedPorts.includes(port.name))
+  };
+}
+
+function updateSelectionActions(disabled) {
+  const actions = selectionActionState();
+  const admin = document.getElementById("togglePortsBtn");
+  admin.disabled = disabled || !state.selected.size;
+  admin.textContent = actions.enable ? "Enable selected" : "Disable selected";
+  admin.className = actions.enable ? "action-enable" : "action-disable";
+  admin.title = actions.enable ? "Append enable commands for all selected ports." : "Append disable commands for all selected ports. Mixed selections are disabled together.";
+  const protection = document.getElementById("toggleProtectionBtn");
+  protection.disabled = disabled || !state.selected.size;
+  protection.textContent = actions.unprotect ? "Remove manual protection" : "Protect selected";
+  protection.className = actions.unprotect ? "action-unprotect" : "action-protect";
+  protection.title = actions.unprotect ? "Remove saved manual protection. Automatic uplink protection remains." : "Save manual protection for every selected port, including mixed selections.";
+}
+
+async function saveSelectedProtection(protect) {
+  if (state.pendingConfirmation || state.deploymentInProgress || state.connectionInProgress || state.protectionSaving || !state.selected.size) return;
+  if (state.protectionHost !== hostInput.value.trim().toLowerCase()) return;
+  const targetHost = state.protectionHost;
+  const ports = new Set(state.manualProtectedPorts);
+  state.selected.forEach((name) => protect ? ports.add(name) : ports.delete(name));
+  state.protectionSaving = true;
+  updatePushAvailability();
+  try {
+    const response = await fetch("/api/protected-ports", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(connectionPayload({ ports: [...ports] }))
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "Unable to save protection");
+    if (state.protectionHost !== targetHost || hostInput.value.trim().toLowerCase() !== targetHost) return;
+    state.manualProtectedPorts = payload.manualProtectedPorts;
+    render(false);
+    connectionStatus.textContent = protect ? "Manual port protection saved" : "Manual protection removed; automatic protection still applies";
+    connectionStatus.className = "status-pill connected";
+  } catch (error) {
+    connectionStatus.textContent = `Protection error: ${error.message}`;
+    connectionStatus.className = "status-pill error";
+  } finally {
+    state.protectionSaving = false;
+    updatePushAvailability();
+  }
+}
+
+function quickTaskValidationError(config) {
+  if (!config.trim()) return "Build a configuration first.";
+  if (!config.split(/\r?\n/).some((line) => line.trim() && !line.trim().startsWith("#"))) return "Build a configuration first.";
+  if (state.protectionHost !== hostInput.value.trim().toLowerCase()) return "Connect to this switch before using quick tasks.";
+  const topology = buildMacTopology();
+  const names = new Set([...state.discoveredVlans.map((vlan) => vlan.name), ...state.bridgeServices.map((service) => service.name)]);
+  const ids = new Set(state.discoveredVlans.map((vlan) => Number(vlan.value)));
+  for (const line of config.split(/\r?\n/).map((value) => value.trim()).filter((value) => value && !value.startsWith("#"))) {
+    if (isDescriptionOnlyDeployment(line)) continue;
+    const portMatch = line.match(/^(?:set|delete) interfaces (\S+) disable$/);
+    if (portMatch) {
+      const port = state.ports.find((entry) => entry.name === portMatch[1]);
+      const reason = port ? quickPortExclusion(port, topology) : "Port not discovered";
+      if (reason) return `${portMatch[1]}: ${reason}. Use rollback protection.`;
+      continue;
+    }
+    const vlan = line.match(/^set vlans ([A-Za-z0-9_.:-]+) vlan-id (\d+)$/);
+    if (vlan && Number(vlan[2]) >= 1 && Number(vlan[2]) <= 4094) {
+      if (names.has(vlan[1]) || ids.has(Number(vlan[2]))) return "Quick VLAN creation requires an unused name and ID.";
+      names.add(vlan[1]); ids.add(Number(vlan[2]));
+      continue;
+    }
+    return "This batch requires rollback protection. Quick tasks allow descriptions, new VLANs, and eligible port enable/disable only.";
   }
   return "";
 }
@@ -1380,6 +1525,16 @@ function updateSelectionSummary() {
     return p && (p.configured || logicalServicesForPort(name).length > 0);
   }).length;
   selectionSummary.textContent = `${list.length} selected`;
+  document.getElementById("floatingSelection").hidden = !list.length;
+  document.getElementById("floatingSelectionSummary").textContent = `${list.length} selected port${list.length === 1 ? "" : "s"}`;
+  const floatingList = document.getElementById("floatingSelectionList");
+  floatingList.replaceChildren();
+  state.ports.filter((port) => state.selected.has(port.name)).forEach((port) => {
+    const item = document.createElement("li");
+    item.textContent = port.name;
+    item.title = port.currentDescription || port.name;
+    floatingList.appendChild(item);
+  });
   selectionSummaryBox.replaceChildren();
   if (!list.length) {
     const empty = document.createElement("em");
@@ -2153,9 +2308,11 @@ function buildIrbConfiguration() {
   const unit = Number(irbUnitInput.value);
   const address = irbAddressInput.value.trim();
   const conflict = irbConflict();
-  if (!vlan || !Number.isInteger(unit) || unit < 0 || unit > 16384 || !validIpv4Prefix(address) || conflict) {
+  if (!vlan || !irbUnitInput.value.trim() || !Number.isInteger(unit) || unit < 0 || unit > 16384 || !validIpv4Prefix(address) || conflict) {
     connectionStatus.textContent = conflict || "Select a VLAN, enter an IRB unit from 0 to 16384, and enter an IPv4 prefix such as 192.0.2.1/24";
     connectionStatus.className = "status-pill error";
+    irbSummary.textContent = connectionStatus.textContent;
+    irbSummary.className = "tool-summary error-text";
     return;
   }
   appendConfigLines([
@@ -2252,6 +2409,8 @@ function buildQinqConfiguration() {
   if (validationError || conflict) {
     connectionStatus.textContent = conflict || validationError;
     connectionStatus.className = "status-pill error";
+    qinqSummary.textContent = connectionStatus.textContent;
+    qinqSummary.className = "tool-summary error-text";
     return;
   }
   appendConfigLines(lines);
@@ -2468,20 +2627,24 @@ async function previewDeviceDiff() {
   }
 }
 
-async function quickCommitDescriptions() {
+async function quickCommitChanges() {
+  if (state.deploymentInProgress || state.connectionInProgress || state.protectionSaving) return;
   if (state.pendingConfirmation) {
     connectionStatus.textContent = "Confirm the pending commit before committing another change";
     connectionStatus.className = "status-pill error";
     return;
   }
   const deploymentConfig = combinedDeploymentConfig();
+  const quickTasks = !isDescriptionOnlyDeployment(deploymentConfig);
   if (!queueMatchesCurrentTarget()) {
     connectionStatus.textContent = "The queued batches belong to another switch. Clear the queue before committing to this target.";
     connectionStatus.className = "status-pill error";
     return;
   }
-  if (!isDescriptionOnlyDeployment(deploymentConfig)) {
-    connectionStatus.textContent = "Quick commit is available only when every queued and current command changes an interface description";
+  const eligibilityError = quickTasks ? quickTaskValidationError(deploymentConfig)
+    : (!isDescriptionOnlyDeployment(deploymentConfig) ? "Quick commit is available only when every queued and current command changes an interface description" : "");
+  if (eligibilityError) {
+    connectionStatus.textContent = eligibilityError;
     connectionStatus.className = "status-pill error";
     return;
   }
@@ -2492,33 +2655,35 @@ async function quickCommitDescriptions() {
   }
 
   state.deploymentInProgress = true;
-  quickDescriptionCommitBtn.textContent = "Committing descriptions...";
-  connectionStatus.textContent = "Checking and committing description changes...";
+  const commitButton = quickCommitBtn;
+  commitButton.textContent = "Committing...";
+  connectionStatus.textContent = quickTasks ? "Rechecking eligible tasks and committing..." : "Checking and committing description changes...";
   connectionStatus.className = "status-pill";
   renderConfigQueue();
 
   try {
-    const response = await fetch("/api/quick-description-commit", {
+    const response = await fetch(quickTasks ? "/api/quick-task-commit" : "/api/quick-description-commit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(connectionPayload({ config: deploymentConfig }))
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) {
-      throw new Error(payload.error || "Description commit failed");
+      throw new Error(payload.error || "Quick commit failed");
     }
 
     clearDeploymentWorkspace();
-    setDeploymentReady("Description-only changes committed directly after a successful commit check.");
+    setDeploymentReady("Quick changes committed directly after a successful commit check.");
     const commandCount = payload.commandCount || configCommandCount(deploymentConfig);
-    connectionStatus.textContent = `${commandCount} description change${commandCount === 1 ? "" : "s"} committed successfully`;
+    connectionStatus.textContent = `${commandCount} ${quickTasks ? "quick" : "description"} change${commandCount === 1 ? "" : "s"} committed successfully`;
     connectionStatus.className = "status-pill connected";
+    if (quickTasks) await connectToSwitch({ isRefresh: true });
   } catch (error) {
-    connectionStatus.textContent = `Description commit error: ${error.message}`;
+    connectionStatus.textContent = `Quick commit error: ${error.message}`;
     connectionStatus.className = "status-pill error";
   } finally {
     state.deploymentInProgress = false;
-    quickDescriptionCommitBtn.textContent = "Quick commit descriptions";
+    commitButton.textContent = "Quick commit";
     renderConfigQueue();
   }
 }
@@ -2719,8 +2884,10 @@ document.getElementById("moveLogicalServiceBtn").addEventListener("click", build
 document.getElementById("applyBtn").addEventListener("click", applySelectedPorts);
 appendSelectedFieldsBtn.addEventListener("click", appendSelectedFields);
 document.getElementById("removeVlanBtn").addEventListener("click", removeVlanFromSelected);
-document.getElementById("enablePortsBtn").addEventListener("click", enableSelectedPorts);
-document.getElementById("disablePortsBtn").addEventListener("click", disableSelectedPorts);
+document.getElementById("togglePortsBtn").addEventListener("click", () => {
+  if (selectionActionState().enable) enableSelectedPorts();
+  else disableSelectedPorts();
+});
 document.getElementById("clearPortsBtn").addEventListener("click", clearSelectedPortConfiguration);
 connectionForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -2803,7 +2970,14 @@ richardViewBtn.addEventListener("click", () => {
   richardViewBtn.textContent = state.richardView ? "Exit Richard View" : "Richard View";
 });
 previewBtn.addEventListener("click", previewDeviceDiff);
-quickDescriptionCommitBtn.addEventListener("click", quickCommitDescriptions);
+quickCommitBtn.addEventListener("click", quickCommitChanges);
+document.getElementById("toggleProtectionBtn").addEventListener("click", () => saveSelectedProtection(!selectionActionState().unprotect));
+document.getElementById("selectEligiblePortsBtn").addEventListener("click", () => {
+  const topology = buildMacTopology();
+  state.selected = new Set(state.ports.filter((port) => !quickPortExclusion(port, topology)).map((port) => port.name));
+  state.lastSelected = null;
+  render();
+});
 pushBtn.addEventListener("click", pushToSwitch);
 confirmBtn.addEventListener("click", confirmCommit);
 queueCurrentConfigBtn.addEventListener("click", queueCurrentConfig);
