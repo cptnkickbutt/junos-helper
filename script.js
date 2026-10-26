@@ -26,11 +26,13 @@ const state = {
   visibleSavedDeviceGroups: null,
   connectionInProgress: false,
   deploymentInProgress: false,
+  bounceInProgress: false,
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 19;
+const REQUIRED_API_VERSION = 20;
 const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
+const BOUNCE_INTERVAL_STORAGE_KEY = "junosHelper.bounceInterval";
 const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
 const MAX_CONFIG_QUEUE_BATCHES = 8;
 const MAX_DEPLOYMENT_CONFIG_CHARS = 64 * 1024;
@@ -198,7 +200,19 @@ function invalidatePreview() {
 
 function replaceConfig(text, manual = true) {
   if (state.pendingConfirmation || state.deploymentInProgress) return;
-  const normalized = text.trim();
+  let normalized = text.trim();
+  if (manual && state.configManual && normalized) {
+    const existingNames = new Set([
+      ...state.discoveredVlans,
+      ...parseVlanDefinitions(normalized),
+      ...parseVlanDefinitions(state.configQueue.map((batch) => batch.config).join("\n"))
+    ].map((vlan) => vlan.name));
+    const retained = parseVlanDefinitions(configOutput.value).filter((vlan) => !existingNames.has(vlan.name));
+    if (retained.length) {
+      normalized = ["# New VLANs retained for deployment",
+        ...retained.map((vlan) => `set vlans ${vlan.name} vlan-id ${vlan.value}`), "", normalized].join("\n");
+    }
+  }
   if (configOutput.value === normalized) {
     state.configManual = manual;
     return;
@@ -245,7 +259,32 @@ function queueMatchesCurrentTarget() {
     || state.queueTargetHost === hostInput.value.trim().toLowerCase();
 }
 
+function parseVlanDefinitions(config) {
+  const vlans = new Map();
+  config.split(/\r?\n/).forEach((line) => {
+    const match = line.trim().match(/^set vlans ([A-Za-z0-9_.:-]+) vlan-id (\d+)$/);
+    if (match && Number(match[2]) >= 1 && Number(match[2]) <= 4094) {
+      vlans.set(match[1], { name: match[1], value: String(Number(match[2])) });
+    }
+  });
+  return [...vlans.values()];
+}
+
+function syncAvailableVlans() {
+  const vlans = new Map(state.discoveredVlans.map((vlan) => [vlan.name, { ...vlan }]));
+  const queuedConfig = queueMatchesCurrentTarget() ? state.configQueue.map((batch) => batch.config).join("\n") : "";
+  parseVlanDefinitions(`${queuedConfig}\n${configOutput.value}`).forEach((vlan) => {
+    if (!vlans.has(vlan.name)) vlans.set(vlan.name, vlan);
+  });
+  const available = [...vlans.values()].sort((a, b) => Number(a.value) - Number(b.value) || a.name.localeCompare(b.name));
+  if (JSON.stringify(available) === JSON.stringify(state.vlans)) return;
+  state.vlans = available;
+  renderVlanChoices();
+  populateServiceChoices();
+}
+
 function renderConfigQueue() {
+  syncAvailableVlans();
   const queuedCommands = state.configQueue.reduce(
     (total, batch) => total + configCommandCount(batch.config),
     0
@@ -352,6 +391,11 @@ function clearConfigQueue() {
 }
 
 function clearDeploymentWorkspace() {
+  const committedVlans = new Map(state.discoveredVlans.map((vlan) => [vlan.name, { ...vlan }]));
+  parseVlanDefinitions(combinedDeploymentConfig()).forEach((vlan) => {
+    committedVlans.set(vlan.name, { ...committedVlans.get(vlan.name), ...vlan });
+  });
+  state.discoveredVlans = [...committedVlans.values()];
   state.configQueue = [];
   state.nextQueueId = 1;
   state.queueTargetHost = null;
@@ -775,7 +819,7 @@ function configureAutoRefresh() {
 }
 
 async function connectToSwitch({ isRefresh = false } = {}) {
-  if (state.connectionInProgress) return;
+  if (state.connectionInProgress || state.bounceInProgress) return;
   if (!(await checkBackendCompatibility())) return;
   if (!isRefresh) await loadDefaults();
   const previousSelected = new Set(state.selected);
@@ -870,12 +914,12 @@ async function connectToSwitch({ isRefresh = false } = {}) {
       });
     }
 
-    state.vlans = payload.vlanMemberships || [];
-    state.discoveredVlans = [...state.vlans];
+    state.discoveredVlans = payload.vlanMemberships || [];
     state.manualProtectedPorts = payload.manualProtectedPorts || [];
     state.protectionHost = payload.host.trim().toLowerCase();
     state.irbUnits = payload.irbUnits || [];
     state.bridgeServices = payload.bridgeServices || [];
+    syncAvailableVlans();
     renderVlanChoices();
     populateServiceChoices();
 
@@ -1236,6 +1280,99 @@ function updateSelectionActions(disabled) {
   protection.textContent = actions.unprotect ? "Remove manual protection" : "Protect selected";
   protection.className = actions.unprotect ? "action-unprotect" : "action-protect";
   protection.title = actions.unprotect ? "Remove saved manual protection. Automatic uplink protection remains." : "Save manual protection for every selected port, including mixed selections.";
+  const bounceError = bounceSelectionError();
+  ["bouncePortsBtn", "bouncePoeBtn"].forEach((id) => {
+    const button = document.getElementById(id);
+    button.disabled = disabled || !!bounceError;
+    button.title = bounceError || "Run a timed bounce immediately after confirmation, independently of the configuration preview.";
+  });
+  document.getElementById("bounceInterval").disabled = state.bounceInProgress;
+}
+
+function loadBounceIntervalPreference() {
+  try {
+    const interval = Number(window.localStorage.getItem(BOUNCE_INTERVAL_STORAGE_KEY));
+    if (Number.isInteger(interval) && interval >= 1 && interval <= 30) {
+      document.getElementById("bounceInterval").value = String(interval);
+    }
+  } catch (_error) {
+    // Use the default when browser storage is unavailable.
+  }
+}
+
+function saveBounceIntervalPreference() {
+  const input = document.getElementById("bounceInterval");
+  const interval = Number(input.value);
+  if (!Number.isInteger(interval) || interval < 1 || interval > 30) {
+    input.reportValidity();
+    return;
+  }
+  try {
+    window.localStorage.setItem(BOUNCE_INTERVAL_STORAGE_KEY, String(interval));
+  } catch (_error) {
+    // The selected interval still applies to this session.
+  }
+}
+
+function bounceSelectionError() {
+  if (!state.protectionHost || state.protectionHost !== hostInput.value.trim().toLowerCase()) return "Connect to this switch first.";
+  const selected = state.ports.filter((port) => state.selected.has(port.name));
+  if (!selected.length || selected.length > 48) return "Select 1 to 48 physical Ethernet ports.";
+  const topology = buildMacTopology();
+  const errors = selected.flatMap((port) => {
+    let reason = portProtectionReason(port, topology);
+    if (!/^(?:fe|ge|mge|xe|et)-\d+\/\d+\/\d+(?:\/\d+)?(?::\d+)?$/i.test(port.name)) reason = "Physical Ethernet ports only";
+    else if (port.currentDisabled || port.admin === "down") reason = "Port is administratively disabled";
+    return reason ? [`${port.name}: ${reason}`] : [];
+  });
+  return errors.join("; ");
+}
+
+async function bounceSelectedPorts(kind) {
+  if (state.pendingConfirmation || state.deploymentInProgress || state.connectionInProgress || state.protectionSaving) return;
+  const resultBox = document.getElementById("portBounceResults");
+  const interval = Number(document.getElementById("bounceInterval").value);
+  const error = bounceSelectionError() || (!Number.isInteger(interval) || interval < 1 || interval > 30
+    ? "Enter a bounce interval from 1 to 30 seconds." : "");
+  if (error) {
+    resultBox.textContent = error;
+    resultBox.className = "tool-summary error-text";
+    return;
+  }
+  if (!["link", "poe"].includes(kind)) return;
+  const ports = selectedInterfaceNames();
+  const target = hostInput.value.trim();
+  const label = kind === "poe" ? "PoE bounce" : "Port bounce";
+  const effect = kind === "poe" ? "Power will be interrupted; connected powered devices may reboot." : "Network links will be interrupted.";
+  if (!window.confirm(`${label} on ${target} for ${interval} seconds?\n\n${ports.join(", ")}\n\n${effect}\nThis runs immediately. Queued and preview configuration is not deployed.`)) return;
+  const payload = connectionPayload({ ports, kind, interval });
+  const connectionControls = [hostInput, usernameInput, passwordInput, savedDeviceInput, connectBtn, quickConnectBtn, refreshNowBtn];
+  const previousDisabled = connectionControls.map((control) => control.disabled);
+  connectionControls.forEach((control) => { control.disabled = true; });
+  state.deploymentInProgress = true;
+  state.bounceInProgress = true;
+  resultBox.textContent = `Checking selected ports and requesting ${label.toLowerCase()} on ${target}...`;
+  resultBox.className = "tool-summary";
+  renderConfigQueue();
+  try {
+    const response = await fetch("/api/ports/bounce", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    const results = (result.results || []).map((item) => `${item.port}: ${item.ok ? `request accepted (${interval}s)` : item.error || "Request failed"}`);
+    resultBox.textContent = [`${label} on ${target}`, ...results,
+      response.ok && result.ok ? "The switch will restore service after the interval. Refresh inventory to check status."
+        : result.error || "Request failed; check switch status before retrying."].join("\n");
+    resultBox.className = response.ok && result.ok ? "tool-summary valid" : "tool-summary error-text";
+  } catch (error) {
+    resultBox.textContent = `${label} on ${target}: response unavailable (${error.message}). Check switch status before retrying; requests may have started.`;
+    resultBox.className = "tool-summary error-text";
+  } finally {
+    state.deploymentInProgress = false;
+    state.bounceInProgress = false;
+    connectionControls.forEach((control, index) => { control.disabled = previousDisabled[index]; });
+    renderConfigQueue();
+  }
 }
 
 async function saveSelectedProtection(protect) {
@@ -1657,7 +1794,7 @@ function updateConfig(force = false) {
 
   selectedPorts.forEach((port) => lines.push(...buildDesiredLines(port, descriptionInput.value.trim()), ""));
 
-  replaceConfig(lines.join("\n"), false);
+  replaceConfig(lines.join("\n"), force);
 }
 
 function updateConnectionHint() {
@@ -1738,6 +1875,7 @@ function updateMoveSummary() {
 }
 
 function buildMoveConfiguration() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const { error, mappings } = getMoveMappings();
   if (error) {
     connectionStatus.textContent = error;
@@ -1812,7 +1950,7 @@ function buildMoveConfiguration() {
   replaceConfig(lines.join("\n"), true);
   connectionStatus.textContent = `Built move configuration for ${mappings.length} interface${mappings.length === 1 ? "" : "s"}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function populateSeriesStartPorts() {
@@ -2014,6 +2152,7 @@ function updateDescriptionTransformPreview() {
 }
 
 function buildDescriptionTransformConfiguration() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const plan = descriptionTransformPlan();
   if (plan.error || !plan.changes.length) {
     connectionStatus.textContent = plan.error || "No selected descriptions would change";
@@ -2034,7 +2173,7 @@ function buildDescriptionTransformConfiguration() {
   const skippedText = plan.unmatched.length ? `; skipped ${plan.unmatched.length} nonmatching port${plan.unmatched.length === 1 ? "" : "s"}` : "";
   connectionStatus.textContent = `Built ${plan.changes.length} description change${plan.changes.length === 1 ? "" : "s"}${skippedText}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function buildDesiredLines(port, description) {
@@ -2065,6 +2204,7 @@ function buildDescriptionLine(port, description) {
 }
 
 function buildSeriesConfiguration() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const startIndex = state.ports.findIndex((port) => port.name === seriesStartPort.value);
   const count = parseInt(seriesCountInput.value || "0", 10);
   const firstNumber = parseInt(seriesStartNumberInput.value || "0", 10);
@@ -2096,10 +2236,11 @@ function buildSeriesConfiguration() {
   render();
   connectionStatus.textContent = `Built series configuration for ${ports.length} interface${ports.length === 1 ? "" : "s"}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function createVlanCommand() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const name = newVlanNameInput.value.trim();
   const vlanId = parseInt(newVlanIdInput.value || "0", 10);
   if (!/^[A-Za-z0-9_.:-]+$/.test(name) || vlanId < 1 || vlanId > 4094) {
@@ -2113,14 +2254,12 @@ function createVlanCommand() {
     return;
   }
   appendConfigLines([`set vlans ${name} vlan-id ${vlanId}`]);
-  state.vlans.push({ name, value: String(vlanId) });
-  state.vlans.sort((a, b) => Number(a.value) - Number(b.value));
-  renderVlanChoices();
-  populateServiceChoices();
+  syncAvailableVlans();
   newVlanNameInput.value = "";
   newVlanIdInput.value = "";
   connectionStatus.textContent = `Added VLAN ${name} (${vlanId}) to the preview`;
   connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review", true);
 }
 
 function populateServiceChoices() {
@@ -2232,6 +2371,7 @@ function updateLogicalServiceMoveSummary() {
 }
 
 function buildLogicalServiceMove() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const source = selectedLogicalServiceMember();
   const destination = selectedInterfaceNames()[0];
   const error = logicalServiceMoveError();
@@ -2261,7 +2401,7 @@ function buildLogicalServiceMove() {
   replaceConfig(lines.join("\n"), true);
   connectionStatus.textContent = `Built logical-unit move for ${source.service.name} to ${destination}.${source.unit}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function validIpv4Prefix(value) {
@@ -2304,6 +2444,7 @@ function updateIrbSummary() {
 }
 
 function buildIrbConfiguration() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const vlan = state.vlans.find((entry) => entry.name === irbVlanInput.value);
   const unit = Number(irbUnitInput.value);
   const address = irbAddressInput.value.trim();
@@ -2322,7 +2463,7 @@ function buildIrbConfiguration() {
   ]);
   connectionStatus.textContent = `Appended IRB gateway irb.${unit} for ${vlan.name}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function qinqValues() {
@@ -2402,6 +2543,7 @@ function updateQinqSummary() {
 }
 
 function buildQinqConfiguration() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const values = qinqValues();
   const validationError = qinqValidationError();
   const lines = validationError ? [] : buildQinqLines(values);
@@ -2416,15 +2558,26 @@ function buildQinqConfiguration() {
   appendConfigLines(lines);
   connectionStatus.textContent = `Appended Q-in-Q service ${values.serviceName} on ${values.customer} and ${values.uplink}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function applySelectedPorts() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
+  const count = selectedInterfaceNames().length;
+  if (!count) {
+    connectionStatus.textContent = "Select at least one port first";
+    connectionStatus.className = "status-pill error";
+    return;
+  }
   updateConfig(true);
   state.configManual = true;
+  connectionStatus.textContent = `Built full configuration for ${count} port${count === 1 ? "" : "s"}`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review", true);
 }
 
 function appendSelectedFields() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
   if (!selectedPorts.length) {
     connectionStatus.textContent = "Select at least one port first";
@@ -2493,10 +2646,11 @@ function appendSelectedFields() {
   ].filter(Boolean);
   connectionStatus.textContent = `Appended ${fieldLabels.join(", ")} for ${selectedPorts.length} port${selectedPorts.length === 1 ? "" : "s"}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function removeVlanFromSelected() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
   const vlanList = parseMembershipInput();
   if (!selectedPorts.length) {
@@ -2521,7 +2675,7 @@ function removeVlanFromSelected() {
   appendConfigLines(lines);
   connectionStatus.textContent = `Appended VLAN removal for ${selectedPorts.length} port${selectedPorts.length === 1 ? "" : "s"}`;
   connectionStatus.className = "status-pill";
-  activateWorkspaceTab("review");
+  activateWorkspaceTab("review", true);
 }
 
 function selectedInterfaceNames() {
@@ -2529,6 +2683,7 @@ function selectedInterfaceNames() {
 }
 
 function appendPortAdministrationCommands(commands, message) {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   if (!commands.length) {
     connectionStatus.textContent = "Select at least one port first";
     connectionStatus.className = "status-pill error";
@@ -2537,6 +2692,7 @@ function appendPortAdministrationCommands(commands, message) {
   appendConfigLines(commands);
   connectionStatus.textContent = message;
   connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review", true);
 }
 
 function enableSelectedPorts() {
@@ -2555,19 +2711,65 @@ function disableSelectedPorts() {
   );
 }
 
+function portConfigurationClearPlan(interfaces) {
+  const selectedNames = new Set(interfaces);
+  const bridgeDeletes = new Set();
+  const pairedUnits = new Map();
+  const skippedPairs = [];
+  const parseMember = (name) => {
+    const separator = name.lastIndexOf(".");
+    return { name, port: name.slice(0, separator), unit: name.slice(separator + 1) };
+  };
+  state.bridgeServices.forEach((service) => {
+    const members = [...new Set(service.interfaces)].map(parseMember);
+    const selected = members.filter((member) => selectedNames.has(member.port));
+    if (!selected.length) return;
+    selected.forEach((member) => bridgeDeletes.add(`delete vlans ${service.name} interface ${member.name}`));
+    const peers = members.filter((member) => !selectedNames.has(member.port));
+    if (!peers.length) return;
+    let skipReason = "";
+    if (members.length !== 2) skipReason = "multiple endpoints";
+    else if (members.some((member) => !/^\d+$/.test(member.unit) || Number(member.unit) === 0)) {
+      skipReason = "unit 0 or unknown unit";
+    } else if (state.bridgeServices.some((other) => other.name !== service.name && other.interfaces.includes(peers[0].name))) {
+      skipReason = "peer unit shared with another VLAN";
+    }
+    if (skipReason) {
+      skippedPairs.push(`${service.name} (${skipReason})`);
+      return;
+    }
+    const peer = peers[0];
+    bridgeDeletes.add(`delete vlans ${service.name} interface ${peer.name}`);
+    pairedUnits.set(peer.name, { ...peer, service: service.name });
+  });
+  return { bridgeDeletes: [...bridgeDeletes], pairedUnits: [...pairedUnits.values()], skippedPairs };
+}
+
 function clearSelectedPortConfiguration() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
   const interfaces = selectedInterfaceNames();
   if (!interfaces.length) {
     appendPortAdministrationCommands([], "");
     return;
   }
+  const { bridgeDeletes, pairedUnits, skippedPairs } = portConfigurationClearPlan(interfaces);
   const portList = interfaces.join(", ");
-  if (!window.confirm(`Remove the entire interface configuration for: ${portList}?\n\nThis appends delete interfaces commands to the preview; it does not push them yet.`)) {
+  const serviceSummary = bridgeDeletes.length
+    ? `\n\nAlso remove ${bridgeDeletes.length} discovered logical-interface VLAN membership${bridgeDeletes.length === 1 ? "" : "s"}.`
+    : "";
+  const pairedSummary = pairedUnits.length
+    ? `\n\nClear paired logical units on unselected ports:\n${pairedUnits.map((peer) => `${peer.service}: ${peer.name}`).join("\n")}\nOther units and physical settings on those ports are preserved.`
+    : "";
+  const skippedSummary = skippedPairs.length
+    ? `\n\nAutomatic peer cleanup skipped:\n${skippedPairs.join("\n")}`
+    : "";
+  if (!window.confirm(`Remove the entire interface configuration, including all logical units, for: ${portList}?${serviceSummary}${pairedSummary}${skippedSummary}\n\nThis appends deletion commands to the preview; it does not push them yet.`)) {
     return;
   }
   appendPortAdministrationCommands(
-    interfaces.map((iface) => `delete interfaces ${iface}`),
-    `Appended full configuration removal for ${interfaces.length} port${interfaces.length === 1 ? "" : "s"}`
+    [...bridgeDeletes, ...pairedUnits.map((peer) => `delete interfaces ${peer.port} unit ${peer.unit}`),
+      ...interfaces.map((iface) => `delete interfaces ${iface}`)],
+    `Appended full configuration removal for ${interfaces.length} port${interfaces.length === 1 ? "" : "s"}${bridgeDeletes.length ? ` and ${bridgeDeletes.length} logical-interface VLAN membership${bridgeDeletes.length === 1 ? "" : "s"}` : ""}${pairedUnits.length ? `; ${pairedUnits.length} paired logical unit${pairedUnits.length === 1 ? "" : "s"} cleared` : ""}${skippedPairs.length ? `; peer cleanup skipped for ${skippedPairs.length} service${skippedPairs.length === 1 ? "" : "s"} (see confirmation details)` : ""}`
   );
 }
 
@@ -2889,6 +3091,8 @@ document.getElementById("togglePortsBtn").addEventListener("click", () => {
   else disableSelectedPorts();
 });
 document.getElementById("clearPortsBtn").addEventListener("click", clearSelectedPortConfiguration);
+document.getElementById("bouncePortsBtn").addEventListener("click", () => bounceSelectedPorts("link"));
+document.getElementById("bouncePoeBtn").addEventListener("click", () => bounceSelectedPorts("poe"));
 connectionForm.addEventListener("submit", (event) => {
   event.preventDefault();
   connectToSwitch();
@@ -2912,6 +3116,7 @@ autoSaveConnectionsInput.addEventListener("change", () => {
   }
 });
 refreshNowBtn.addEventListener("click", () => connectToSwitch({ isRefresh: true }));
+document.getElementById("bounceInterval").addEventListener("change", saveBounceIntervalPreference);
 optionsBtn.addEventListener("click", async () => {
   await loadSavedDevices(state.savedDeviceId);
   optionsDialog.showModal();
@@ -3012,6 +3217,7 @@ try {
   state.visibleSavedDeviceGroups = null;
 }
 
+loadBounceIntervalPreference();
 render();
 activateWorkspaceTab("configure");
 updateSelectionModeHint();

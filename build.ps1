@@ -28,6 +28,7 @@ $pyInstallerArgs = @(
     "--clean",
     "--onefile",
     "--name", "JunosHelper",
+    "--version-file", "$(Join-Path $projectDir 'version_info.txt')",
     "--add-data", "$(Join-Path $projectDir 'index.html');.",
     "--add-data", "$(Join-Path $projectDir 'styles.css');.",
     "--add-data", "$(Join-Path $projectDir 'script.js');."

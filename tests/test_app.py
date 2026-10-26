@@ -502,6 +502,21 @@ class ConfigValidationTests(unittest.TestCase):
             ["set vlans CAMERAS vlan-id 325"],
         )
 
+    def test_accepts_port_clear_with_leftover_qinq_memberships(self) -> None:
+        commands = [
+            "delete vlans BT_APT_306_QnQ interface mge-0/0/12.3026",
+            "delete vlans BT_APT_306_QnQ interface xe-0/2/0.3026",
+            "delete vlans BT_APT_307_QnQ interface mge-0/0/13.3027",
+            "delete vlans BT_APT_307_QnQ interface xe-0/2/0.3027",
+            "delete interfaces xe-0/2/0 unit 3026",
+            "delete interfaces xe-0/2/0 unit 3027",
+            "delete interfaces mge-0/0/12",
+            "delete interfaces mge-0/0/13",
+        ]
+        self.assertEqual(_validated_config_lines("\n".join(commands)), commands)
+        with self.assertRaises(ValueError):
+            _validated_description_only_lines("\n".join(commands))
+
     def test_accepts_irb_and_qinq_service_commands(self) -> None:
         config = "\n".join([
             "set interfaces irb unit 310 family inet address 192.0.2.1/24",
@@ -579,6 +594,7 @@ class ApiSafetyTests(unittest.TestCase):
             packaged_health = app.test_client().get("/api/health").get_json()
 
         self.assertEqual(source_health["apiVersion"], app_module.API_VERSION)
+        self.assertEqual(source_health["appVersion"], app_module.APP_VERSION)
         self.assertFalse(source_health["packaged"])
         self.assertTrue(packaged_health["packaged"])
 

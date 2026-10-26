@@ -11,6 +11,19 @@ Add new entries here under `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`,
 or `Security`. When publishing a release, move those entries into a dated version
 section and update the comparison links at the bottom of this file.
 
+## [v1.5] - 2026-10-26
+
+### Added
+
+- Added Port bounce and PoE bounce controls with a compact off-time preference under Options, saved in the browser, immediate-action confirmation, fresh protection/PoE checks, and per-port results. Native timed requests preserve configuration and queued work; unsupported commands and partial failures are reported without a commit-based fallback.
+
+### Fixed
+
+- Keep staged VLANs available in membership, native-VLAN, and IRB pickers across queued batches and inventory refreshes. Replacement builders retain unqueued VLAN creation commands; removing staged definitions clears stale choices, and successfully committed VLANs remain available until discovery refreshes.
+- Made the floating selected-ports panel and port-label fills translucent while keeping text and borders fully opaque.
+- Made all successful command-building buttons open and focus Review & deploy, including full regeneration, VLAN creation, enable/disable, and configuration clearing. Invalid or canceled actions stay in context, and builders preserve the preview during deployment or pending confirmation. Added a complete button behavior reference and distinct teal/purple bounce buttons.
+- Clearing selected ports now removes discovered logical-interface VLAN memberships before deleting their interface configuration, including memberships left by earlier clears. Two-endpoint services also clear the paired uplink reference and logical unit, preserving other uplink configuration. Confirmations list paired units and skipped ambiguous services.
+
 ## [v1.4] - 2026-10-22
 
 ### Added
@@ -130,7 +143,8 @@ section and update the comparison links at the bottom of this file.
 - Restricted web-served files to the three required frontend assets so `.env` and source files cannot be downloaded.
 - Excluded credentials, virtual environments, caches, logs, coverage output, and editor metadata from Git.
 
-[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.4...HEAD
+[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.5...HEAD
+[v1.5]: https://github.com/cptnkickbutt/junos-helper/compare/v1.4...v1.5
 [v1.4]: https://github.com/cptnkickbutt/junos-helper/compare/v1.3...v1.4
 [v1.3]: https://github.com/cptnkickbutt/junos-helper/compare/v1.2...v1.3
 [v1.2]: https://github.com/cptnkickbutt/junos-helper/compare/v1.1...v1.2

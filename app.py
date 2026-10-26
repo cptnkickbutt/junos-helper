@@ -147,7 +147,9 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-API_VERSION = 19
+APP_VERSION = "1.5"
+API_VERSION = 20
+PORT_BOUNCE_LOCK = threading.Lock()
 COMMIT_COMMENT = "Applied by Junos Helper"
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
 QUICK_DESCRIPTION_COMMIT_COMMENT = "Description update by Junos Helper"
@@ -757,7 +759,7 @@ def javascript() -> Any:
 
 @app.get("/api/health")
 def health() -> Any:
-    return jsonify({"ok": True, "apiVersion": API_VERSION, "packaged": IS_FROZEN})
+    return jsonify({"ok": True, "appVersion": APP_VERSION, "apiVersion": API_VERSION, "packaged": IS_FROZEN})
 
 
 @app.post("/api/shutdown")
@@ -1225,7 +1227,8 @@ def save_protected_ports() -> Any:
     return jsonify({"ok": True, "manualProtectedPorts": sorted(set(ports))})
 
 
-def _quick_port_exclusions(configuration: dict, macs: dict, neighbors: dict, manual: list[str]) -> dict[str, str]:
+def _quick_port_exclusions(configuration: dict, macs: dict, neighbors: dict, manual: list[str],
+                           *, access_only: bool = True) -> dict[str, str]:
     reasons = dict.fromkeys(manual, "Manually protected")
     explicit = {name for name, details in configuration.items() if re.search(
         r"(?:^|[^a-z0-9])(?:uplink|upstream|distribution|distro|core)(?:$|[^a-z0-9])",
@@ -1249,17 +1252,108 @@ def _quick_port_exclusions(configuration: dict, macs: dict, neighbors: dict, man
             reasons[name] = "Uplink description"
         elif not PHYSICAL_INTERFACE_NAME_RE.fullmatch(name):
             reasons[name] = "Aggregated interface"
-        elif details.get("mode") != "access":
+        elif details.get("mode") == "trunk" or (access_only and details.get("mode") != "access"):
             reasons[name] = "Requires explicit access mode"
         elif re.search(r"\b(?:bridge|router)\b", capabilities, re.I):
             reasons[name] = "LLDP switch/router neighbor"
         elif not explicit and (len(duplicate) >= 2 and len(peers) >= 2 or dominant):
             reasons[name] = "Uplink MAC pattern"
-        elif any(re.search(r"\b(?:802\.3ad|native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b", line)
+        elif any(re.search(r"\b802\.3ad\b", line) for line in lines):
+            reasons[name] = "Aggregate member"
+        elif access_only and any(re.search(r"\b(?:native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b", line)
                  or re.search(r"\bunit (?!0\b)\d+\b", line)
                  or re.search(r"\bfamily (?!ethernet-switching\b)\S+", line) for line in lines):
             reasons[name] = "Aggregate membership or logical service configuration"
     return reasons
+
+
+def _bounce_read(client: paramiko.SSHClient, command: str) -> str:
+    output, error, status = _execute_cli(client, command)
+    if status != 0 or error.strip() or re.search(
+        r"(?:error:|syntax error|permission denied|unknown command|command not found)", output, re.I
+    ):
+        raise ValueError(_cli_failure_message(output, error, f"Unable to read {command}."))
+    return output
+
+
+def _check_bounce_ports(client: paramiko.SSHClient, host: str, ports: list[str], kind: str) -> None:
+    details = {item["name"]: item for item in _parse_interface_details(_bounce_read(client, "show interfaces terse"))}
+    configuration = _parse_interface_configuration(_bounce_read(client, "show configuration interfaces | display set"))
+    for name in details:
+        configuration.setdefault(name, {})
+    macs = _parse_ethernet_switching_table(_bounce_read(client, "show ethernet-switching table"))
+    neighbors = _parse_lldp_neighbors(_bounce_read(client, "show lldp neighbors detail"))
+    exclusions = _quick_port_exclusions(configuration, macs, neighbors, _manual_protected_ports(host), access_only=False)
+    errors = []
+    for name in ports:
+        if name not in details:
+            errors.append(f"{name}: physical interface was not discovered; refresh inventory")
+        elif name in exclusions:
+            errors.append(f"{name}: {exclusions[name]}")
+        elif configuration[name].get("disabled") or details[name]["admin"] != "up":
+            errors.append(f"{name}: interface must be administratively enabled")
+    if errors:
+        raise ValueError("No ports bounced. " + "; ".join(errors))
+    if kind == "poe":
+        for name in ports:
+            output = _bounce_read(client, f"show poe interface {name}")
+            if not re.search(r"Administrative status\s*:\s*Enabled\b", output, re.I):
+                raise ValueError(f"No ports bounced. {name}: PoE is not enabled or its status could not be verified.")
+
+
+@app.post("/api/ports/bounce")
+def bounce_ports() -> Any:
+    payload = request.get_json(silent=True) or {}
+    host, username, password = _connection_values(payload)
+    ports, kind, interval = payload.get("ports"), payload.get("kind"), payload.get("interval", 5)
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+    if kind not in ("link", "poe") or type(interval) is not int or not 1 <= interval <= 30:
+        return jsonify({"ok": False, "error": "Choose link or poe bounce and an interval from 1 to 30 seconds."}), 400
+    if not isinstance(ports, list) or not 1 <= len(ports) <= 48 or any(
+        not isinstance(name, str) or not PHYSICAL_INTERFACE_NAME_RE.fullmatch(name) for name in ports
+    ):
+        return jsonify({"ok": False, "error": "Select 1 to 48 physical Ethernet ports."}), 400
+    ports = list(dict.fromkeys(ports))
+    if not PORT_BOUNCE_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Another bounce request is in progress."}), 409
+    client = None
+    results = []
+    try:
+        client = _ssh_client(host, username, password)
+        _check_bounce_ports(client, host, ports, kind)
+        for name in ports:
+            command = f"request interface bounce {'poe ' if kind == 'poe' else ''}{name} interval {interval}"
+            try:
+                output, error, status = _execute_cli(client, command)
+            except (paramiko.SSHException, OSError) as exc:
+                results.append({"port": name, "ok": False, "error": f"Response unavailable; bounce may have started: {exc}"})
+                for remaining in ports[len(results):]:
+                    results.append({"port": remaining, "ok": False, "error": "Not attempted after connection failure."})
+                break
+            acknowledged = re.search(
+                rf"PoE bounce request received for {re.escape(name)}\b" if kind == "poe"
+                else rf"Bounce operation on interface {re.escape(name)} started\b", output, re.I
+            )
+            ok = status == 0 and not error.strip() and bool(acknowledged) and not re.search(
+                r"(?:error:|failed|syntax error|permission denied)", output, re.I
+            )
+            results.append({"port": name, "ok": ok, "output": output.strip(), "error": "" if ok else
+                            _cli_failure_message(output, error, "Bounce was not acknowledged; check switch support and port status.")})
+        ok = all(result["ok"] for result in results)
+        logger.info("%s bounce requested for %s on %s: %s", kind, ports, host, results)
+        return jsonify({"ok": ok, "results": results, "interval": interval,
+                        "error": "" if ok else "Some bounce requests failed or could not be verified. Review per-port results."}), 200 if ok else 502
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc), "results": results}), 409
+    except (paramiko.SSHException, OSError) as exc:
+        return jsonify({"ok": False, "error": str(exc), "results": results}), 502
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            PORT_BOUNCE_LOCK.release()
 
 
 def _validated_quick_task_lines(config_text: str, configuration: dict, vlan_output: str,

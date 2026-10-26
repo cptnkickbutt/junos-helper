@@ -1439,6 +1439,22 @@ button:disabled {
   border-color: rgba(248, 113, 113, 0.2);
 }
 
+.bounce-interval-option {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.bounce-interval-option small {
+  color: #94a3b8;
+}
+
+.bounce-interval-option input {
+  width: 72px;
+  padding: 6px 8px;
+}
+
 .deployment-stage {
   border-color: rgba(248, 113, 113, 0.28);
   background: linear-gradient(135deg, rgba(127, 29, 29, 0.1), rgba(15, 23, 42, 0.58));
@@ -1984,6 +2000,29 @@ button.action-disable, button.action-unprotect {
   color: #fffbeb;
 }
 
+button.action-bounce-link {
+  border: 1px solid #22d3ee;
+  background: linear-gradient(135deg, #0e7490, #155e75);
+  color: #ecfeff;
+}
+
+button.action-bounce-poe {
+  border: 1px solid #c084fc;
+  background: linear-gradient(135deg, #7e22ce, #581c87);
+  color: #faf5ff;
+}
+
+button.action-bounce-link:not(:disabled):hover,
+button.action-bounce-poe:not(:disabled):hover {
+  filter: brightness(1.15);
+}
+
+button.action-bounce-link:focus-visible,
+button.action-bounce-poe:focus-visible {
+  outline: 2px solid #e2e8f0;
+  outline-offset: 3px;
+}
+
 .floating-selection {
   position: fixed;
   bottom: 16px;
@@ -1993,7 +2032,7 @@ button.action-disable, button.action-unprotect {
   padding: 12px 14px;
   border: 1px solid #38bdf8;
   border-radius: 12px;
-  background: #0f172a;
+  background: rgba(15, 23, 42, 0.35);
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
 }
 
@@ -2021,7 +2060,7 @@ button.action-disable, button.action-unprotect {
 .floating-selection li {
   padding: 4px 7px;
   border-radius: 5px;
-  background: #1e293b;
+  background: rgba(30, 41, 59, 0.45);
   color: #f1f5f9;
   font-size: 0.8rem;
   overflow-wrap: anywhere;

@@ -143,7 +143,7 @@
             <div class="tab-card-grid">
               <div class="tool-group">
                 <h4>Configuration builder</h4>
-                <p>Regenerate every field, or choose only the fields that should be appended. A focused append replaces an untouched automatic draft.</p>
+                <p>Regenerate every field, or choose only the fields that should be appended. A focused append replaces an untouched automatic draft. Successful command actions open Review &amp; deploy.</p>
                 <fieldset class="append-field-picker">
                   <legend>Fields to append</legend>
                   <div class="append-field-options">
@@ -161,13 +161,19 @@
               </div>
               <div class="tool-group port-admin-group">
                 <h4>Port administration</h4>
-                <p>Enable, disable, or remove all configuration from the selected interfaces.</p>
+                <p>Enable, disable, or clear selected interfaces. Clearing removes all their logical units and discovered VLAN references, plus the peer unit of each detected two-endpoint service. Review paired uplink units in the confirmation; other uplink configuration is preserved.</p>
                 <div class="button-row stage-actions">
                   <button id="togglePortsBtn" class="secondary" type="button">Disable selected</button>
                   <button id="clearPortsBtn" class="danger-outline">Clear selected configuration</button>
                   <button id="toggleProtectionBtn" class="secondary" type="button">Protect selected</button>
                 </div>
                 <p id="protectionSummary" role="status">Connect to discover protected ports. Quick enable/disable excludes protected ports and service ports.</p>
+                <div class="button-row stage-actions">
+                  <button id="bouncePortsBtn" class="action-bounce-link" type="button" disabled>Port bounce</button>
+                  <button id="bouncePoeBtn" class="action-bounce-poe" type="button" disabled>PoE bounce</button>
+                </div>
+                <p>Bounces run immediately after confirmation and interrupt service. Set off time under <strong>Options &rarr; Port actions</strong>. Protected and disabled ports are excluded. Native bounce support is required on the switch; PoE must be enabled for a PoE bounce.</p>
+                <pre id="portBounceResults" class="tool-summary" role="status" aria-live="polite">Select ports to bounce their links or cycle PoE power.</pre>
               </div>
             </div>
             <details class="advanced-service-options">
@@ -338,11 +344,16 @@
       <div class="dialog-heading">
         <div>
           <p class="section-label">Application options</p>
-          <h2 id="optionsDialogTitle">Saved sites</h2>
+          <h2 id="optionsDialogTitle">Preferences &amp; saved sites</h2>
         </div>
         <button id="closeOptionsBtn" class="dialog-close secondary" type="button" aria-label="Close options" title="Close">&times;</button>
       </div>
-      <p class="options-copy">Select one or more saved switches and assign them to a group together.</p>
+      <p class="options-copy">Adjust port actions and organize your saved switches.</p>
+      <section class="options-section">
+        <h3>Port actions</h3>
+        <label class="bounce-interval-option"><span>Bounce off time <small>(seconds)</small></span><input id="bounceInterval" type="number" min="1" max="30" step="1" value="5" aria-describedby="bounceIntervalHint" /></label>
+        <p id="bounceIntervalHint" class="credential-note">1&ndash;30 seconds for both port and PoE bounces. Saved in this browser.</p>
+      </section>
       <section class="options-section">
         <div class="group-management-heading">
           <h3>Groups shown in Saved device</h3>
