@@ -9,6 +9,19 @@ import app
 ACCESS = "set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access"
 
 
+
+def setUpModule():
+    global _activity_directory, _activity_config
+    _activity_directory = tempfile.TemporaryDirectory()
+    _activity_config = patch.dict(app.app.config, {"ACTIVITY_LOG_PATH": Path(_activity_directory.name) / "activity.sqlite3"})
+    _activity_config.start()
+
+
+def tearDownModule():
+    _activity_config.stop()
+    _activity_directory.cleanup()
+
+
 class QuickTaskTests(unittest.TestCase):
     def validate(self, commands, interfaces=ACCESS, vlans="", manual=None, macs=None, neighbors=None):
         return app._validated_quick_task_lines(
@@ -51,6 +64,9 @@ class QuickTaskTests(unittest.TestCase):
 
     def test_unknown_ports_and_higher_risk_commands_rejected(self):
         for command in [
+            'set system host-name switch-a', 'delete protocols rstp',
+            'set vlans NEW vlan-id 5000', 'set vlans NEW vlan-id invalid',
+            'set vlans NEW vlan-id 0', 'set vlans NEW vlan-id -1',
             'set interfaces ge-0/0/99 disable', 'delete interfaces ge-0/0/1',
             'set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members CAMERAS',
             'set interfaces irb unit 310 family inet address 192.0.2.1/24',

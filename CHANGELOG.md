@@ -11,6 +11,19 @@ Add new entries here under `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`,
 or `Security`. When publishing a release, move those entries into a dated version
 section and update the comparison links at the bottom of this file.
 
+## [v1.6] - 2026-10-27
+
+### Added
+
+- Added a read-only Live watch tab for 1–8 pinned physical/aggregate ports, receive/transmit and packet rates, per-direction utilization, two-minute in-memory graphs, new error/drop/carrier-transition counts, observed link changes, optional cached PoE, and timestamped learned-device evidence. Includes Check now, Pause/Resume, Reset view, precise counter deltas, stale/gap/reset handling, reused bounded SSH sessions, automatic idle cleanup, and throttled diagnostics without persisting traffic samples.
+- Replaced the in-page Diagnostics output section with an Options → Device data popup showing the current target's latest timestamped discovery snapshot. Added an Options → Activity log popup backed by one persistent local SQLite database, with active/all-device and activity/error filters, pagination, 90-day/50,000-entry retention, sanitized error details, linked pushes and confirmations, uncertain-result states, browser-error capture, and visible storage failures.
+- Added a Custom command tab for any Junos `set`/`delete` configuration commands, including global commands that run once without requiring selected ports. Optional `{port}`, `{portNumber}`, `{index}`, `{device}`, and `{host}` variables have live previews, inline errors, literal-brace escaping, and checks for the combined editor/queue deployment limits.
+
+### Fixed
+
+- Recognize the single-interface PoE field `Power consumed`, so Live watch displays consumption instead of Unavailable.
+- Protected pushes now require a separate successful private-candidate commit check before sending a commit request. Failed checks display Junos details, discard the private candidate, and preserve drafts and queued batches for correction and a fresh comparison. Quick-commit eligibility remains restricted. API compatibility checks detect servers that need restarting for the expanded custom commands.
+
 ## [v1.5] - 2026-10-26
 
 ### Added
@@ -143,7 +156,8 @@ section and update the comparison links at the bottom of this file.
 - Restricted web-served files to the three required frontend assets so `.env` and source files cannot be downloaded.
 - Excluded credentials, virtual environments, caches, logs, coverage output, and editor metadata from Git.
 
-[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.5...HEAD
+[Unreleased]: https://github.com/cptnkickbutt/junos-helper/compare/v1.6...HEAD
+[v1.6]: https://github.com/cptnkickbutt/junos-helper/compare/v1.5...v1.6
 [v1.5]: https://github.com/cptnkickbutt/junos-helper/compare/v1.4...v1.5
 [v1.4]: https://github.com/cptnkickbutt/junos-helper/compare/v1.3...v1.4
 [v1.3]: https://github.com/cptnkickbutt/junos-helper/compare/v1.2...v1.3

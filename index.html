@@ -106,10 +106,6 @@
           </div>
 
           <div class="port-grid" id="portGrid"></div>
-          <details class="note-card diagnostics-card">
-            <summary>Diagnostics output</summary>
-            <pre id="diagnosticsOutput"></pre>
-          </details>
         </section>
 
         <section class="panel workspace-panel">
@@ -121,13 +117,30 @@
             <span id="selectionSummary">0 selected</span>
           </div>
 
-          <nav class="workspace-tabs" role="tablist" aria-label="Configuration workflows">
+          <nav class="workspace-tabs" role="tablist" aria-label="Switch workflows">
+            <button class="tab-button" id="tab-watch" role="tab" aria-selected="false" aria-controls="panel-watch" data-tab="watch">Live watch</button>
             <button class="tab-button active" id="tab-configure" role="tab" aria-selected="true" aria-controls="panel-configure" data-tab="configure">Configure</button>
             <button class="tab-button" id="tab-move" role="tab" aria-selected="false" aria-controls="panel-move" data-tab="move">Move config</button>
             <button class="tab-button" id="tab-series" role="tab" aria-selected="false" aria-controls="panel-series" data-tab="series">Series/Descriptions</button>
             <button class="tab-button" id="tab-vlans" role="tab" aria-selected="false" aria-controls="panel-vlans" data-tab="vlans">VLANs</button>
+            <button class="tab-button" id="tab-custom" role="tab" aria-selected="false" aria-controls="panel-custom" data-tab="custom">Custom command</button>
             <button class="tab-button review-tab" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review">Review & deploy</button>
           </nav>
+
+          <div class="tab-panel" id="panel-watch" role="tabpanel" aria-labelledby="tab-watch" data-panel="watch" hidden>
+            <div class="tab-intro"><h3>What are these ports doing right now?</h3><p>Watch a customer port and its uplink together. Live watch reads statistics only; it keeps a two-minute graph in memory and never changes configuration or clears switch counters.</p></div>
+            <div class="watch-controls">
+              <button id="watchSelectedBtn" type="button" disabled>Watch selected ports</button>
+              <button id="watchPauseBtn" class="secondary" type="button" disabled>Pause</button>
+              <button id="watchCheckBtn" class="secondary" type="button" disabled>Check now</button>
+              <button id="watchResetBtn" class="secondary" type="button" disabled>Reset view</button>
+              <label>Refresh interval<select id="watchInterval"><option value="2">2 seconds</option><option value="5" selected>5 seconds</option><option value="10">10 seconds</option></select></label>
+              <label class="compact-checkbox"><input id="watchPoe" type="checkbox" /><span>Collect PoE <small>Power samples every 20 seconds</small></span></label>
+            </div>
+            <p id="watchSelectionHint" class="credential-note">Select 1–8 ports in the inventory.</p>
+            <p id="watchStatus" class="tool-summary muted" role="status" aria-live="polite">Connect, select ports, then choose Watch selected ports.</p>
+            <div id="watchPorts" class="watch-ports"></div>
+          </div>
 
           <div class="tab-panel active" id="panel-configure" role="tabpanel" aria-labelledby="tab-configure" data-panel="configure">
             <div class="tab-intro"><h3>Configure selected ports</h3><p>Controls hydrate from a single selected port. Use them to build a final switching configuration or append a focused edit.</p></div>
@@ -282,6 +295,19 @@
             </div>
           </div>
 
+          <div class="tab-panel" id="panel-custom" role="tabpanel" aria-labelledby="tab-custom" data-panel="custom" hidden>
+            <div class="tab-intro"><h3>Custom configuration commands</h3><p>Enter any Junos <code>set</code> or <code>delete</code> configuration command. Global commands run once; commands with port variables repeat for every selected port.</p></div>
+            <div class="feature-focus-card custom-command-group">
+              <label for="customCommandTemplate">Command template</label>
+              <textarea id="customCommandTemplate" spellcheck="false" aria-describedby="customCommandHelp customVariableHelp" placeholder="set protocols rstp interface {port} disable&#10;set system ntp server 192.0.2.123"></textarea>
+              <p id="customCommandHelp" class="pattern-help">Use one command per line. Variables are optional; global commands work without selected ports and run once even when ports are selected. Blank lines and <code>#</code> comment lines are ignored. Command separators and pipes are not supported. Click <strong>Append custom commands</strong> to stage the expanded preview in Review &amp; deploy.</p>
+              <p id="customVariableHelp" class="pattern-help"><code>{port}</code>: full interface name; <code>{portNumber}</code>: unpadded physical port number (or aggregate number); <code>{index}</code>: selected-port position starting at 1, in inventory order. These variables repeat the line per selected port. <code>{device}</code>: discovered device name; <code>{host}</code>: management address. Use <code>{{</code> and <code>}}</code> for literal braces.</p>
+              <div id="customCommandSummary" class="tool-summary muted" role="status" aria-live="polite">Enter a command template or global commands.</div>
+              <pre id="customCommandPreview" class="custom-command-preview" aria-label="Expanded custom commands">No custom commands to preview.</pre>
+              <button id="buildCustomCommandBtn" type="button">Append custom commands</button>
+            </div>
+          </div>
+
           <div class="tab-panel" id="panel-review" role="tabpanel" aria-labelledby="tab-review" data-panel="review" hidden>
             <div class="tab-intro"><h3>Review and deploy</h3><p>Review generated commands and current port context. Description-only work can use the guarded quick commit; other changes require the live Junos candidate diff.</p></div>
             <div class="config-workspace">
@@ -312,7 +338,7 @@
 
             <div class="deployment-stage">
               <div class="stage-heading">
-                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Preview before a rollback-protected push, or quick commit eligible tasks.</p></div>
+                <div><h3>Device comparison and commit</h3><p id="deploymentHint">Compare before a rollback-protected push. Push runs commit check first; a failed check keeps your editor and queue for correction.</p></div>
                 <span id="commitTimer" class="commit-timer ready" aria-live="polite">Ready</span>
               </div>
               <div class="compare-panel">
@@ -344,11 +370,19 @@
       <div class="dialog-heading">
         <div>
           <p class="section-label">Application options</p>
-          <h2 id="optionsDialogTitle">Preferences &amp; saved sites</h2>
+          <h2 id="optionsDialogTitle">Options</h2>
         </div>
         <button id="closeOptionsBtn" class="dialog-close secondary" type="button" aria-label="Close options" title="Close">&times;</button>
       </div>
-      <p class="options-copy">Adjust port actions and organize your saved switches.</p>
+      <p class="options-copy">Inspect device data and activity, adjust port actions, and organize saved switches.</p>
+      <section class="options-section">
+        <h3>Device information &amp; history</h3>
+        <div class="button-row">
+          <button id="openDeviceDataBtn" class="secondary" type="button" aria-haspopup="dialog">Device data</button>
+          <button id="openActivityLogBtn" class="secondary" type="button" aria-haspopup="dialog">Activity log</button>
+        </div>
+        <p class="credential-note">Device data shows the latest pull for the target. Activity history records actions, outcomes, and errors across app restarts.</p>
+      </section>
       <section class="options-section">
         <h3>Port actions</h3>
         <label class="bounce-interval-option"><span>Bounce off time <small>(seconds)</small></span><input id="bounceInterval" type="number" min="1" max="30" step="1" value="5" aria-describedby="bounceIntervalHint" /></label>
@@ -382,6 +416,30 @@
       </section>
       <p class="credential-note">Group changes do not modify connection credentials.</p>
     </dialog>
+    <dialog id="deviceDataDialog" class="utility-dialog" aria-labelledby="deviceDataTitle">
+      <div class="dialog-heading">
+        <div><p class="section-label">Latest discovery snapshot</p><h2 id="deviceDataTitle">Device data</h2></div>
+        <button id="closeDeviceDataBtn" class="dialog-close secondary" type="button" aria-label="Close device data">&times;</button>
+      </div>
+      <p id="deviceDataSummary" class="muted"></p>
+      <p class="credential-note">Raw output from the last successful data pull in this browser session. Refresh the device inventory to collect a new snapshot.</p>
+      <pre id="deviceDataOutput" class="device-data-output">No device data collected yet.</pre>
+    </dialog>
+    <dialog id="activityLogDialog" class="utility-dialog activity-log-dialog" aria-labelledby="activityLogTitle">
+      <div class="dialog-heading">
+        <div><p class="section-label">Persistent local history</p><h2 id="activityLogTitle">Activity log</h2></div>
+        <button id="closeActivityLogBtn" class="dialog-close secondary" type="button" aria-label="Close activity log">&times;</button>
+      </div>
+      <div class="activity-log-controls">
+        <label>Device<select id="activityLogScope"><option value="active">Active device</option><option value="all">All devices</option></select></label>
+        <label>Show<select id="activityLogView"><option value="changes">Changes &amp; errors</option><option value="all">All activity</option><option value="errors">Errors &amp; warnings</option></select></label>
+        <button id="refreshActivityLogBtn" class="secondary" type="button">Refresh log</button>
+      </div>
+      <p id="activityLogSummary" class="tool-summary muted" role="status" aria-live="polite"></p>
+      <ol id="activityLogList" class="activity-log-list"></ol>
+      <button id="olderActivityLogBtn" class="secondary" type="button" hidden>Load older entries</button>
+      <p class="credential-note">Newest first; times shown in your browser's local time. Retained locally for up to 90 days or 50,000 entries. This history records Junos Helper actions; an elapsed confirmation window does not prove a rollback. Raw configurations and discovery output are not stored in this log.</p>
+    </dialog>
     <dialog id="learnedMacDialog" class="learned-mac-dialog" aria-labelledby="learnedMacDialogTitle">
       <div class="dialog-heading">
         <div>
@@ -407,5 +465,6 @@
       <div id="learnedMacDialogContent" class="learned-mac-content"></div>
     </dialog>
     <script src="script.js"></script>
+    <script src="live-watch.js"></script>
   </body>
 </html>

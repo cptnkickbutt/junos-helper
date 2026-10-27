@@ -5,6 +5,14 @@ const state = {
   mode: "single",
   pendingConfirmation: false,
   pendingTarget: null,
+  pendingActivityId: null,
+  deviceDataSnapshots: new Map(),
+  activityEvents: [],
+  activityBefore: null,
+  activityLoadId: 0,
+  returnToOptionsButton: null,
+  browserErrors: [],
+  browserErrorsFlushing: false,
   vlans: [],
   irbUnits: [],
   bridgeServices: [],
@@ -30,7 +38,7 @@ const state = {
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 20;
+const REQUIRED_API_VERSION = 24;
 const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
 const BOUNCE_INTERVAL_STORAGE_KEY = "junosHelper.bounceInterval";
 const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
@@ -59,7 +67,16 @@ const connectionHint = document.getElementById("connectionHint");
 const portGrid = document.getElementById("portGrid");
 const connectionStatus = document.getElementById("connectionStatus");
 const deviceMetadata = document.getElementById("deviceMetadata");
-const diagnosticsOutput = document.getElementById("diagnosticsOutput");
+const deviceDataDialog = document.getElementById("deviceDataDialog");
+const deviceDataSummary = document.getElementById("deviceDataSummary");
+const deviceDataOutput = document.getElementById("deviceDataOutput");
+const activityLogDialog = document.getElementById("activityLogDialog");
+const activityLogScope = document.getElementById("activityLogScope");
+const activityLogView = document.getElementById("activityLogView");
+const activityLogSummary = document.getElementById("activityLogSummary");
+const activityLogList = document.getElementById("activityLogList");
+const refreshActivityLogBtn = document.getElementById("refreshActivityLogBtn");
+const olderActivityLogBtn = document.getElementById("olderActivityLogBtn");
 const confirmBtn = document.getElementById("confirmBtn");
 const connectBtn = document.getElementById("connectBtn");
 const savedDeviceInput = document.getElementById("savedDevice");
@@ -112,6 +129,9 @@ const descriptionTransformPreview = document.getElementById("descriptionTransfor
 const buildDescriptionTransformBtn = document.getElementById("buildDescriptionTransformBtn");
 const newVlanNameInput = document.getElementById("newVlanName");
 const newVlanIdInput = document.getElementById("newVlanId");
+const customCommandTemplateInput = document.getElementById("customCommandTemplate");
+const customCommandSummary = document.getElementById("customCommandSummary");
+const customCommandPreview = document.getElementById("customCommandPreview");
 const irbVlanInput = document.getElementById("irbVlan");
 const irbUnitInput = document.getElementById("irbUnit");
 const irbAddressInput = document.getElementById("irbAddress");
@@ -138,7 +158,7 @@ const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
 const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
 
 function activateWorkspaceTab(tabName, focus = false) {
-  if (tabName !== "review" && tabButtons.some((button) => button.dataset.tab === tabName)) {
+  if (tabName !== "review" && tabName !== "watch" && tabButtons.some((button) => button.dataset.tab === tabName)) {
     state.lastEditingTab = tabName;
   }
   tabButtons.forEach((button) => {
@@ -188,6 +208,7 @@ function updatePushAvailability() {
   quickCommitBtn.title = quickError || "Commit all queued and current eligible changes after commit check, without rollback confirmation.";
   document.getElementById("quickTaskSummary").textContent = quickError || "All queued and current commands qualify for quick commit. Fresh switch checks run before committing.";
   updateProtectionSummary();
+  window.liveWatch?.onContextChange();
 }
 
 function invalidatePreview() {
@@ -461,7 +482,8 @@ function clearConfirmationTimer() {
   }
 }
 
-function setDeploymentReady(message = "Run show | compare before a rollback-protected push, or quick commit eligible tasks.") {
+function setDeploymentReady(message = "Compare before a rollback-protected push. Push runs commit check first; failed checks preserve your editor and queue.") {
+  state.pendingActivityId = null;
   clearConfirmationTimer();
   state.pendingConfirmation = false;
   state.pendingTarget = null;
@@ -529,8 +551,170 @@ function connectionPayload(extra = {}) {
     host: hostInput.value.trim(),
     username: usernameInput.value.trim(),
     password: passwordInput.value,
+    deviceName: deviceNameInput.value.trim(),
     ...extra
   };
+}
+
+function getLiveWatchContext() {
+  const connection = connectionPayload();
+  return { connection, ports: state.ports, selected: new Set(state.selected),
+    connected: state.protectionHost === connection.host.toLowerCase() && state.ports.length > 0,
+    busy: state.connectionInProgress || state.deploymentInProgress || state.bounceInProgress,
+    inventoryAt: state.deviceDataSnapshots?.get(connection.host.toLowerCase())?.collectedAt || null };
+}
+
+function cacheDeviceData(payload) {
+  const snapshots = state.deviceDataSnapshots ||= new Map();
+  const host = payload.host.trim().toLowerCase();
+  const debug = payload.debug || {};
+  const text = [
+    `Interface count: ${debug.interfaceCount ?? payload.portCount ?? 0}`,
+    `VLAN count: ${debug.vlanCount ?? 0}`,
+    `Configured interface count: ${debug.configuredInterfaceCount ?? 0}`,
+    ...((payload.results || []).map((entry) => `=== ${entry.command} ===\n${(entry.output || "").trim()}${entry.error ? `\nError: ${entry.error.trim()}` : ""}`))
+  ].join("\n\n");
+  snapshots.delete(host);
+  snapshots.set(host, { host: payload.host, device: payload.deviceName || payload.host,
+    collectedAt: payload.collectedAt || new Date().toISOString(), text });
+  if (snapshots.size > 10) snapshots.delete(snapshots.keys().next().value);
+}
+
+function queueBrowserError(message, source = "") {
+  state.browserErrors.push({ message: String(message).slice(0, 2000), source: String(source).slice(0, 200),
+    host: hostInput.value.trim(), deviceId: state.savedDeviceId, deviceName: deviceNameInput.value.trim() });
+  if (state.browserErrors.length > 50) state.browserErrors.shift();
+  void flushBrowserErrors();
+}
+
+async function flushBrowserErrors() {
+  if (state.browserErrorsFlushing) return;
+  state.browserErrorsFlushing = true;
+  try {
+    while (state.browserErrors.length) {
+      const response = await fetch("/api/activity/browser-error", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.browserErrors[0])
+      });
+      if (!response.ok) break;
+      state.browserErrors.shift();
+    }
+  } catch (_error) {
+    // Keep unsent errors in memory; do not recursively log a logging failure.
+  } finally {
+    state.browserErrorsFlushing = false;
+  }
+}
+
+function openOptionsPopup(dialog, buttonId) {
+  state.returnToOptionsButton = optionsDialog.open ? buttonId : null;
+  if (optionsDialog.open) optionsDialog.close();
+  dialog.showModal();
+}
+
+function showDeviceData() {
+  const host = hostInput.value.trim().toLowerCase();
+  const snapshot = state.deviceDataSnapshots?.get(host);
+  deviceDataSummary.textContent = snapshot
+    ? `${snapshot.device} · ${snapshot.host} · Collected ${new Date(snapshot.collectedAt).toLocaleString()}`
+    : `No data has been pulled for ${host || "the current target"} in this browser session.`;
+  deviceDataOutput.textContent = snapshot?.text || "Connect or refresh this device to collect its data.";
+  openOptionsPopup(deviceDataDialog, "openDeviceDataBtn");
+}
+
+function activityEventMessage(event) {
+  if (event.confirmationState === "confirmed") return "Configuration applied; final confirmation was later recorded.";
+  if (event.confirmationState === "window-elapsed") return "Configuration was applied; the confirmation window elapsed. Verify the current switch state.";
+  return event.message;
+}
+
+function renderActivityLog() {
+  activityLogList.replaceChildren();
+  if (!state.activityEvents.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "No retained entries match these filters. History begins with this update.";
+    activityLogList.appendChild(empty);
+    return;
+  }
+  state.activityEvents.forEach((event) => {
+    const item = document.createElement("li");
+    item.className = `activity-entry ${["info", "warning", "error"].includes(event.severity) ? event.severity : "info"}`;
+    const heading = document.createElement("div");
+    heading.className = "activity-entry-heading";
+    const time = document.createElement("time");
+    time.dateTime = event.timestamp;
+    time.textContent = new Date(event.timestamp).toLocaleString();
+    const status = document.createElement("strong");
+    status.textContent = (event.confirmationState || event.status).replaceAll("-", " ");
+    heading.append(time, status);
+    const device = document.createElement("div");
+    device.className = "activity-entry-device";
+    device.textContent = `${event.device_name || event.host || "Application"}${event.device_name && event.host ? ` · ${event.host}` : ""} · ${event.operation}`;
+    const message = document.createElement("p");
+    message.textContent = activityEventMessage(event);
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "Details";
+    const content = document.createElement("pre");
+    content.textContent = JSON.stringify(event.details, null, 2);
+    details.append(summary, content);
+    item.append(heading, device, message, details);
+    activityLogList.appendChild(item);
+  });
+}
+
+async function loadActivityLog(older = false) {
+  const loadId = ++state.activityLoadId;
+  const host = hostInput.value.trim().toLowerCase();
+  const activeOnly = activityLogScope.value === "active";
+  if (!older) {
+    state.activityEvents = [];
+    state.activityBefore = null;
+    activityLogList.replaceChildren();
+    olderActivityLogBtn.hidden = true;
+  }
+  if (activeOnly && !host) {
+    activityLogSummary.textContent = "Choose a target device or select All devices.";
+    refreshActivityLogBtn.disabled = false;
+    olderActivityLogBtn.disabled = false;
+    return;
+  }
+  const query = new URLSearchParams({ view: activityLogView.value });
+  if (activeOnly) query.set("host", host);
+  if (older && state.activityBefore) query.set("before", String(state.activityBefore));
+  refreshActivityLogBtn.disabled = true;
+  olderActivityLogBtn.disabled = true;
+  activityLogSummary.textContent = "Loading local activity history…";
+  activityLogSummary.className = "tool-summary muted";
+  try {
+    const response = await fetch(`/api/activity?${query}`, { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "Unable to read activity history");
+    if (loadId !== state.activityLoadId) return;
+    state.activityEvents = [...new Map([...state.activityEvents, ...payload.events].map((event) => [event.id, event])).values()];
+    state.activityBefore = payload.nextBefore;
+    olderActivityLogBtn.hidden = !payload.hasMore;
+    renderActivityLog();
+    activityLogSummary.textContent = `${state.activityEvents.length} entries · ${activeOnly ? host : "All devices"}${payload.warning ? ` · ${payload.warning}` : ""}`;
+    activityLogSummary.className = `tool-summary ${payload.warning ? "error-text" : "muted"}`;
+  } catch (error) {
+    if (loadId !== state.activityLoadId) return;
+    activityLogSummary.textContent = error.message;
+    activityLogSummary.className = "tool-summary error-text";
+  } finally {
+    if (loadId === state.activityLoadId) {
+      refreshActivityLogBtn.disabled = false;
+      olderActivityLogBtn.disabled = false;
+    }
+  }
+}
+
+function showActivityLog() {
+  activityLogScope.value = "active";
+  openOptionsPopup(activityLogDialog, "openActivityLogBtn");
+  void flushBrowserErrors();
+  return loadActivityLog();
 }
 
 function savedDeviceGroup(device) {
@@ -755,6 +939,7 @@ function selectSavedDevice() {
   invalidatePreview();
   updateConnectionHint();
   updateConfig();
+  window.liveWatch?.onContextChange();
 }
 
 async function saveCurrentDevice({ automatic = false } = {}) {
@@ -836,7 +1021,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     const response = await fetch("/api/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(connectionPayload())
+      body: JSON.stringify(connectionPayload({ isRefresh }))
     });
 
     const payload = await response.json();
@@ -924,15 +1109,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     populateServiceChoices();
 
     if (payload.debug) {
-      const debugText = [
-        `Interface count: ${payload.debug.interfaceCount}`,
-        `VLAN count: ${payload.debug.vlanCount ?? 0}`,
-        `Configured interface count: ${payload.debug.configuredInterfaceCount ?? 0}`,
-        `Commands run: ${payload.debug.rawCommands.join(", ")}`,
-        "",
-        ...payload.results.map((entry) => `=== ${entry.command} ===\n${(entry.output || entry.error || "").trim()}`)
-      ].join("\n\n");
-      diagnosticsOutput.textContent = debugText;
+      cacheDeviceData(payload);
     }
 
     state.configManual = isRefresh ? previousConfigManual : false;
@@ -960,6 +1137,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     refreshNowBtn.disabled = !state.ports.length;
     quickConnectBtn.disabled = !savedDeviceInput.value;
     updatePushAvailability();
+    window.liveWatch?.onContextChange();
   }
 }
 
@@ -1123,9 +1301,11 @@ function render(updateConfiguration = true) {
   }
   updateSeriesDescriptionPreview();
   updateDescriptionTransformPreview();
+  updateCustomCommandPreview();
   updateIrbSummary();
   updateQinqSummary();
   updateLogicalServiceMoveSummary();
+  window.liveWatch?.onContextChange();
   if (updateConfiguration) updateConfig();
   updateConnectionHint();
 }
@@ -1364,6 +1544,7 @@ async function bounceSelectedPorts(kind) {
       response.ok && result.ok ? "The switch will restore service after the interval. Refresh inventory to check status."
         : result.error || "Request failed; check switch status before retrying."].join("\n");
     resultBox.className = response.ok && result.ok ? "tool-summary valid" : "tool-summary error-text";
+    if (result.activityWarning) resultBox.textContent += `\n${result.activityWarning}`;
   } catch (error) {
     resultBox.textContent = `${label} on ${target}: response unavailable (${error.message}). Check switch status before retrying; requests may have started.`;
     resultBox.className = "tool-summary error-text";
@@ -2576,6 +2757,102 @@ function applySelectedPorts() {
   activateWorkspaceTab("review", true);
 }
 
+function customCommandPlan() {
+  const ports = state.ports.filter((port) => state.selected.has(port.name));
+  const fail = (error) => ({ error, lines: [], portCount: 0, globalCount: 0 });
+  if (customCommandTemplateInput.value.length > MAX_DEPLOYMENT_CONFIG_CHARS) return fail("Custom commands exceed the 64 KB configuration limit.");
+  const templates = customCommandTemplateInput.value.split(/\r?\n/)
+    .map((line, index) => ({ line: line.trim(), number: index + 1 }))
+    .filter(({ line }) => line && !line.startsWith("#"));
+  if (!templates.length) return fail("Enter at least one custom command.");
+  const portVariables = new Set(["port", "portNumber", "index"]);
+  const supported = new Set([...portVariables, "device", "host"]);
+  try {
+    for (const template of templates) {
+      template.tokens = parseDescriptionPattern(template.line);
+      const names = template.tokens.filter((token) => token.type === "section").map((token) => token.name);
+      const unknown = names.find((name) => !supported.has(name));
+      if (unknown) return fail(`Line ${template.number}: unknown variable {${unknown}}. Use {port}, {portNumber}, {index}, {device}, or {host}.`);
+      template.perPort = names.some((name) => portVariables.has(name));
+    }
+    const perPort = templates.some((template) => template.perPort);
+    if (perPort && !ports.length) return fail("Select at least one port for port variables.");
+    const commandCount = templates.reduce((count, template) => count + (template.perPort ? ports.length : 1), 0);
+    if (commandCount > 500) return fail("Custom commands exceed the 500-command limit. Select fewer ports or use fewer template lines.");
+    const globals = { device: deviceNameInput.value.trim(), host: hostInput.value.trim() };
+    const expand = (template, port, index) => {
+      const values = { ...globals, port: port?.name, index: String(index + 1),
+        portNumber: port ? rawPhysicalPortNumber(port.name) || port.name.match(/(\d+)$/)?.[1] : undefined };
+      const line = template.tokens.map((token) => {
+        if (token.type === "literal") return token.value;
+        if (!values[token.name]) throw new Error(`Line ${template.number}: no value is available for {${token.name}}.`);
+        return values[token.name];
+      }).join("");
+      if (/[;|`\x00-\x08\x0b-\x1f\x7f]/.test(line) || line.includes("$(")) {
+        throw new Error(`Line ${template.number}: command separators and control characters are not allowed.`);
+      }
+      if (!/^(set|delete)\s+\S/.test(line)) {
+        throw new Error(`Line ${template.number}: start with set or delete followed by a configuration path.`);
+      }
+      if (!/^(?:[^"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')*$/.test(line)) {
+        throw new Error(`Line ${template.number}: check quotes and trailing backslashes.`);
+      }
+      return line;
+    };
+    const lines = [];
+    let portBlock = [];
+    const flushPorts = () => {
+      ports.forEach((port, index) => portBlock.forEach((template) => lines.push(expand(template, port, index))));
+      portBlock = [];
+    };
+    templates.forEach((template) => {
+      if (template.perPort) portBlock.push(template);
+      else {
+        flushPorts();
+        lines.push(expand(template));
+      }
+    });
+    flushPorts();
+    if (lines.join("\n").length > MAX_DEPLOYMENT_CONFIG_CHARS) return fail("Custom commands exceed the 64 KB configuration limit.");
+    return { error: "", lines, portCount: perPort ? ports.length : 0,
+      globalCount: templates.filter((template) => !template.perPort).length };
+  } catch (error) {
+    return fail(error.message);
+  }
+}
+
+function updateCustomCommandPreview() {
+  const plan = customCommandPlan();
+  customCommandSummary.textContent = plan.error || `${plan.lines.length} commands: ${plan.globalCount} global (once), ${plan.portCount} selected ports.`;
+  customCommandSummary.className = `tool-summary ${plan.error ? "error-text" : "valid"}`;
+  customCommandPreview.textContent = plan.lines.join("\n") || "No custom commands to preview.";
+}
+
+function buildCustomCommands() {
+  if (state.pendingConfirmation || state.deploymentInProgress) return;
+  const plan = customCommandPlan();
+  updateCustomCommandPreview();
+  if (plan.error) {
+    connectionStatus.textContent = plan.error;
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  const current = state.configManual ? configOutput.value.trim() : "";
+  const prospective = composeDeploymentConfig(state.configQueue, [current, plan.lines.join("\n")].filter(Boolean).join("\n"));
+  if (configCommandCount(prospective) > 500 || prospective.length > MAX_DEPLOYMENT_CONFIG_CHARS) {
+    const message = "The combined editor and queue would exceed the 500-command or 64 KB deployment limit.";
+    customCommandSummary.textContent = message;
+    customCommandSummary.className = "tool-summary error-text";
+    connectionStatus.textContent = message;
+    connectionStatus.className = "status-pill error";
+    return;
+  }
+  appendConfigLines(plan.lines);
+  connectionStatus.textContent = `Appended ${plan.lines.length} custom commands (${plan.globalCount} global, ${plan.portCount} selected ports)`;
+  connectionStatus.className = "status-pill";
+  activateWorkspaceTab("review", true);
+}
+
 function appendSelectedFields() {
   if (state.pendingConfirmation || state.deploymentInProgress) return;
   const selectedPorts = state.ports.filter((port) => state.selected.has(port.name));
@@ -2878,6 +3155,7 @@ async function quickCommitChanges() {
     setDeploymentReady("Quick changes committed directly after a successful commit check.");
     const commandCount = payload.commandCount || configCommandCount(deploymentConfig);
     connectionStatus.textContent = `${commandCount} ${quickTasks ? "quick" : "description"} change${commandCount === 1 ? "" : "s"} committed successfully`;
+    if (payload.activityWarning) connectionStatus.textContent += ` · ${payload.activityWarning}`;
     connectionStatus.className = "status-pill connected";
     if (quickTasks) await connectToSwitch({ isRefresh: true });
   } catch (error) {
@@ -2891,6 +3169,7 @@ async function quickCommitChanges() {
 }
 
 async function pushToSwitch() {
+  if (state.deploymentInProgress || state.connectionInProgress) return;
   if (state.pendingConfirmation) {
     connectionStatus.textContent = "Confirm the pending commit before pushing another change";
     connectionStatus.className = "status-pill error";
@@ -2907,7 +3186,7 @@ async function pushToSwitch() {
     connectionStatus.className = "status-pill error";
     return;
   }
-  if (!window.confirm("Apply this configuration using a 5-minute confirmed commit? It will roll back unless you confirm it afterward.")) {
+  if (!window.confirm("Run commit check, then apply this configuration using a 5-minute confirmed commit? A failed check stops the push and keeps your draft. Applied changes roll back unless you confirm them afterward.")) {
     return;
   }
   state.deploymentInProgress = true;
@@ -2915,7 +3194,7 @@ async function pushToSwitch() {
   pushBtn.disabled = true;
   pushBtn.textContent = "Pushing configuration…";
   confirmBtn.disabled = true;
-  connectionStatus.textContent = "Pushing config…";
+  connectionStatus.textContent = "Running commit check before the protected push…";
   connectionStatus.className = "status-pill";
 
   try {
@@ -2927,11 +3206,18 @@ async function pushToSwitch() {
 
     const payload = await response.json();
     if (!response.ok || !payload.ok) {
+      if (payload.stage === "commit-check") {
+        state.lastPreviewConfig = null;
+        previewState.textContent = "Commit check failed — edit and compare again";
+        previewState.className = "preview-state stale";
+        compareOutput.textContent = `Commit check failed. No commit was sent. Your editor and queue are preserved.\n\n${payload.output || payload.error || "No details returned by Junos."}`;
+      }
       throw new Error(payload.error || "Push failed");
     }
 
     const pendingConfirmation = !!payload.pendingConfirmation;
     state.pendingConfirmation = pendingConfirmation;
+    state.pendingActivityId = pendingConfirmation ? payload.activityId || null : null;
     state.pendingTarget = state.pendingConfirmation
       ? { host: hostInput.value.trim(), username: usernameInput.value.trim(), deviceId: state.savedDeviceId }
       : null;
@@ -2944,6 +3230,7 @@ async function pushToSwitch() {
     connectionStatus.textContent = pendingConfirmation
       ? `Config applied. Confirm within ${payload.confirmMinutes || 5} minutes or Junos will roll it back.`
       : "Config pushed successfully";
+    if (payload.activityWarning) connectionStatus.textContent += ` · ${payload.activityWarning}`;
     connectionStatus.className = "status-pill connected";
   } catch (error) {
     pushBtn.textContent = "Push with rollback protection";
@@ -2969,7 +3256,9 @@ async function confirmCommit() {
         deviceId: state.pendingTarget?.deviceId || state.savedDeviceId,
         host: state.pendingTarget?.host || hostInput.value.trim(),
         username: state.pendingTarget?.username || usernameInput.value.trim(),
-        password: passwordInput.value
+        password: passwordInput.value,
+        deviceName: deviceNameInput.value.trim(),
+        confirmationFor: state.pendingActivityId
       })
     });
     const payload = await response.json();
@@ -2977,6 +3266,7 @@ async function confirmCommit() {
     clearDeploymentWorkspace();
     setDeploymentReady("Commit confirmed successfully. Rollback protection is cleared and the workspace is ready for another push.");
     connectionStatus.textContent = "Commit confirmed; automatic rollback canceled";
+    if (payload.activityWarning) connectionStatus.textContent += ` · ${payload.activityWarning}`;
     connectionStatus.className = "status-pill connected";
   } catch (error) {
     confirmBtn.disabled = !state.confirmationDeadline || state.confirmationDeadline <= Date.now();
@@ -2996,8 +3286,14 @@ async function confirmCommit() {
   invalidatePreview();
   updateConnectionHint();
   updateConfig();
+  updateCustomCommandPreview();
+  window.liveWatch?.onContextChange();
 }));
-deviceNameInput.addEventListener("input", () => updateConfig());
+passwordInput.addEventListener("input", () => window.liveWatch?.resetConnection());
+deviceNameInput.addEventListener("input", () => {
+  updateConfig();
+  updateCustomCommandPreview();
+});
 descriptionInput.addEventListener("input", () => {
   updateIntendedChangeSummary();
   updateConfig();
@@ -3080,6 +3376,8 @@ document.getElementById("moveConfigBtn").addEventListener("click", buildMoveConf
 document.getElementById("buildSeriesBtn").addEventListener("click", buildSeriesConfiguration);
 buildDescriptionTransformBtn.addEventListener("click", buildDescriptionTransformConfiguration);
 document.getElementById("createVlanBtn").addEventListener("click", createVlanCommand);
+document.getElementById("buildCustomCommandBtn").addEventListener("click", buildCustomCommands);
+customCommandTemplateInput.addEventListener("input", updateCustomCommandPreview);
 document.getElementById("buildIrbBtn").addEventListener("click", buildIrbConfiguration);
 document.getElementById("buildQinqBtn").addEventListener("click", buildQinqConfiguration);
 document.getElementById("moveLogicalServiceBtn").addEventListener("click", buildLogicalServiceMove);
@@ -3118,14 +3416,35 @@ autoSaveConnectionsInput.addEventListener("change", () => {
 refreshNowBtn.addEventListener("click", () => connectToSwitch({ isRefresh: true }));
 document.getElementById("bounceInterval").addEventListener("change", saveBounceIntervalPreference);
 optionsBtn.addEventListener("click", async () => {
-  await loadSavedDevices(state.savedDeviceId);
   optionsDialog.showModal();
-  (groupDeviceList.querySelector('input[name="groupDevice"]') || groupAssignmentInput).focus();
+  document.getElementById("openDeviceDataBtn").focus();
+  await loadSavedDevices(state.savedDeviceId);
 });
 document.getElementById("closeOptionsBtn").addEventListener("click", () => optionsDialog.close());
+window.addEventListener("error", (event) => queueBrowserError(event.message || "Browser script error", event.filename || ""));
+window.addEventListener("unhandledrejection", (event) => queueBrowserError(event.reason?.message || String(event.reason), "Unhandled promise rejection"));
 optionsDialog.addEventListener("click", (event) => {
   if (event.target === optionsDialog) optionsDialog.close();
 });
+document.getElementById("openDeviceDataBtn").addEventListener("click", showDeviceData);
+document.getElementById("openActivityLogBtn").addEventListener("click", showActivityLog);
+document.getElementById("closeDeviceDataBtn").addEventListener("click", () => deviceDataDialog.close());
+document.getElementById("closeActivityLogBtn").addEventListener("click", () => activityLogDialog.close());
+[deviceDataDialog, activityLogDialog].forEach((dialog) => {
+  dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.addEventListener("close", () => {
+    const buttonId = state.returnToOptionsButton;
+    state.returnToOptionsButton = null;
+    if (buttonId) {
+      optionsDialog.showModal();
+      document.getElementById(buttonId).focus();
+    }
+  });
+});
+activityLogScope.addEventListener("change", () => loadActivityLog());
+activityLogView.addEventListener("change", () => loadActivityLog());
+refreshActivityLogBtn.addEventListener("click", () => loadActivityLog());
+olderActivityLogBtn.addEventListener("click", () => loadActivityLog(true));
 groupDeviceList.addEventListener("change", updateGroupSelectionStatus);
 visibleGroupList.addEventListener("change", () => {
   state.visibleSavedDeviceGroups = new Set(

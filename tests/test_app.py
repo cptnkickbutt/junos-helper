@@ -33,6 +33,19 @@ from app import (
 )
 
 
+
+def setUpModule():
+    global _activity_directory, _activity_config
+    _activity_directory = tempfile.TemporaryDirectory()
+    _activity_config = patch.dict(app_module.app.config, {"ACTIVITY_LOG_PATH": Path(_activity_directory.name) / "activity.sqlite3"})
+    _activity_config.start()
+
+
+def tearDownModule():
+    _activity_config.stop()
+    _activity_directory.cleanup()
+
+
 class PackagedEnvironmentTests(unittest.TestCase):
     def test_packaged_environment_uses_local_app_data(self) -> None:
         with patch.object(app_module, "IS_FROZEN", True), patch.dict(
@@ -438,6 +451,28 @@ class DiscoveryParsingTests(unittest.TestCase):
 
 
 class ConfigValidationTests(unittest.TestCase):
+    def test_accepts_per_interface_rstp_custom_commands(self) -> None:
+        commands = [
+            "set protocols rstp interface ge-0/0/1 disable",
+            "set protocols rstp interface et-0/0/0:1 edge",
+            "delete protocols rstp interface ge-0/0/2 disable",
+            "delete protocols rstp interface ae0",
+        ]
+        self.assertEqual(_validated_config_lines("\n".join(commands)), commands)
+        with self.assertRaisesRegex(ValueError, "description"):
+            _validated_description_only_lines("\n".join(commands))
+
+    def test_rejects_non_configuration_commands_and_invalid_framing(self) -> None:
+        for command in (
+            "set", "delete", "set ''", "show configuration", "run show version", "commit",
+            "set protocols rstp interface ge-0/0/1 disable; commit",
+            "set system host-name test | save /tmp/config",
+            'set system host-name "unterminated', "set system host-name test\x00",
+            "set system host-name test\x1b", "set system host-name `id`",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                _validated_config_lines(command)
+
     def test_accepts_interface_set_and_delete_commands(self) -> None:
         config = "\n".join([
             "# generated config",
@@ -529,15 +564,18 @@ class ConfigValidationTests(unittest.TestCase):
 
         self.assertEqual(len(_validated_config_lines(config)), 6)
 
-    def test_rejects_invalid_irb_prefix_and_unscoped_vlan_edit(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Invalid IRB"):
-            _validated_config_lines("set interfaces irb unit 310 family inet address nope")
-        with self.assertRaisesRegex(ValueError, "Only VLAN"):
-            _validated_config_lines("delete vlans TEST_MGMT")
+    def test_configuration_semantics_are_left_to_junos_commit_check(self) -> None:
+        commands = ["set interfaces irb unit 310 family inet address nope", "set vlans CAMERAS vlan-id 5000"]
+        self.assertEqual(_validated_config_lines("\n".join(commands)), commands)
 
-    def test_rejects_out_of_range_vlan(self) -> None:
-        with self.assertRaisesRegex(ValueError, "between 1 and 4094"):
-            _validated_config_lines("set vlans CAMERAS vlan-id 5000")
+    def test_accepts_global_deletes_and_extended_configuration(self) -> None:
+        commands = [
+            "delete vlans TEST_MGMT", "delete protocols rstp", "delete system services telnet",
+            "set system ntp server 192.0.2.123", "set protocols rstp interface all disable",
+            "set routing-options static route 192.0.2.0/24 discard",
+            'set snmp location "Building A"',
+        ]
+        self.assertEqual(_validated_config_lines("\n".join(commands)), commands)
 
     def test_compare_cleanup_removes_cli_mode_noise(self) -> None:
         output = "Entering configuration mode\n[edit interfaces ge-0/0/1]\n+ description Camera;\nExiting configuration mode\n"
@@ -555,9 +593,9 @@ class ConfigValidationTests(unittest.TestCase):
             "error: commit comment is required",
         )
 
-    def test_rejects_non_interface_commands(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Only"):
-            _validated_config_lines("set system root-authentication plain-text-password")
+    def test_global_commands_do_not_qualify_for_description_quick_commit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "description"):
+            _validated_description_only_lines("set system host-name switch-a")
 
     def test_rejects_cli_delimiters(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsafe"):
@@ -565,6 +603,98 @@ class ConfigValidationTests(unittest.TestCase):
 
 
 class ApiSafetyTests(unittest.TestCase):
+    @patch("app._execute_cli")
+    @patch("app._ssh_client")
+    def test_failed_commit_check_never_sends_commit_and_discards_private_candidate(
+        self, ssh_client: Mock, execute_cli: Mock
+    ) -> None:
+        ssh_client.return_value = Mock()
+        for result in (
+            ("error: invalid value\nconfiguration check-out failed\n", "", 0),
+            ("syntax error, expecting <command>\nconfiguration check succeeds\n", "", 0),
+            ("configuration check succeeds\n", "error: validation failed", 0),
+            ("configuration check succeeds\n", "", 1),
+            ("", "", 0),
+        ):
+            with self.subTest(result=result):
+                execute_cli.reset_mock()
+                execute_cli.return_value = result
+                response = app.test_client().post("/api/push", json={
+                    "host": "192.0.2.10", "username": "netops", "password": "test",
+                    "config": "set system host-name test-switch",
+                })
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(response.get_json()["stage"], "commit-check")
+                self.assertFalse(response.get_json()["pendingConfirmation"])
+                execute_cli.assert_called_once()
+                cli = execute_cli.call_args.args[1]
+                self.assertIn("set system host-name test-switch; commit check; rollback 0; exit", cli)
+                self.assertNotIn("commit confirmed", cli)
+                ssh_client.return_value.close.assert_called()
+
+    @patch("app._execute_cli")
+    @patch("app._ssh_client")
+    def test_global_custom_commands_can_be_compared_checked_and_pushed(
+        self, ssh_client: Mock, execute_cli: Mock
+    ) -> None:
+        ssh_client.return_value = Mock()
+        config = "set system ntp server 192.0.2.123\ndelete system services telnet"
+        payload = {"host": "192.0.2.10", "username": "netops", "password": "test", "config": config}
+        execute_cli.side_effect = [
+            ("[edit system ntp]\n+ server 192.0.2.123;", "", 0),
+            ("configuration check succeeds\n", "", 0),
+            ("commit complete\n", "", 0),
+        ]
+        self.assertEqual(app.test_client().post("/api/preview", json=payload).status_code, 200)
+        response = app.test_client().post("/api/push", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(execute_cli.call_count, 3)
+        for call in execute_cli.call_args_list:
+            for line in config.splitlines():
+                self.assertEqual(call.args[1].count(line), 1)
+
+    @patch("app._execute_cli")
+    @patch("app._ssh_client")
+    def test_preview_reports_configuration_typo_from_junos_stdout(
+        self, ssh_client: Mock, execute_cli: Mock
+    ) -> None:
+        ssh_client.return_value = Mock()
+        execute_cli.return_value = ("syntax error: unknown statement ntpp\n", "", 0)
+        response = app.test_client().post("/api/preview", json={
+            "host": "192.0.2.10", "username": "netops", "config": "set system ntpp server 192.0.2.123",
+        })
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("unknown statement ntpp", response.get_json()["error"])
+
+    @patch("app._execute_cli")
+    @patch("app._ssh_client")
+    def test_rstp_custom_commands_preview_and_push_with_rollback_protection(
+        self, ssh_client: Mock, execute_cli: Mock
+    ) -> None:
+        ssh_client.return_value = Mock()
+        config = "\n".join([
+            "set protocols rstp interface ge-0/0/1 disable",
+            "set protocols rstp interface ge-0/0/2 disable",
+        ])
+        payload = {"host": "192.0.2.10", "username": "netops", "password": "test", "config": config}
+        execute_cli.return_value = ("[edit protocols rstp]\n+ interface ge-0/0/1 { disable; }", "", 0)
+        preview = app.test_client().post("/api/preview", json=payload)
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("protocols rstp", preview.get_json()["compare"])
+        preview_cli = execute_cli.call_args.args[1]
+        for line in config.splitlines():
+            self.assertIn(line, preview_cli)
+        self.assertIn("show | compare; rollback 0; exit", preview_cli)
+
+        execute_cli.side_effect = [("configuration check succeeds\n", "", 0), ("commit complete\n", "", 0)]
+        push = app.test_client().post("/api/push", json=payload)
+        self.assertEqual(push.status_code, 200)
+        self.assertTrue(push.get_json()["pendingConfirmation"])
+        push_cli = execute_cli.call_args.args[1]
+        for line in config.splitlines():
+            self.assertIn(line, push_cli)
+        self.assertIn("commit check; commit confirmed 5", push_cli)
+
     def test_only_public_frontend_assets_are_served(self) -> None:
         client = app.test_client()
 
@@ -935,7 +1065,7 @@ class ApiSafetyTests(unittest.TestCase):
     @patch("app._ssh_client")
     def test_push_uses_confirmed_commit(self, ssh_client: Mock, execute_cli: Mock) -> None:
         ssh_client.return_value = Mock()
-        execute_cli.return_value = ("commit complete\n", "", 0)
+        execute_cli.side_effect = [("configuration check succeeds\n", "", 0), ("commit complete\n", "", 0)]
 
         response = app.test_client().post("/api/push", json={
             "host": "192.0.2.10",
@@ -946,6 +1076,12 @@ class ApiSafetyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["pendingConfirmation"])
+        self.assertTrue(response.get_json()["commitCheckPassed"])
+        self.assertEqual(execute_cli.call_count, 2)
+        check_cli = execute_cli.call_args_list[0].args[1]
+        self.assertTrue(check_cli.startswith("configure private;"))
+        self.assertIn("commit check; rollback 0; exit", check_cli)
+        self.assertNotIn("commit confirmed", check_cli)
         self.assertTrue(execute_cli.call_args.args[1].startswith("configure exclusive;"))
         self.assertIn('commit check; commit confirmed 5 comment "Applied by Junos Helper"', execute_cli.call_args.args[1])
 
@@ -969,7 +1105,7 @@ class ApiSafetyTests(unittest.TestCase):
     @patch("app._ssh_client")
     def test_push_returns_junos_stdout_error(self, ssh_client: Mock, execute_cli: Mock) -> None:
         ssh_client.return_value = Mock()
-        execute_cli.return_value = ("error: permission denied\n", "", 1)
+        execute_cli.side_effect = [("configuration check succeeds\n", "", 0), ("error: permission denied\n", "", 1)]
 
         response = app.test_client().post("/api/push", json={
             "host": "192.0.2.10",

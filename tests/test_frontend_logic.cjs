@@ -22,7 +22,7 @@ function loadSourceSection(startMarker, endMarker, context = {}) {
 }
 
 function navigationContext(editingTab) {
-  const buttons = ["configure", "move", "series", "vlans", "review"].map((tab) => ({
+  const buttons = ["watch", "configure", "move", "series", "vlans", "custom", "review"].map((tab) => ({
     dataset: { tab }, classList: { toggle() {} }, setAttribute() {},
     focus() { this.focused = true; }
   }));
@@ -37,6 +37,13 @@ function navigationContext(editingTab) {
   context.activateWorkspaceTab("review");
   return context;
 }
+
+test("Live watch does not replace the most recent editing tab as the queue return destination", () => {
+  const context = navigationContext("custom");
+  context.activateWorkspaceTab("watch");
+  assert.equal(context.state.lastEditingTab, "custom");
+  assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "watch");
+});
 
 function quickTaskContext() {
   const context = loadSourceSection("function isDescriptionOnlyDeployment", "function updatePushAvailability", {
@@ -80,6 +87,8 @@ function commandActionContext(tab = "configure") {
     descriptionTransformSourceInput: input("{port}_{site}_{apt}"),
     descriptionTransformTargetInput: input("{port}_{site}_RENAMED_{apt}"),
     newVlanNameInput: input("NEW"), newVlanIdInput: input("311"),
+    customCommandTemplateInput: input("set interfaces {port} mtu 9216"),
+    customCommandSummary: {}, customCommandPreview: {}, MAX_DEPLOYMENT_CONFIG_CHARS: 65536,
     logicalServiceSourceInput: input("0:0"),
     irbVlanInput: input("CUSTOMER"), irbUnitInput: input("310"), irbAddressInput: input("192.0.2.1/24"),
     qinqCustomerPortInput: input("ge-0/0/1"), qinqUplinkPortInput: input("xe-0/0/48"),
@@ -94,6 +103,107 @@ function commandActionContext(tab = "configure") {
   return context;
 }
 
+function utilityContext() {
+  const element = () => ({ children: [], textContent: "", hidden: false, disabled: false,
+    replaceChildren(...children) { this.children = children; },
+    append(...children) { this.children.push(...children); },
+    appendChild(child) { this.children.push(child); },
+    set innerHTML(value) { assert.fail("History and device data must use plain text"); }
+  });
+  const dialog = () => ({ open: false, showModal() { this.open = true; }, close() { this.open = false; } });
+  const context = loadSourceSection("function cacheDeviceData", "function savedDeviceGroup", {
+    state: { deviceDataSnapshots: new Map(), activityEvents: [], activityBefore: null, activityLoadId: 0,
+      browserErrors: [], browserErrorsFlushing: false },
+    hostInput: { value: "switch-a" }, deviceNameInput: { value: "Access A" },
+    deviceDataDialog: dialog(), activityLogDialog: dialog(), optionsDialog: dialog(),
+    deviceDataOutput: element(), deviceDataSummary: element(),
+    activityLogScope: { value: "active" }, activityLogView: { value: "changes" },
+    activityLogSummary: element(), activityLogList: element(), refreshActivityLogBtn: element(), olderActivityLogBtn: element(),
+    URLSearchParams, document: { createElement: element },
+    fetch: async () => { assert.fail("This action must not make a request"); }
+  });
+  context.optionsDialog.open = true;
+  return context;
+}
+
+function historyEvent(id, updates = {}) {
+  return { id, timestamp: "2026-10-27T16:00:00+00:00", host: "switch-a", operation: "Protected push",
+    status: "awaiting-confirmation", severity: "info", message: "Configuration applied", details: { commandCount: 2 }, ...updates };
+}
+
+test("device data popup uses the target's timestamped snapshot and preserves output and errors", () => {
+  const context = utilityContext();
+  context.cacheDeviceData({ host: "SWITCH-A", deviceName: "Access A", collectedAt: "2026-10-27T16:00:00+00:00",
+    debug: { interfaceCount: 2 }, results: [{ command: "show interfaces terse", output: "ports on A", error: "partial read" }] });
+  context.cacheDeviceData({ host: "switch-b", deviceName: "Access B", debug: {}, results: [{ command: "show version", output: "data from B" }] });
+  context.showDeviceData();
+  assert.match(context.deviceDataSummary.textContent, /Access A.*SWITCH-A.*Collected/);
+  assert.match(context.deviceDataOutput.textContent, /ports on A/);
+  assert.match(context.deviceDataOutput.textContent, /Error: partial read/);
+  assert.doesNotMatch(context.deviceDataOutput.textContent, /data from B/);
+  assert.equal(context.optionsDialog.open, false);
+  assert.equal(context.deviceDataDialog.open, true);
+  assert.equal(context.state.returnToOptionsButton, "openDeviceDataBtn");
+  context.hostInput.value = "switch-c";
+  context.showDeviceData();
+  assert.match(context.deviceDataSummary.textContent, /No data.*switch-c/);
+  assert.doesNotMatch(context.deviceDataOutput.textContent, /ports on A/);
+});
+
+test("activity log filters active device, paginates, and renders untrusted messages as text", async () => {
+  const context = utilityContext();
+  const requests = [];
+  context.fetch = async (url) => {
+    requests.push(url);
+    return { ok: true, json: async () => ({ ok: true, events: requests.length === 1
+      ? [historyEvent(3, { message: '<script>alert("test")</script>' })]
+      : [historyEvent(3), historyEvent(2)], hasMore: requests.length === 1, nextBefore: 3 }) };
+  };
+  await context.showActivityLog();
+  assert.match(requests[0], /host=switch-a/);
+  assert.match(requests[0], /view=changes/);
+  assert.equal(context.activityLogList.children[0].children[2].textContent, '<script>alert("test")</script>');
+  await context.loadActivityLog(true);
+  assert.match(requests[1], /before=3/);
+  assert.deepEqual(Array.from(context.state.activityEvents, (event) => event.id), [3, 2]);
+  context.activityLogScope.value = "all";
+  await context.loadActivityLog();
+  assert.doesNotMatch(requests[2], /host=/);
+  context.hostInput.value = "";
+  context.activityLogScope.value = "active";
+  await context.loadActivityLog();
+  assert.equal(requests.length, 3);
+  assert.match(context.activityLogSummary.textContent, /Choose a target/);
+});
+
+test("out-of-order history requests cannot display a previous device or filter", async () => {
+  const context = utilityContext();
+  let resolveFirst;
+  context.fetch = () => new Promise((resolve) => { resolveFirst = resolve; });
+  const first = context.loadActivityLog();
+  context.activityLogScope.value = "all";
+  context.fetch = async () => ({ ok: true, json: async () => ({ ok: true, events: [historyEvent(2)], hasMore: false }) });
+  await context.loadActivityLog();
+  resolveFirst({ ok: true, json: async () => ({ ok: true, events: [historyEvent(1)], hasMore: false }) });
+  await first;
+  assert.deepEqual(Array.from(context.state.activityEvents, (event) => event.id), [2]);
+  assert.match(context.activityLogSummary.textContent, /All devices/);
+  assert.match(context.activityEventMessage(historyEvent(1, { confirmationState: "window-elapsed" })), /Verify the current switch state/);
+  assert.doesNotMatch(context.activityEventMessage(historyEvent(1, { confirmationState: "window-elapsed" })), /rolled back/);
+});
+
+test("browser logging failures retain messages for retry without recursively throwing", async () => {
+  const context = utilityContext();
+  context.state.browserErrors.push({ message: "Script failed", host: "switch-a" });
+  context.fetch = async () => { throw new Error("Backend offline"); };
+  await context.flushBrowserErrors();
+  assert.equal(context.state.browserErrors.length, 1);
+  assert.equal(context.state.browserErrorsFlushing, false);
+  context.fetch = async () => ({ ok: true });
+  await context.flushBrowserErrors();
+  assert.equal(context.state.browserErrors.length, 0);
+});
+
 const commandActions = [
   ["applySelectedPorts", "configure"], ["appendSelectedFields", "configure"],
   ["removeVlanFromSelected", "configure"], ["enableSelectedPorts", "configure"],
@@ -101,8 +211,172 @@ const commandActions = [
   ["buildIrbConfiguration", "configure"], ["buildQinqConfiguration", "configure"],
   ["buildLogicalServiceMove", "configure"], ["buildMoveConfiguration", "move"],
   ["buildSeriesConfiguration", "series"], ["buildDescriptionTransformConfiguration", "series"],
-  ["createVlanCommand", "vlans"]
+  ["createVlanCommand", "vlans"], ["buildCustomCommands", "custom"]
 ];
+
+test("custom templates expand in inventory order for only selected ports and preserve staged work", () => {
+  const context = commandActionContext("custom");
+  context.state.ports.push({ name: "et-0/0/0:1", index: 2 });
+  context.state.selected = new Set(["et-0/0/0:1", "ge-0/0/1"]);
+  context.state.configManual = true;
+  context.configOutput.value = "set vlans NEW vlan-id 311";
+  context.customCommandTemplateInput.value = '# Comment\r\nset interfaces {port} description "Port {port}"\r\n\r\ndelete interfaces {port} unit 0 family ethernet-switching vlan members OLD';
+  context.updateCustomCommandPreview();
+  const expected = [
+    'set interfaces ge-0/0/1 description "Port ge-0/0/1"',
+    'delete interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members OLD',
+    'set interfaces et-0/0/0:1 description "Port et-0/0/0:1"',
+    'delete interfaces et-0/0/0:1 unit 0 family ethernet-switching vlan members OLD'
+  ].join("\n");
+  assert.equal(context.customCommandPreview.textContent, expected);
+  context.buildCustomCommands();
+  assert.equal(context.configOutput.value, `set vlans NEW vlan-id 311\n${expected}`);
+  assert.match(context.customCommandSummary.textContent, /4 commands: 0 global \(once\), 2 selected ports/);
+});
+
+test("invalid custom templates reject the entire batch without changing staged work or navigation", () => {
+  for (const template of [
+    "", "# Only a comment", "set", "delete", "show interfaces {port}",
+    "set interfaces {port} disable; commit", 'set interfaces {port} description "unterminated',
+    "set interfaces {port} description `test`", "set interfaces {port} description $(test)",
+    "set interfaces {port} disable\u0000", "set interfaces {port} disable\ncommit",
+    "set interfaces {port} description {unknown}", "set interfaces {port",
+    "set system host-name foo | save /tmp/test",
+    "set protocols rstp interface {port} disable; commit"
+  ]) {
+    const context = commandActionContext("custom");
+    context.configOutput.value = "# Keep staged work";
+    context.customCommandTemplateInput.value = template;
+    context.buildCustomCommands();
+    assert.equal(context.configOutput.value, "# Keep staged work", template);
+    assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "custom", template);
+    assert.ok(context.customCommandPlan().error, template);
+  }
+  const context = commandActionContext("custom");
+  context.state.selected.clear();
+  assert.match(context.customCommandPlan().error, /Select/);
+  context.state.selected.add("ge-0/0/1");
+  context.customCommandTemplateInput.value = "set interfaces {port} disable\n".repeat(501);
+  assert.match(context.customCommandPlan().error, /500-command/);
+  context.customCommandTemplateInput.value = `set interfaces {port} description "${"a".repeat(65536)}"`;
+  assert.match(context.customCommandPlan().error, /64 KB/);
+});
+
+test("global custom commands run once with no selected ports and once with many ports", () => {
+  for (const selected of [[], ["ge-0/0/1", "ge-0/0/2"]]) {
+    const context = commandActionContext("custom");
+    context.state.selected = new Set(selected);
+    context.customCommandTemplateInput.value = "set system ntp server 192.0.2.123\ndelete protocols rstp";
+    context.buildCustomCommands();
+    assert.equal(context.configOutput.value, context.customCommandTemplateInput.value);
+    assert.equal(context.customCommandPlan().globalCount, 2);
+    assert.equal(context.customCommandPlan().portCount, 0);
+    assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "review");
+  }
+});
+
+test("mixed templates preserve command blocks and expand port and device variables", () => {
+  const context = commandActionContext("custom");
+  context.state.ports.push({ name: "et-0/1/12:1", index: 2 });
+  context.state.selected = new Set(["et-0/1/12:1", "ge-0/0/1"]);
+  context.customCommandTemplateInput.value = [
+    'set snmp location "{device} at {host}"',
+    'set interfaces {port} description "{device}_{portNumber}_{index}_{{literal}}"',
+    'set protocols rstp interface {port} disable',
+    'set system ntp server 192.0.2.123',
+    'delete interfaces {port} disable'
+  ].join("\n");
+  context.buildCustomCommands();
+  assert.equal(context.configOutput.value, [
+    'set snmp location "BT at switch"',
+    'set interfaces ge-0/0/1 description "BT_1_1_{literal}"',
+    'set protocols rstp interface ge-0/0/1 disable',
+    'set interfaces et-0/1/12:1 description "BT_12_2_{literal}"',
+    'set protocols rstp interface et-0/1/12:1 disable',
+    'set system ntp server 192.0.2.123',
+    'delete interfaces ge-0/0/1 disable',
+    'delete interfaces et-0/1/12:1 disable'
+  ].join("\n"));
+  context.state.selected.clear();
+  assert.match(context.customCommandPlan().error, /Select/);
+  context.customCommandTemplateInput.value = 'set system host-name {device}';
+  context.deviceNameInput.value = "";
+  assert.match(context.customCommandPlan().error, /no value.*device/);
+  context.customCommandTemplateInput.value = 'set system host-name {host}';
+  context.hostInput.value = 'bad; commit';
+  assert.match(context.customCommandPlan().error, /separators/);
+});
+
+test("custom commands account for existing editor and queued commands before staging", () => {
+  const context = commandActionContext("custom");
+  context.state.configManual = true;
+  context.configOutput.value = "delete system ntp";
+  context.state.configQueue = [{ label: "large batch", config: "set system ntp server 192.0.2.1\n".repeat(499) }];
+  context.buildCustomCommands();
+  assert.equal(context.configOutput.value, "delete system ntp");
+  assert.match(context.customCommandSummary.textContent, /combined editor and queue/);
+  assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "custom");
+});
+
+test("failed push check preserves editor and queue, exposes Junos errors, and allows correction and retry", async () => {
+  const context = commandActionContext("custom");
+  const original = "set system host-name typo";
+  context.configOutput.value = original;
+  context.state.configManual = true;
+  context.state.configQueue = [{ label: "Queued", config: "set system ntp server 192.0.2.123" }];
+  context.state.lastPreviewConfig = context.combinedDeploymentConfig();
+  Object.assign(context, {
+    pushBtn: {}, confirmBtn: {}, previewState: {}, compareOutput: {},
+    queueMatchesCurrentTarget: () => true, connectionPayload: (value) => value,
+    requests: [], startConfirmationWindow() {},
+    fetch: async (url) => {
+      context.requests.push(url);
+      return { ok: false, json: async () => ({ ok: false, stage: "commit-check",
+        error: "configuration check-out failed", output: "error: invalid host-name" }) };
+    }
+  });
+  context.activateWorkspaceTab("review");
+  await context.pushToSwitch();
+  assert.equal(context.configOutput.value, original);
+  assert.equal(context.state.configQueue.length, 1);
+  assert.equal(context.state.lastPreviewConfig, null);
+  assert.equal(context.state.deploymentInProgress, false);
+  assert.equal(!!context.state.pendingConfirmation, false);
+  assert.match(context.compareOutput.textContent, /No commit was sent/);
+  assert.match(context.compareOutput.textContent, /invalid host-name/);
+  assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "review");
+  context.configOutput.value = "set system host-name corrected";
+  await context.pushToSwitch();
+  assert.equal(context.requests.length, 1, "a new comparison is required after failure");
+  context.state.lastPreviewConfig = context.combinedDeploymentConfig();
+  context.fetch = async () => ({ ok: true, json: async () => ({ ok: true, pendingConfirmation: true }) });
+  await context.pushToSwitch();
+  assert.equal(context.state.pendingConfirmation, true);
+});
+
+test("RSTP custom command expands every selected port and appends into Review & deploy", () => {
+  const context = commandActionContext("custom");
+  context.state.selected.add("ge-0/0/2");
+  context.state.ports.push({ name: "et-0/0/0:1", index: 2 });
+  context.state.selected.add("et-0/0/0:1");
+  context.customCommandTemplateInput.value = "set protocols rstp interface {port} disable";
+  context.updateCustomCommandPreview();
+  const expected = [
+    "set protocols rstp interface ge-0/0/1 disable",
+    "set protocols rstp interface ge-0/0/2 disable",
+    "set protocols rstp interface et-0/0/0:1 disable"
+  ].join("\n");
+  assert.equal(context.customCommandPreview.textContent, expected);
+  context.buildCustomCommands();
+  assert.equal(context.configOutput.value, expected);
+  assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "review");
+  assert.equal(context.isDescriptionOnlyDeployment(expected), false);
+  assert.match(quickTaskContext().quickTaskValidationError(expected), /rollback protection/);
+  context.customCommandTemplateInput.value = "delete protocols rstp interface {port} disable";
+  assert.equal(context.customCommandPlan().lines.length, 3);
+  context.customCommandTemplateInput.value = "delete protocols rstp interface {port}";
+  assert.equal(context.customCommandPlan().lines.length, 3);
+});
 
 test("every command action stages commands, opens and focuses review, and remembers its editing tab", () => {
   for (const [action, tab] of commandActions) {
@@ -173,7 +447,7 @@ test("quick task eligibility rejects VLAN collisions, comments, stale targets, a
 });
 
 test("queue returns to the previous editing tab only after a successful queue", () => {
-  for (const tab of ["configure", "series", "move", "vlans"]) {
+  for (const tab of ["configure", "series", "move", "vlans", "custom"]) {
     const context = navigationContext(tab);
     Object.assign(context, {
       configOutput: { value: "set interfaces ge-0/0/1 description AP" },
@@ -202,7 +476,7 @@ test("successful quick commits and confirmations return to editing; failures sta
       Object.assign(context, {
         configQueueLabelInput: { value: "" }, configOutput: { value: "config" }, compareOutput: {},
         connectionStatus: {}, quickCommitBtn: {}, confirmBtn: {},
-        hostInput: { value: "switch" }, usernameInput: { value: "user" }, passwordInput: { value: "" },
+        hostInput: { value: "switch" }, usernameInput: { value: "user" }, passwordInput: { value: "" }, deviceNameInput: { value: "Switch" },
         MAX_DEPLOYMENT_CONFIG_CHARS: 65536,
         combinedDeploymentConfig: () => "config", queueMatchesCurrentTarget: () => true,
         isDescriptionOnlyDeployment: () => operation !== "quickTasks", connectionPayload: (value) => value,

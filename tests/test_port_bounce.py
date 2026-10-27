@@ -1,9 +1,24 @@
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
 import paramiko
 
 import app
+
+
+
+def setUpModule():
+    global _activity_directory, _activity_config
+    _activity_directory = tempfile.TemporaryDirectory()
+    _activity_config = patch.dict(app.app.config, {"ACTIVITY_LOG_PATH": Path(_activity_directory.name) / "activity.sqlite3"})
+    _activity_config.start()
+
+
+def tearDownModule():
+    _activity_config.stop()
+    _activity_directory.cleanup()
 
 
 class PortBounceTests(unittest.TestCase):

@@ -10,6 +10,7 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 *.log
+activity.sqlite3*
 build/
 dist/
 *.spec

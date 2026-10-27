@@ -14,12 +14,17 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import uuid
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import paramiko
 from dotenv import dotenv_values, load_dotenv, set_key
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, g, jsonify, request, send_from_directory
+from activity_log import ActivityLog, utc_now
+from live_watch import WatchSessions, WatchSessionError, validate_watch_ports, parse_interface_sample, parse_poe_sample
 from mac_vendor_lookup import BaseMacLookup, InvalidMacError, MacLookup, VendorNotFoundError
 
 APP_DIR = Path(__file__).resolve().parent
@@ -147,8 +152,12 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-APP_VERSION = "1.5"
-API_VERSION = 20
+APP_VERSION = "1.6"
+API_VERSION = 24
+WATCH_SESSIONS = WatchSessions()
+atexit.register(WATCH_SESSIONS.close)
+WATCH_LOG_THROTTLE = {}
+WATCH_LOG_LOCK = threading.Lock()
 PORT_BOUNCE_LOCK = threading.Lock()
 COMMIT_COMMENT = "Applied by Junos Helper"
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
@@ -346,6 +355,194 @@ def _connection_values(payload: dict[str, Any]) -> tuple[str, str, str]:
     username = (payload.get("username") or saved.get("username") or os.getenv("JUNOS_USERNAME", "")).strip()
     password = payload.get("password") or saved.get("password") or os.getenv("JUNOS_PASSWORD", "")
     return host, username, password
+
+
+ACTIVITY_OPERATIONS = {
+    "/api/connect": ("Data pull", "data"), "/api/preview": ("Comparison", "review"),
+    "/api/push": ("Protected push", "change"), "/api/confirm": ("Commit confirmation", "change"),
+    "/api/quick-task-commit": ("Quick commit", "change"),
+    "/api/quick-description-commit": ("Description quick commit", "change"),
+    "/api/ports/bounce": ("Port bounce", "change"),
+    "/api/protected-ports": ("Port protection", "settings"),
+    "/api/devices": ("Save device", "settings"), "/api/devices/group": ("Assign group", "settings"),
+}
+ACTIVITY_LAST_ERROR = ""
+
+
+def _activity_store() -> ActivityLog:
+    configured = app.config.get("ACTIVITY_LOG_PATH") or os.getenv("JUNOS_HELPER_ACTIVITY_LOG_PATH")
+    base = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    return ActivityLog(Path(configured) if configured else base / "Junos Helper" / "activity.sqlite3")
+
+
+def _activity_clean(value: Any, payload: dict) -> str:
+    """Keep useful error text while excluding credentials and secret configuration values."""
+    text = str(value or "")
+    secrets = [payload.get("password")]
+    try:
+        secrets.append(_connection_values(payload)[2])
+    except (ValueError, TypeError, AttributeError):
+        pass
+    for line in str(payload.get("config") or "").splitlines():
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            # Malformed secret-bearing commands must not leak through validation errors.
+            sensitive = re.search(r"(?:password|secret|community|authentication-data|\bkey)\s+(.+)", line, re.I)
+            if sensitive:
+                remainder = sensitive.group(1).strip().strip("\"'")
+                secrets.extend([remainder, *[part.strip("\"'") for part in remainder.split()]])
+                text = text.replace(line.strip(), "[sensitive command omitted]")
+            continue
+        for index, part in enumerate(parts[:-1]):
+            if re.search(r"password|secret|community|authentication-data|(?:^|-)key(?:$|-)", part, re.I):
+                secrets.extend(parts[index + 1:])
+    for secret in sorted({str(secret) for secret in secrets if secret}, key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
+    text = re.sub(r'(?i)((?:encrypted-password|password|secret|community|authentication-key|private-key)\s+)("[^"\n]*"|\S+)',
+                  r"\1[redacted]", text)
+    text = "\n".join("[Sensitive error details omitted; see current operation output.]" if re.search(
+        r"password|secret|community|authentication-data|(?:^|[\s-])key(?:$|[\s-])", line, re.I) else line for line in text.splitlines())
+    return text[:2000]
+
+
+def _record_activity(event: dict) -> bool:
+    global ACTIVITY_LAST_ERROR
+    try:
+        _activity_store().append(event)
+        return True
+    except (OSError, sqlite3.Error) as exc:
+        ACTIVITY_LAST_ERROR = f"History could not be saved at {utc_now()} ({type(exc).__name__}). Some actions may be missing."
+        logger.warning("Activity history write failed: %s", type(exc).__name__)
+        return False
+
+
+@app.before_request
+def start_activity() -> None:
+    if request.method not in {"POST", "PATCH"} or request.path not in ACTIVITY_OPERATIONS:
+        return
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return
+    try:
+        host, username, _ = _connection_values(payload)
+    except (ValueError, TypeError, AttributeError):
+        host, username = "", ""
+    operation, category = ACTIVITY_OPERATIONS[request.path]
+    if request.path == "/api/connect" and payload.get("isRefresh"):
+        operation = "Data refresh"
+    lines = [line.strip() for line in str(payload.get("config") or "").splitlines()
+             if line.strip() and not line.lstrip().startswith("#")]
+    details = {"operator": _activity_clean(username, payload)}
+    if lines:
+        details["commandCount"] = len(lines)
+        if not re.search(r"password|secret|community|authentication-data|(?:^|[\s-])key(?:$|[\s-])", "\n".join(lines), re.I):
+            details["batchFingerprint"] = hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
+        interfaces = set()
+        for line in lines:
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                continue
+            if len(parts) >= 3 and parts[1] == "interfaces" and INTERFACE_RE.fullmatch(parts[2]):
+                interfaces.add(parts[2])
+            elif len(parts) >= 5 and parts[1] == "protocols":
+                interfaces.update(parts[index + 1] for index, part in enumerate(parts[:-1])
+                                  if part == "interface" and INTERFACE_RE.fullmatch(parts[index + 1]))
+        details["interfaces"] = sorted(interfaces)[:100]
+    if isinstance(payload.get("ports"), list):
+        details["ports"] = [name for name in payload["ports"] if isinstance(name, str) and INTERFACE_RE.fullmatch(name)][:100]
+    if request.path == "/api/ports/bounce":
+        details.update(kind=payload.get("kind") if payload.get("kind") in ("link", "poe") else "invalid",
+                       interval=payload.get("interval") if type(payload.get("interval")) is int else None)
+    related = str(payload.get("confirmationFor") or "")
+    event = {"host": host.lower(), "device_name": _activity_clean(payload.get("deviceName"), payload)[:128],
+             "operation": operation, "category": category, "request_id": uuid.uuid4().hex,
+             "related_request_id": related if re.fullmatch(r"[a-f0-9]{32}", related) else "", "details": details}
+    g.activity_event = event
+    g.activity_payload = payload
+    if category == "change" and request.path != "/api/protected-ports":
+        _record_activity({**event, "status": "started", "severity": "info",
+                          "message": f"{operation} requested. No completion result recorded yet."})
+
+
+@app.after_request
+def finish_activity(response):
+    event = getattr(g, "activity_event", None)
+    if event is None:
+        return response
+    payload = g.activity_payload
+    body = response.get_json(silent=True) or {}
+    ok = response.status_code < 400 and body.get("ok") is True
+    status, severity = ("succeeded", "info") if ok else ("failed", "error")
+    message = f'{event["operation"]} {"completed" if ok else "failed"}.'
+    details = {**event["details"], "httpStatus": response.status_code}
+    if request.path == "/api/connect" and ok:
+        event["device_name"] = _activity_clean(body.get("deviceName"), payload)[:128]
+        failures = [item for item in body.get("results", []) if item.get("error") or re.search(
+            r"(?:error:|syntax error|permission denied|unknown command)", item.get("output") or "", re.I)]
+        details["interfaceCount"] = body.get("portCount", 0)
+        if failures:
+            status, severity = "partial", "warning"
+            details["commandErrors"] = [{"command": item.get("command"),
+                "error": _activity_clean(_cli_failure_message(item.get("output", ""), item.get("error", ""), "Data pull failed"), payload)} for item in failures]
+        message = f'{event["operation"]}: {details["interfaceCount"]} interfaces, {len(failures)} command errors.'
+    elif request.path == "/api/push" and ok and body.get("pendingConfirmation"):
+        status = "awaiting-confirmation"
+        details["confirmationDeadline"] = (datetime.now(timezone.utc) + timedelta(minutes=body.get("confirmMinutes", 5))).isoformat(timespec="seconds")
+        message = "Configuration applied with rollback protection; awaiting final confirmation."
+    elif request.path == "/api/confirm" and ok:
+        status, message = "confirmed", "Committed change confirmed successfully."
+    elif request.path.startswith("/api/quick-") and ok:
+        status, message = "committed", "Quick changes committed successfully; no confirmation window."
+    elif body.get("stage") == "commit-check":
+        status, message = "check-failed", "Commit check failed. No commit request was sent; draft retained in the browser."
+    elif not ok and response.status_code >= 500 and event["category"] == "change":
+        status, severity = "unverified", "warning"
+        message = f'{event["operation"]} result could not be verified. Check switch state before retrying.'
+    if body.get("error"):
+        details["error"] = _activity_clean(body["error"], payload)
+    if request.path == "/api/ports/bounce":
+        details["portsAccepted"] = [item["port"] for item in body.get("results", []) if item.get("ok")]
+        details["portErrors"] = [{"port": item["port"], "error": _activity_clean(item.get("error"), payload)}
+                                 for item in body.get("results", []) if not item.get("ok")]
+    stored = _record_activity({**event, "status": status, "severity": severity, "message": message, "details": details})
+    if response.is_json:
+        body["activityId"] = event["request_id"]
+        if not stored:
+            body["activityWarning"] = "This outcome could not be saved in activity history."
+        response.set_data(app.json.dumps(body))
+    return response
+
+
+@app.get("/api/activity")
+def activity_history() -> Any:
+    view = request.args.get("view", "changes")
+    try:
+        before = int(request.args.get("before", "0"))
+        if view not in {"changes", "all", "errors"} or before < 0:
+            raise ValueError
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid activity filter."}), 400
+    try:
+        history = _activity_store().read(host=request.args.get("host", ""), view=view, before=before)
+        return jsonify({"ok": True, **history, "warning": ACTIVITY_LAST_ERROR,
+                        "retentionDays": 90, "maxEntries": 50000})
+    except (OSError, sqlite3.Error, ValueError):
+        return jsonify({"ok": False, "error": "Activity history is unavailable. Check the local storage location."}), 503
+
+
+@app.post("/api/activity/browser-error")
+def browser_activity_error() -> Any:
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("message"), str):
+        return jsonify({"ok": False, "error": "Supply a browser error message."}), 400
+    host, _, _ = _connection_values(payload)
+    stored = _record_activity({"host": host, "device_name": _activity_clean(payload.get("deviceName"), payload)[:128],
+        "operation": "Browser error", "category": "application", "status": "failed", "severity": "error",
+        "message": _activity_clean(payload["message"], payload), "request_id": uuid.uuid4().hex,
+        "details": {"source": _activity_clean(payload.get("source"), payload)[:200]}})
+    return jsonify({"ok": stored}), 200 if stored else 503
 
 
 def _ssh_client(host: str, username: str, password: str) -> paramiko.SSHClient:
@@ -757,6 +954,11 @@ def javascript() -> Any:
     return send_from_directory(RESOURCE_DIR, "script.js")
 
 
+@app.get("/live-watch.js")
+def live_watch_javascript() -> Any:
+    return send_from_directory(RESOURCE_DIR, "live-watch.js")
+
+
 @app.get("/api/health")
 def health() -> Any:
     return jsonify({"ok": True, "appVersion": APP_VERSION, "apiVersion": API_VERSION, "packaged": IS_FROZEN})
@@ -1008,6 +1210,7 @@ def connect_switch() -> Any:
             {
                 "ok": True,
                 "host": host,
+                "collectedAt": utc_now(),
                 "manualProtectedPorts": _manual_protected_ports(host),
                 "results": results,
                 "interfaces": parsed_interface_names,
@@ -1039,75 +1242,25 @@ def connect_switch() -> Any:
 
 
 def _validated_config_lines(config_text: str) -> list[str]:
+    """Validate command framing; Junos validates configuration syntax and semantics."""
     if len(config_text) > 65536:
         raise ValueError("Configuration is too large.")
+    if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", config_text.replace("\r", "").replace("\n", "")):
+        raise ValueError("Unsafe control character in configuration.")
 
     commands: list[str] = []
-    for raw_line in config_text.splitlines():
+    for number, raw_line in enumerate(config_text.splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        if any(token in line for token in (";", "`", "$(", "\x00")):
-            raise ValueError(f"Unsafe command delimiter in line: {line}")
+        if any(token in line for token in (";", "|", "`", "$(")):
+            raise ValueError(f"Unsafe command delimiter on line {number}: {line}")
         try:
             parts = shlex.split(line)
         except ValueError as exc:
-            raise ValueError(f"Invalid quoting in line: {line}") from exc
-        if len(parts) < 3 or parts[0] not in {"set", "delete"}:
-            raise ValueError("Only approved interface and VLAN commands are allowed.")
-        if parts[1] == "interfaces":
-            if parts[2].lower() == "irb":
-                if parts[0] == "set":
-                    valid_irb = (
-                        len(parts) == 9
-                        and parts[3] == "unit"
-                        and parts[4].isdigit()
-                        and 0 <= int(parts[4]) <= 16384
-                        and parts[5:8] == ["family", "inet", "address"]
-                    )
-                    if not valid_irb:
-                        raise ValueError("Only IPv4 IRB address commands are allowed.")
-                    try:
-                        ipaddress.ip_interface(parts[8])
-                    except ValueError as exc:
-                        raise ValueError(f"Invalid IRB IPv4 prefix: {parts[8]}") from exc
-                    if ipaddress.ip_interface(parts[8]).version != 4:
-                        raise ValueError("Only IPv4 IRB address commands are allowed.")
-                else:
-                    valid_irb_delete = (
-                        len(parts) == 5
-                        and parts[3] == "unit"
-                        and parts[4].isdigit()
-                        and 0 <= int(parts[4]) <= 16384
-                    )
-                    if not valid_irb_delete:
-                        raise ValueError("Only complete IRB logical-unit deletion is allowed.")
-            elif not INTERFACE_RE.fullmatch(parts[2].split(".")[0]):
-                raise ValueError(f"Unsupported interface name: {parts[2]}")
-            elif len(parts) == 3 and parts[0] != "delete":
-                raise ValueError("A complete interface command is required.")
-        elif parts[1] == "vlans":
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", parts[2]):
-                raise ValueError(f"Unsupported VLAN name: {parts[2]}")
-            is_vlan_id = parts[0] == "set" and len(parts) == 5 and parts[3] == "vlan-id"
-            is_l3_binding = (
-                len(parts) == 5
-                and parts[3] == "l3-interface"
-                and re.fullmatch(r"irb\.\d+", parts[4], re.IGNORECASE)
-                and 0 <= int(parts[4].split(".")[1]) <= 16384
-            )
-            is_bridge_member = (
-                len(parts) == 5
-                and parts[3] == "interface"
-                and INTERFACE_RE.fullmatch(parts[4])
-                and "." in parts[4]
-            )
-            if not (is_vlan_id or is_l3_binding or is_bridge_member):
-                raise ValueError("Only VLAN IDs, IRB bindings, and logical interface members are allowed.")
-            if is_vlan_id and (not parts[4].isdigit() or not 1 <= int(parts[4]) <= 4094):
-                raise ValueError(f"VLAN ID must be between 1 and 4094: {parts[4]}")
-        else:
-            raise ValueError("Only approved interface and VLAN commands are allowed.")
+            raise ValueError(f"Invalid quoting on line {number}: {line}") from exc
+        if len(parts) < 2 or parts[0] not in {"set", "delete"} or not parts[1]:
+            raise ValueError(f"Line {number}: only set/delete commands with a configuration path are allowed.")
         commands.append(line)
 
     if not commands:
@@ -1170,6 +1323,123 @@ def _cli_failure_message(output: str, error: str, fallback: str) -> str:
     return message[:2000] or fallback
 
 
+def _watch_read(client, command):
+    _, stdout, stderr = client.exec_command(f"cli -c {shlex.quote(command)}", timeout=6)
+    output = stdout.read().decode("utf-8", errors="replace")
+    error = stderr.read().decode("utf-8", errors="replace")
+    status = stdout.channel.recv_exit_status()
+    if status != 0 or error.strip() or re.search(r"(?im)^\s*(?:error:|syntax error|unknown command|permission denied)", output):
+        raise ValueError(_cli_failure_message(output, error, "The switch did not return interface statistics."))
+    return output
+
+
+def _watch_warning(host, message, payload):
+    with WATCH_LOG_LOCK:
+        now = time.monotonic()
+        if now - WATCH_LOG_THROTTLE.get(host, -60) < 30:
+            return
+        if len(WATCH_LOG_THROTTLE) >= 64:
+            WATCH_LOG_THROTTLE.clear()
+        WATCH_LOG_THROTTLE[host] = now
+    _record_activity({"host": host, "device_name": _activity_clean(payload.get("deviceName"), payload),
+        "operation": "Live watch", "category": "monitor", "status": "read-failed", "severity": "warning",
+        "request_id": uuid.uuid4().hex, "message": "Live statistics could not be collected completely.",
+        "details": {"error": _activity_clean(message, payload)}})
+
+
+@app.post("/api/live-watch/sample")
+def live_watch_sample() -> Any:
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Supply a connection and 1–8 watched ports."}), 400
+    try:
+        ports = validate_watch_ports(payload.get("ports"))
+        host, username, password = _connection_values(payload)
+        if not host or not username:
+            raise ValueError("Host and username are required.")
+        token = payload.get("sessionId") or ""
+        if not isinstance(token, str) or token and not re.fullmatch(r"[a-f0-9]{32}", token):
+            raise ValueError("Invalid watch session.")
+        if type(payload.get("includePoe", False)) is not bool:
+            raise ValueError("Choose whether to collect PoE information.")
+    except (ValueError, TypeError, AttributeError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    entry = None
+    samples = []
+    started = time.monotonic()
+    fatal = False
+    cancelled = False
+    try:
+        entry = WATCH_SESSIONS.acquire(host, username, password, token, _ssh_client)
+        if not token:
+            _record_activity({"host": host, "device_name": _activity_clean(payload.get("deviceName"), payload),
+                "operation": "Live watch", "category": "monitor", "status": "started", "severity": "info",
+                "request_id": uuid.uuid4().hex, "message": "Read-only live watch started.", "details": {"ports": ports}})
+        for index, name in enumerate(ports):
+            try:
+                output = _watch_read(entry.client, f"show interfaces {name} extensive")
+                sample = {**parse_interface_sample(output, name), "sampledAt": utc_now(),
+                          "sampleTimeMs": time.monotonic() * 1000}
+                if payload.get("includePoe"):
+                    cached = entry.optional.get(name)
+                    if cached is None or time.monotonic() - cached[0] >= 20:
+                        try:
+                            if name.startswith(("ae", "reth")):
+                                raise ValueError("PoE is not applicable to this interface type.")
+                            poe = {"available": True, **parse_poe_sample(_watch_read(entry.client, f"show poe interface {name}"), name)}
+                        except ValueError as exc:
+                            poe = {"available": False, "error": str(exc)}
+                        except (paramiko.SSHException, OSError) as exc:
+                            poe = {"available": False, "error": f"PoE read unavailable: {exc}"}
+                            fatal = True
+                            cancelled = not WATCH_SESSIONS.active(entry)
+                            WATCH_SESSIONS.drop(entry.token)
+                        poe["sampledAt"] = utc_now()
+                        entry.optional[name] = (time.monotonic(), poe)
+                    sample["poe"] = entry.optional[name][1]
+                samples.append(sample)
+                if fatal:
+                    samples.extend({"name": remaining, "error": "Not collected after SSH failure."} for remaining in ports[index + 1:])
+                    break
+            except ValueError as exc:
+                cancelled = cancelled or not WATCH_SESSIONS.active(entry)
+                samples.append({"name": name, "error": str(exc)})
+            except (paramiko.SSHException, OSError) as exc:
+                samples.extend({"name": remaining, "error": f"Statistics unavailable after SSH failure: {exc}"} for remaining in ports[index:])
+                fatal = True
+                cancelled = not WATCH_SESSIONS.active(entry)
+                WATCH_SESSIONS.drop(entry.token)
+                break
+        errors = [sample["error"] for sample in samples if sample.get("error")]
+        if errors and not cancelled:
+            _watch_warning(host, errors[0], payload)
+        ok = any(not sample.get("error") for sample in samples)
+        return jsonify({"ok": ok, "host": host, "sessionId": "" if fatal else entry.token, "ports": samples,
+            "collectedAt": utc_now(), "durationMs": round((time.monotonic() - started) * 1000),
+            "error": "" if ok else "No watched-port statistics could be collected."}), 200 if ok else 502
+    except WatchSessionError as exc:
+        return jsonify({"ok": False, "sessionExpired": exc.expired, "error": str(exc)}), 409
+    except (paramiko.SSHException, OSError) as exc:
+        _watch_warning(host, str(exc), payload)
+        return jsonify({"ok": False, "error": str(exc), "sessionId": ""}), 502
+    finally:
+        if entry is not None:
+            WATCH_SESSIONS.release(entry)
+
+
+@app.post("/api/live-watch/stop")
+def live_watch_stop() -> Any:
+    payload = request.get_json(silent=True) or {}
+    token = payload.get("sessionId") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
+        return jsonify({"ok": False, "error": "Supply a watch session ID."}), 400
+    host = WATCH_SESSIONS.drop(token)
+    if host:
+        _record_activity({"host": host, "operation": "Live watch", "category": "monitor", "status": "stopped",
+            "severity": "info", "request_id": uuid.uuid4().hex, "message": "Read-only watch session closed."})
+    return jsonify({"ok": True})
+
+
 @app.post("/api/preview")
 def preview_config() -> Any:
     payload = request.get_json(silent=True) or {}
@@ -1192,7 +1462,7 @@ def preview_config() -> Any:
         )
         combined_output = f"{output}\n{error}".lower()
         if exit_status != 0 or any(marker in combined_output for marker in ("error:", "syntax error")):
-            return jsonify({"ok": False, "error": error.strip() or "Preview failed.", "output": output.strip()}), 500
+            return jsonify({"ok": False, "error": _cli_failure_message(output, error, "Preview failed."), "output": output.strip()}), 502
         return jsonify({"ok": True, "compare": _clean_compare_output(output), "error": error.strip()})
     except (paramiko.SSHException, OSError, ValueError) as exc:
         logger.warning("Preview failed for %s: %s", host, exc)
@@ -1376,6 +1646,8 @@ def _validated_quick_task_lines(config_text: str, configuration: dict, vlan_outp
             if any(member.split(".")[0] == name for member in re.findall(r"^set vlans \S+ interface (\S+)", vlan_output, re.M)):
                 raise ValueError(f"{name}: bridge service member. Use rollback protection.")
         elif len(parts) == 5 and parts[:2] == ["set", "vlans"] and parts[3] == "vlan-id":
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", parts[2]) or not parts[4].isdigit() or not 1 <= int(parts[4]) <= 4094:
+                raise ValueError("Quick VLAN creation requires a valid name and an ID between 1 and 4094.")
             name, vlan_id = parts[2], int(parts[4])
             if name in names or vlan_id in ids:
                 raise ValueError("Quick VLAN creation requires an unused name and ID, including within this batch.")
@@ -1479,12 +1751,26 @@ def push_config() -> Any:
     try:
         client = _ssh_client(host, username, password)
         combined = "; ".join(commands)
+        # Do not send a commit request unless this exact payload passes a separate
+        # check. The private candidate is discarded on both success and failure.
+        check_output, check_error, check_status = _execute_cli(
+            client,
+            f"configure private; {combined}; commit check; rollback 0; exit",
+        )
+        check_text = f"{check_output}\n{check_error}".lower()
+        failure_markers = ("error:", "commit failed", "configuration check-out failed", "syntax error", "unknown command", "permission denied")
+        if (check_status != 0 or "configuration check succeeds" not in check_text
+                or any(marker in check_text for marker in failure_markers)):
+            message = _cli_failure_message(check_output, check_error, "Junos did not report a successful commit check.")
+            return jsonify({
+                "ok": False, "stage": "commit-check", "error": message,
+                "output": check_output.strip(), "pendingConfirmation": False,
+            }), 422
         output, error, exit_status = _execute_cli(
             client,
             f'configure exclusive; {combined}; commit check; commit confirmed 5 comment "{COMMIT_COMMENT}"; exit',
         )
         combined_output = f"{output}\n{error}".lower()
-        failure_markers = ("error:", "commit failed", "configuration check-out failed", "syntax error")
         success = "commit complete" in combined_output or "commit confirmed" in combined_output
         if exit_status != 0 or not success or any(marker in combined_output for marker in failure_markers):
             message = _cli_failure_message(output, error, "Commit did not complete.")
@@ -1499,6 +1785,7 @@ def push_config() -> Any:
                 "output": output.strip(),
                 "error": error.strip(),
                 "pendingConfirmation": True,
+                "commitCheckPassed": True,
                 "confirmMinutes": 5,
             }
         )
