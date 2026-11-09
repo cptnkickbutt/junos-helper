@@ -139,6 +139,12 @@
             </div>
             <p id="watchSelectionHint" class="credential-note">Select 1–8 ports in the inventory.</p>
             <p id="watchStatus" class="tool-summary muted" role="status" aria-live="polite">Connect, select ports, then choose Watch selected ports.</p>
+            <p id="watchTiming" class="watch-timing muted"></p>
+            <section id="watchOverview" class="watch-overview" hidden aria-label="Watched port traffic">
+              <div class="watch-chart-heading"><strong>Watched port traffic</strong><span>Separate TX/RX scales · Transmit above zero · Receive below zero (dashed)</span></div>
+              <div id="watchLegend" class="watch-legend" aria-label="Port colors"></div>
+              <div class="watch-plot"><svg id="watchGraph" class="watch-chart" viewBox="0 0 960 350" role="img" aria-label="Traffic over the last 120 seconds. Transmit above zero, receive below zero, with separate scales for each direction. Each port has its own color."></svg></div>
+            </section>
             <div id="watchPorts" class="watch-ports"></div>
           </div>
 

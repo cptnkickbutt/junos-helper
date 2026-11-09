@@ -7,9 +7,18 @@ and this project uses versioned GitHub releases.
 
 ## [Unreleased]
 
-Add new entries here under `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`,
-or `Security`. When publishing a release, move those entries into a dated version
-section and update the comparison links at the bottom of this file.
+## [v1.7] - 2026-11-09
+
+### Changed
+
+- Combine watched-port traffic in one two-minute graph with consistent port colors, independently scaled transmit/receive halves with labeled numeric ticks and ranges, transmit above zero, and dashed receive below zero. Use two-line graph legend entries with a color swatch and interface name above a wrapping description; trace tooltips include both. Undescribed ports show just the name. Keep live metrics and expandable evidence beneath it.
+- Show in-progress collection time, last batch duration, and each port's traffic-read duration to distinguish slow switch reads from stalled rendering.
+
+### Fixed
+
+- Keep Live watch sampling and rate baselines active during automatic or manual read-only inventory refresh of the connected switch. The default one-minute refresh previously shared the connection-busy flag and suspended sampling for the duration of discovery. Reconnects, deployments, and bounces still block collection.
+- Remove deliberate hidden-tab sampling suspension and focus-change baseline resets. Browser timer throttling and sleeping tabs can still delay collection.
+- Bound watch SSH commands with a six-second transport-closing deadline, explicitly close command streams, and stop starting more batch reads after 12 seconds while prioritizing skipped ports next time. Successful slow batches no longer wait an additional full refresh interval. Real-switch validation of the refresh/polling fixes remains pending.
 
 ## [v1.6] - 2026-10-27
 

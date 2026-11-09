@@ -6,6 +6,7 @@ const vm = require("node:vm");
 
 const scriptPath = path.join(__dirname, "..", "script.js");
 const source = fs.readFileSync(scriptPath, "utf8");
+const { LiveWatchController } = require("../live-watch.js");
 
 function runSourceSection(startMarker, endMarker, context) {
   const start = source.indexOf(startMarker);
@@ -43,6 +44,117 @@ test("Live watch does not replace the most recent editing tab as the queue retur
   context.activateWorkspaceTab("watch");
   assert.equal(context.state.lastEditingTab, "custom");
   assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "watch");
+});
+
+function inventoryRefreshContext() {
+  let now = Date.parse("2026-10-28T16:00:00Z");
+  const input = (value = "") => ({ value, disabled: false, checked: false });
+  const context = loadSourceSection("function getLiveWatchContext", "function cacheDeviceData", {
+    state: { ports: [{ name: "ge-0/0/1" }], selected: new Set(["ge-0/0/1"]), protectionHost: "switch",
+      savedDevices: [], configManual: true, connectionInProgress: false, inventoryRefreshInProgress: false,
+      deploymentInProgress: false, bounceInProgress: false, refreshTimer: null },
+    connectionPayload: (extra) => ({ host: "switch", username: "user", ...extra }),
+    checkBackendCompatibility: async () => true, loadDefaults: async () => {},
+    hostInput: input("switch"), deviceNameInput: input("Example"), refreshIntervalInput: input("60"),
+    connectBtn: input(), refreshNowBtn: input(), quickConnectBtn: input(), savedDeviceInput: input(),
+    connectionStatus: {}, deviceMetadata: { replaceChildren() {} }, saveDeviceBtn: input(), lastRefresh: {},
+    autoSaveConnectionsInput: input(), populateSeriesStartPorts() {}, syncAvailableVlans() {},
+    renderVlanChoices() {}, populateServiceChoices() {}, updatePushAvailability() {}
+  });
+  const intervalCallbacks = [];
+  const calls = [];
+  let fetchBegan, finishFetch, failFetch;
+  const began = new Promise((resolve) => { fetchBegan = resolve; });
+  context.fetch = () => {
+    fetchBegan();
+    return new Promise((resolve, reject) => { finishFetch = resolve; failFetch = reject; });
+  };
+  const env = { context: () => context.getLiveWatchContext(), now: () => now,
+    render() {}, schedule: () => 1, cancel() {}, abort() { calls.push({ url: "abort" }); },
+    request: async (url) => {
+      calls.push({ url });
+      return { sessionId: "watch-session", ports: [{ name: "ge-0/0/1", admin: "up", oper: "up", speed: "1Gbps",
+        sampledAt: new Date(now).toISOString(), sampleTimeMs: now, counterEpoch: "same",
+        counters: { rxBytes: String(now), txBytes: String(now * 2) } }] };
+    }
+  };
+  const watch = new LiveWatchController(env);
+  context.window = { liveWatch: { onContextChange: () => watch.contextChanged() },
+    setInterval(fn, delay) { intervalCallbacks.push({ fn, delay }); return intervalCallbacks.length; }, clearInterval() {} };
+  context.render = () => context.window.liveWatch.onContextChange();
+  runSourceSection("function savedProfileForCurrentConnection", "function logicalServicesForPort", context);
+  return { context, watch, calls, env, intervalCallbacks, began, advance: () => { now += 5000; },
+    finish: () => finishFetch({ ok: true, json: async () => ({ ok: true, host: "switch", interfaces: ["ge-0/0/1"] }) }),
+    fail: () => failFetch(new Error("discovery unavailable")) };
+}
+
+test("the one-minute inventory refresh preserves an in-flight watch, SSH session, and comparable rates", async () => {
+  const h = inventoryRefreshContext();
+  await h.watch.start();
+  h.advance();
+  await h.watch.poll();
+  const record = h.watch.records.get("ge-0/0/1");
+  assert.equal(record.rates.rxBytes, 8000);
+  const request = h.env.request;
+  let finishSample;
+  h.env.request = () => new Promise((resolve) => { finishSample = resolve; });
+  h.advance();
+  const pendingSample = h.watch.poll();
+  h.context.configureAutoRefresh();
+  assert.equal(h.intervalCallbacks[0].delay, 60000);
+  const refresh = h.intervalCallbacks[0].fn();
+  await h.began;
+  assert.equal(h.context.state.connectionInProgress, true);
+  assert.equal(h.context.getLiveWatchContext().busy, false);
+  assert.equal(h.watch.busy, true);
+  assert.equal(h.watch.sessionId, "watch-session");
+  assert.equal(record.rateGap, false);
+  finishSample(await request("/api/live-watch/sample"));
+  await pendingSample;
+  assert.equal(record.rates.rxBytes, 8000);
+  h.env.request = request;
+  h.advance();
+  await h.watch.poll();
+  assert.equal(record.rates.rxBytes, 8000);
+  h.finish();
+  await refresh;
+  assert.equal(h.context.state.connectionInProgress, false);
+  assert.equal(h.context.state.inventoryRefreshInProgress, false);
+  assert.equal(h.watch.sessionId, "watch-session");
+  assert.equal(record.rateGap, false);
+  assert.equal(h.context.state.configManual, true);
+  assert.ok(h.calls.slice(1).every((call) => call.url.endsWith("/sample")));
+});
+
+test("failed inventory refresh leaves watching active; reconnects and configuration actions still block reads", async () => {
+  const h = inventoryRefreshContext();
+  await h.watch.start();
+  const refresh = h.context.connectToSwitch({ isRefresh: true });
+  await h.began;
+  h.fail();
+  await refresh;
+  assert.equal(h.context.state.inventoryRefreshInProgress, false);
+  assert.equal(h.watch.running, true);
+  h.advance();
+  await h.watch.poll();
+  assert.equal(h.watch.records.get("ge-0/0/1").rates.rxBytes, 8000);
+  h.context.state.connectionInProgress = true;
+  assert.equal(h.context.getLiveWatchContext().busy, true);
+  h.context.state.inventoryRefreshInProgress = true;
+  for (const flag of ["deploymentInProgress", "bounceInProgress"]) {
+    h.context.state[flag] = true;
+    assert.equal(h.context.getLiveWatchContext().busy, true);
+    h.context.state[flag] = false;
+  }
+  h.context.state.connectionInProgress = false;
+  const other = inventoryRefreshContext();
+  other.context.state.protectionHost = "another-switch";
+  const differentTarget = other.context.connectToSwitch({ isRefresh: true });
+  await other.began;
+  assert.equal(other.context.state.inventoryRefreshInProgress, false);
+  assert.equal(other.context.getLiveWatchContext().busy, true);
+  other.fail();
+  await differentTarget;
 });
 
 function quickTaskContext() {

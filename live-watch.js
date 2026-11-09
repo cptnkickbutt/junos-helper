@@ -3,6 +3,30 @@
   const COUNTERS = ["inputErrors", "outputErrors", "inputDrops", "outputDrops", "framingErrors", "carrierTransitions"];
   const TRAFFIC = ["rxBytes", "txBytes", "rxPackets", "txPackets"];
   const HISTORY_MS = 120000;
+  const PORT_COLORS = ["#38bdf8", "#fbbf24", "#c084fc", "#34d399", "#fb7185", "#e2e8f0", "#fb923c", "#a3e635"];
+
+  function graphScale(records, now) {
+    return Object.fromEntries(["rx", "tx"].map((key) => {
+      const peak = Math.max(1, ...[...records.values()].flatMap((record) => record.points
+        .filter((point) => point.time >= now - HISTORY_MS).map((point) => point[key] || 0)));
+      const power = 10 ** Math.floor(Math.log10(peak));
+      return [key, [1, 2, 5, 10].find((step) => step * power >= peak) * power];
+    }));
+  }
+
+  function graphSegments(points, key, now, scale) {
+    const segments = [];
+    let segment = [];
+    for (const point of points) {
+      if (point.time < now - HISTORY_MS) continue;
+      if (!Number.isFinite(point[key])) { if (segment.length) segments.push(segment); segment = []; continue; }
+      const x = 94 + Math.max(0, Math.min(1, (point.time - now + HISTORY_MS) / HISTORY_MS)) * 850;
+      const y = 164 + (key === "rx" ? 1 : -1) * point[key] / scale * 132;
+      segment.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+    }
+    if (segment.length) segments.push(segment);
+    return segments;
+  }
 
   function counterDelta(current, previous) {
     if (!/^\d+$/.test(String(current ?? "")) || !/^\d+$/.test(String(previous ?? ""))) return null;
@@ -84,6 +108,8 @@
       this.targetLabel = "";
       this.generation = 0;
       this.timer = null;
+      this.collectingSince = null;
+      this.lastDurationMs = null;
       this.status = "Select ports, then choose Watch selected ports.";
     }
     key(context) { return `${context.connection.host.toLowerCase()}|${context.connection.username}`; }
@@ -103,6 +129,8 @@
       this.cancelTimer();
       this.env.abort?.();
       this.busy = false;
+      this.collectingSince = null;
+      this.lastDurationMs = null;
       this.closeSession();
       this.records.forEach((record) => { record.rateGap = true; record.rates = null; });
       if (clear) { this.names = []; this.records.clear(); }
@@ -118,6 +146,7 @@
           this.generation++;
           this.env.abort?.();
           this.busy = false;
+          this.collectingSince = null;
           this.closeSession();
           this.records.forEach((record) => { record.rateGap = true; record.rates = null; });
           this.status = "Waiting for the current switch action to finish…";
@@ -158,14 +187,16 @@
       if (!this.names.length || this.busy || !this.running && !manual) return;
       const context = this.env.context();
       if (this.key(context) !== this.targetKey || !context.connected) { this.stop(true); return; }
-      if (context.busy || context.hidden) {
-        this.status = context.hidden ? "Browser tab hidden — sampling suspended." : "Waiting for the current switch action to finish…";
+      if (context.busy) {
+        this.status = "Waiting for the current switch action to finish…";
         this.records.forEach((record) => { record.rateGap = true; record.rates = null; });
         this.notify(); this.schedule(); return;
       }
       const generation = this.generation;
       const began = this.env.now();
+      let collected = false;
       this.busy = true;
+      this.collectingSince = began;
       this.status = "Collecting live statistics…";
       this.notify();
       try {
@@ -190,9 +221,11 @@
           return;
         }
         const now = this.env.now();
+        this.lastDurationMs = payload.durationMs ?? now - began;
         const byName = new Map(payload.ports.map((sample) => [sample.name, sample]));
         this.names.forEach((name) => acceptSample(this.records.get(name), byName.get(name) || { error: "No sample returned for this port." }, now, this.intervalMs));
         const failed = [...this.records.values()].filter((record) => record.error).length;
+        collected = failed < this.names.length;
         this.status = `${this.running ? "Watching" : "One-time check complete"}: ${this.targetLabel}${failed ? ` · ${failed} port read${failed === 1 ? "" : "s"} unavailable` : ""}.`;
       } catch (error) {
         if (generation !== this.generation) return;
@@ -202,21 +235,22 @@
       } finally {
         if (generation === this.generation) {
           this.busy = false;
+          this.collectingSince = null;
           this.notify();
           const elapsed = this.env.now() - began;
-          this.schedule(elapsed >= this.intervalMs ? this.intervalMs : this.intervalMs - elapsed);
+          this.schedule(collected ? Math.max(250, this.intervalMs - elapsed) : this.intervalMs);
         }
       }
     }
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { counterDelta, acceptSample, freshRecord, bitRate, LiveWatchController };
+    module.exports = { counterDelta, acceptSample, freshRecord, bitRate, graphScale, graphSegments, PORT_COLORS, LiveWatchController };
     return;
   }
 
   const doc = root.document;
-  const controls = Object.fromEntries(["watchSelectedBtn", "watchPauseBtn", "watchCheckBtn", "watchResetBtn", "watchInterval", "watchPoe", "watchSelectionHint", "watchStatus", "watchPorts"]
+  const controls = Object.fromEntries(["watchSelectedBtn", "watchPauseBtn", "watchCheckBtn", "watchResetBtn", "watchInterval", "watchPoe", "watchSelectionHint", "watchStatus", "watchPorts", "watchGraph", "watchLegend", "watchOverview", "watchTiming"]
     .map((id) => [id, doc.getElementById(id)]));
   const cards = new Map();
   let abort = null;
@@ -229,9 +263,9 @@
     container.append(element("small", "", label), value);
     return { container, value };
   }
-  function createCard(name, open) {
-    const node = element("details", "watch-port"); node.open = open;
-    const summary = element("summary", "watch-port-summary");
+  function createCard(name) {
+    const node = element("section", "watch-port");
+    const summary = element("div", "watch-port-summary");
     const identity = element("span", "watch-port-identity");
     const link = element("span", "watch-link", "Waiting");
     const speed = element("small");
@@ -242,13 +276,6 @@
     const description = element("p", "muted");
     const freshness = element("p", "watch-freshness");
     const packets = element("p", "watch-packets");
-    const graphHeader = element("div", "watch-chart-heading");
-    const ceiling = element("span");
-    graphHeader.append(element("span", "watch-rx", "━ Receive"), element("span", "watch-tx", "━ Transmit"), ceiling);
-    const graph = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
-    graph.classList.add("watch-chart"); graph.setAttribute("viewBox", "0 0 720 150"); graph.setAttribute("role", "img");
-    graph.setAttribute("aria-label", `${name}: receive and transmit rates over the last 120 seconds`);
-    const axis = element("div", "watch-chart-axis"); axis.append(element("span", "", "120 seconds ago"), element("span", "", "Now"));
     const errors = element("details", "watch-section");
     const errorsSummary = element("summary", "", "Errors & link changes");
     const errorValues = element("dl", "watch-error-values");
@@ -262,43 +289,61 @@
     poe.append(element("summary", "", "PoE"), poeText);
     const learned = element("details", "watch-section"); const learnedText = element("p");
     learned.append(element("summary", "", "Learned device details"), learnedText);
-    body.append(description, freshness, packets, graphHeader, graph, axis, errors, poe, learned);
+    const details = element("div", "watch-port-details"); details.append(errors, poe, learned);
+    body.append(description, freshness, packets, details);
     node.append(summary, body); controls.watchPorts.appendChild(node);
-    return { node, link, speed, rx: rx.value, tx: tx.value, description, freshness, packets, graph, ceiling,
+    return { node, link, speed, rx: rx.value, tx: tx.value, description, freshness, packets,
       errorsSummary, errorFields, flap, events, poeText, learnedText };
   }
-  function drawGraph(card, record, now) {
-    const points = record.points.filter((point) => point.time >= now - HISTORY_MS);
-    const max = Math.max(1, ...points.flatMap((point) => [point.rx || 0, point.tx || 0]));
-    card.ceiling.textContent = `Scale 0–${bitRate(max)}`;
-    card.graph.replaceChildren();
-    [0, 75, 150].forEach((y) => {
-      const line = doc.createElementNS("http://www.w3.org/2000/svg", "line");
-      line.setAttribute("x1", "0"); line.setAttribute("x2", "720"); line.setAttribute("y1", String(y)); line.setAttribute("y2", String(y));
-      line.setAttribute("class", "watch-chart-grid"); card.graph.appendChild(line);
+  function drawGraph(controller, context, now) {
+    const graph = controls.watchGraph;
+    const scales = graphScale(controller.records, now);
+    const labels = new Map(controller.names.map((name) => {
+      const sample = controller.records.get(name).latest;
+      const inventory = context.ports.find((port) => port.name === name);
+      const description = (sample?.description ?? inventory?.currentDescription ?? "").trim();
+      return [name, { description, title: description ? `${description} (${name})` : name }];
+    }));
+    graph.replaceChildren();
+    const svg = (tag, attrs, text = "") => {
+      const node = doc.createElementNS("http://www.w3.org/2000/svg", tag);
+      Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+      node.textContent = text; graph.appendChild(node); return node;
+    };
+    [1, 0.5, 0, -0.5, -1].forEach((fraction) => {
+      const y = 164 - fraction * 132;
+      svg("line", { x1: 94, x2: 944, y1: y, y2: y, class: fraction ? "watch-chart-grid" : "watch-chart-zero" });
+      svg("text", { x: 84, y: y + 4, "text-anchor": "end", class: "watch-chart-label" },
+        fraction ? `${fraction > 0 ? "+" : "−"}${bitRate(Math.abs(fraction) * scales[fraction > 0 ? "tx" : "rx"])}` : "0 b/s");
     });
-    ["rx", "tx"].forEach((key) => {
-      let segment = [];
-      const flush = () => {
-        if (segment.length) {
-          const path = doc.createElementNS("http://www.w3.org/2000/svg", "polyline");
-          path.setAttribute("points", segment.join(" ")); path.setAttribute("class", `watch-line watch-${key}`);
-          card.graph.appendChild(path);
+    svg("text", { x: 94, y: 17, class: "watch-chart-label" }, `TRANSMIT ↑ · 0–${bitRate(scales.tx)}`);
+    svg("text", { x: 94, y: 318, class: "watch-chart-label" }, `RECEIVE ↓ · 0–${bitRate(scales.rx)}`);
+    [120, 90, 60, 30, 0].forEach((seconds) => {
+      const x = 944 - seconds / 120 * 850;
+      svg("text", { x, y: 340, "text-anchor": seconds === 120 ? "start" : seconds === 0 ? "end" : "middle", class: "watch-chart-label" }, seconds ? `−${seconds}s` : "Now");
+    });
+    controller.names.forEach((name, index) => {
+      const record = controller.records.get(name);
+      ["tx", "rx"].forEach((key) => {
+        graphSegments(record.points, key, now, scales[key]).forEach((segment) => {
+          const attrs = { class: `watch-line watch-direction-${key}`, style: `color: ${PORT_COLORS[index]}` };
+          const path = svg("polyline", { ...attrs, points: segment.join(" ") });
+          const title = doc.createElementNS("http://www.w3.org/2000/svg", "title");
+          title.textContent = `${labels.get(name).title} ${key === "tx" ? "transmit" : "receive"}`; path.appendChild(title);
           if (segment.length === 1) {
-            const [x, y] = segment[0].split(",");
-            const dot = doc.createElementNS("http://www.w3.org/2000/svg", "circle");
-            dot.setAttribute("cx", x); dot.setAttribute("cy", y); dot.setAttribute("r", "3");
-            dot.setAttribute("class", `watch-dot watch-${key}`); card.graph.appendChild(dot);
+            const [cx, cy] = segment[0].split(",");
+            svg("circle", { cx, cy, r: 3, class: "watch-dot", style: attrs.style });
           }
-        }
-        segment = [];
-      };
-      points.forEach((point) => {
-        if (point[key] === null) { flush(); return; }
-        segment.push(`${Math.max(0, (point.time - now + HISTORY_MS) / HISTORY_MS * 720).toFixed(2)},${(145 - point[key] / max * 140).toFixed(2)}`);
+        });
       });
-      flush();
     });
+    controls.watchLegend.replaceChildren(...controller.names.map((name, index) => {
+      const label = element("span", "watch-port-key");
+      label.append(element("span", "watch-port-key-name", name));
+      if (labels.get(name).description) label.append(element("span", "watch-port-key-description", labels.get(name).description));
+      label.setAttribute("style", `--port-color: ${PORT_COLORS[index]}`);
+      return label;
+    }));
   }
   function render(controller) {
     const context = root.getLiveWatchContext();
@@ -312,16 +357,22 @@
     controls.watchResetBtn.disabled = !controller.names.length || controller.busy;
     [...cards].forEach(([name, card]) => { if (!controller.records.has(name)) { card.node.remove(); cards.delete(name); } });
     const now = Date.now();
+    controls.watchOverview.hidden = !controller.names.length;
+    const elapsed = controller.collectingSince === null ? null : (now - controller.collectingSince) / 1000;
+    controls.watchTiming.textContent = controller.busy && elapsed !== null
+      ? `Collecting · ${Math.floor(elapsed)}s elapsed${elapsed >= controller.intervalMs / 1000 ? " · Switch read is taking longer than the refresh interval" : ""}`
+      : controller.lastDurationMs === null ? "" : `Last collection: ${(controller.lastDurationMs / 1000).toFixed(1)}s · Requested interval: ${controller.intervalMs / 1000}s`;
     controller.names.forEach((name, index) => {
-      if (!cards.has(name)) cards.set(name, createCard(name, index < 2));
+      if (!cards.has(name)) cards.set(name, createCard(name));
       const card = cards.get(name); const record = controller.records.get(name); const sample = record.latest;
+      card.node.setAttribute("style", `--port-color: ${PORT_COLORS[index]}`);
       const inventory = context.ports.find((port) => port.name === name);
       const age = record.receivedAt === null ? null : (now - record.receivedAt) / 1000;
       const stale = age === null || age > Math.max(12, controller.intervalMs / 1000 * 3) || !!record.error;
       card.node.classList.toggle("watch-stale", stale || !controller.running);
       card.link.textContent = sample ? `${sample.admin === "down" ? "Disabled" : sample.oper === "up" ? "Link up" : "Link down"}${stale || !controller.running ? " · last sample" : ""}` : "Waiting for sample";
       card.link.className = `watch-link ${sample?.oper === "up" && sample?.admin === "up" ? "up" : "down"}`;
-      card.speed.textContent = sample ? `Reported speed: ${sample.speed}` : "Reported speed: —";
+      card.speed.textContent = sample ? `Reported speed: ${sample.speed}${Number.isFinite(sample.readDurationMs) ? ` · Read: ${(sample.readDurationMs / 1000).toFixed(1)}s` : ""}` : "Reported speed: —";
       const currentRates = stale ? null : record.rates;
       card.rx.textContent = bitRate(currentRates?.rxBytes); card.tx.textContent = bitRate(currentRates?.txBytes);
       card.description.textContent = sample?.description || inventory?.currentDescription || "No description";
@@ -344,8 +395,8 @@
       const evidence = inventory?.learnedMacs?.map((mac) => `${mac.mac}${mac.manufacturer ? ` (${mac.manufacturer})` : ""}`).join(", ");
       const neighbor = inventory?.lldpNeighbor;
       card.learnedText.textContent = `Inventory evidence${context.inventoryAt ? ` collected ${new Date(context.inventoryAt).toLocaleTimeString()}` : ""}. MACs: ${evidence || "None learned"}. LLDP: ${neighbor?.systemName || neighbor?.chassisId || "None learned"}. Learned records can remain after a device disconnects; refresh inventory for a new pull.`;
-      drawGraph(card, record, now);
     });
+    drawGraph(controller, context, now);
   }
   const controller = new LiveWatchController({
     context: () => ({ ...root.getLiveWatchContext(), hidden: doc.hidden }), now: () => Date.now(), render,
@@ -375,7 +426,6 @@
   controls.watchInterval.addEventListener("change", () => { controller.intervalMs = Number(controls.watchInterval.value) * 1000; controller.schedule(); });
   controls.watchPoe.addEventListener("change", () => { controller.includePoe = controls.watchPoe.checked; controller.notify(); });
   doc.addEventListener("visibilitychange", () => {
-    controller.records.forEach((record) => { record.rateGap = true; });
     if (!doc.hidden && controller.running) void controller.poll();
   });
   root.addEventListener("pagehide", () => {

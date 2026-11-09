@@ -152,7 +152,7 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 API_VERSION = 24
 WATCH_SESSIONS = WatchSessions()
 atexit.register(WATCH_SESSIONS.close)
@@ -1324,10 +1324,38 @@ def _cli_failure_message(output: str, error: str, fallback: str) -> str:
 
 
 def _watch_read(client, command):
-    _, stdout, stderr = client.exec_command(f"cli -c {shlex.quote(command)}", timeout=6)
-    output = stdout.read().decode("utf-8", errors="replace")
-    error = stderr.read().decode("utf-8", errors="replace")
-    status = stdout.channel.recv_exit_status()
+    # Paramiko's socket timeout alone does not bound the exec acknowledgement or
+    # a stream that keeps trickling data. Close this watch's dedicated transport
+    # on deadline so neither case can hold up every watched port indefinitely.
+    expired = threading.Event()
+    streams = []
+
+    def expire():
+        expired.set()
+        client.close()
+
+    deadline = threading.Timer(6, expire)
+    deadline.daemon = True
+    deadline.start()
+    try:
+        streams = client.exec_command(f"cli -c {shlex.quote(command)}", timeout=6)
+        _, stdout, stderr = streams
+        output = stdout.read().decode("utf-8", errors="replace")
+        error = stderr.read().decode("utf-8", errors="replace")
+        status = stdout.channel.recv_exit_status()
+        if expired.is_set():
+            raise TimeoutError(f"Switch read exceeded 6 seconds: {command}")
+    except (paramiko.SSHException, OSError) as exc:
+        if expired.is_set():
+            raise TimeoutError(f"Switch read exceeded 6 seconds: {command}") from exc
+        raise
+    finally:
+        deadline.cancel()
+        for stream in streams:
+            if stream is not None:
+                stream.close()
+        if streams:
+            streams[1].channel.close()
     if status != 0 or error.strip() or re.search(r"(?im)^\s*(?:error:|syntax error|unknown command|permission denied)", output):
         raise ValueError(_cli_failure_message(output, error, "The switch did not return interface statistics."))
     return output
@@ -1375,14 +1403,23 @@ def live_watch_sample() -> Any:
             _record_activity({"host": host, "device_name": _activity_clean(payload.get("deviceName"), payload),
                 "operation": "Live watch", "category": "monitor", "status": "started", "severity": "info",
                 "request_id": uuid.uuid4().hex, "message": "Read-only live watch started.", "details": {"ports": ports}})
-        for index, name in enumerate(ports):
+        offset = entry.next_port % len(ports)
+        ordered_ports = ports[offset:] + ports[:offset]
+        entry.next_port = 0
+        for index, name in enumerate(ordered_ports):
             try:
+                if time.monotonic() - started >= 12:
+                    entry.next_port = (offset + index) % len(ports)
+                    samples.extend({"name": remaining, "error": "Collection time budget reached; remaining reads will be prioritized next time."} for remaining in ordered_ports[index:])
+                    break
+                port_started = time.monotonic()
                 output = _watch_read(entry.client, f"show interfaces {name} extensive")
                 sample = {**parse_interface_sample(output, name), "sampledAt": utc_now(),
-                          "sampleTimeMs": time.monotonic() * 1000}
+                          "sampleTimeMs": time.monotonic() * 1000,
+                          "readDurationMs": round((time.monotonic() - port_started) * 1000)}
                 if payload.get("includePoe"):
                     cached = entry.optional.get(name)
-                    if cached is None or time.monotonic() - cached[0] >= 20:
+                    if (cached is None or time.monotonic() - cached[0] >= 20) and time.monotonic() - started < 12:
                         try:
                             if name.startswith(("ae", "reth")):
                                 raise ValueError("PoE is not applicable to this interface type.")
@@ -1396,16 +1433,17 @@ def live_watch_sample() -> Any:
                             WATCH_SESSIONS.drop(entry.token)
                         poe["sampledAt"] = utc_now()
                         entry.optional[name] = (time.monotonic(), poe)
-                    sample["poe"] = entry.optional[name][1]
+                    sample["poe"] = entry.optional.get(name, (None, {"available": False,
+                        "error": "PoE read deferred because the collection time budget was reached."}))[1]
                 samples.append(sample)
                 if fatal:
-                    samples.extend({"name": remaining, "error": "Not collected after SSH failure."} for remaining in ports[index + 1:])
+                    samples.extend({"name": remaining, "error": "Not collected after SSH failure."} for remaining in ordered_ports[index + 1:])
                     break
             except ValueError as exc:
                 cancelled = cancelled or not WATCH_SESSIONS.active(entry)
                 samples.append({"name": name, "error": str(exc)})
             except (paramiko.SSHException, OSError) as exc:
-                samples.extend({"name": remaining, "error": f"Statistics unavailable after SSH failure: {exc}"} for remaining in ports[index:])
+                samples.extend({"name": remaining, "error": f"Statistics unavailable after SSH failure: {exc}"} for remaining in ordered_ports[index:])
                 fatal = True
                 cancelled = not WATCH_SESSIONS.active(entry)
                 WATCH_SESSIONS.drop(entry.token)
@@ -1414,6 +1452,8 @@ def live_watch_sample() -> Any:
         if errors and not cancelled:
             _watch_warning(host, errors[0], payload)
         ok = any(not sample.get("error") for sample in samples)
+        by_name = {sample["name"]: sample for sample in samples}
+        samples = [by_name[name] for name in ports]
         return jsonify({"ok": ok, "host": host, "sessionId": "" if fatal else entry.token, "ports": samples,
             "collectedAt": utc_now(), "durationMs": round((time.monotonic() - started) * 1000),
             "error": "" if ok else "No watched-port statistics could be collected."}), 200 if ok else 502

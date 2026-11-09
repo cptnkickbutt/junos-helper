@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { counterDelta, acceptSample, freshRecord, LiveWatchController } = require("../live-watch.js");
+const { counterDelta, acceptSample, freshRecord, graphScale, graphSegments, PORT_COLORS, LiveWatchController } = require("../live-watch.js");
 
 function sample(time = 100000, updates = {}) {
   const { counters, ...rest } = updates;
@@ -17,17 +17,63 @@ function harness() {
   let now = 100000;
   let timerId = 0;
   const timers = new Map();
+  const delays = [];
   const context = { connection: { host: "switch", username: "netops", password: "secret", deviceName: "Access" },
     ports: [{ name: "ge-0/0/1" }, { name: "xe-0/0/48" }], selected: new Set(["ge-0/0/1"]), connected: true, busy: false, hidden: false };
   const calls = [];
   const env = { context: () => context, now: () => now, render() {}, abort() {},
-    schedule: (fn) => { timers.set(++timerId, fn); return timerId; }, cancel: (id) => timers.delete(id),
+    schedule: (fn, delay) => { delays.push(delay); timers.set(++timerId, fn); return timerId; }, cancel: (id) => timers.delete(id),
     request: async (url, payload) => {
       calls.push({ url, payload });
       return url.endsWith("/sample") ? { ok: true, sessionId: "session-a", ports: payload.ports.map((name) => sample(now, { name })) } : { ok: true };
     } };
-  return { env, context, calls, timers, controller: new LiveWatchController(env), advance: (ms) => { now += ms; } };
+  return { env, context, calls, timers, delays, controller: new LiveWatchController(env), advance: (ms) => { now += ms; } };
 }
+
+test("shared graph scales RX and TX independently across all ports, preserving direction and gaps", () => {
+  const points = [{ time: 95000, rx: 1e9, tx: 1e9 }, { time: 100000, rx: 1000, tx: 2000000 },
+    { time: 105000, rx: null, tx: null }, { time: 110000, rx: 4000, tx: 3000000 }];
+  const now = 220000;
+  const records = new Map([["one", { points }], ["two", { points: [{ time: now, rx: 9000, tx: 100 }] }]]);
+  const scales = graphScale(records, now);
+  assert.deepEqual(scales, { rx: 10000, tx: 5000000 });
+  for (const key of ["tx", "rx"]) {
+    const segments = graphSegments(points, key, now, scales[key]);
+    assert.equal(segments.length, 2);
+    assert.ok(segments.every((segment) => segment.length === 1));
+    for (const segment of segments) {
+      const [x, y] = segment[0].split(",").map(Number);
+      assert.ok(x >= 94 && x <= 944);
+      assert.ok(key === "tx" ? y < 164 : y > 164);
+    }
+    assert.equal(Number(segments[0][0].split(",")[1]), key === "tx" ? 111.2 : 177.2);
+  }
+  assert.equal(new Set(PORT_COLORS).size, 8);
+  assert.deepEqual(graphScale(new Map(), now), { rx: 1, tx: 1 });
+  assert.deepEqual(graphScale(new Map([["one", { points: [{ time: now, rx: null, tx: 900 }] }]]), now), { rx: 1, tx: 1000 });
+});
+
+test("collection continues beyond a minute while hidden, with no extra full interval after a slow success", async () => {
+  const h = harness();
+  await h.controller.start();
+  h.context.hidden = true;
+  for (let count = 0; count < 18; count++) {
+    h.advance(5000);
+    await h.controller.poll();
+  }
+  assert.equal(h.calls.filter((call) => call.url.endsWith("/sample")).length, 19);
+  h.env.request = async () => {
+    h.advance(9000);
+    return { sessionId: "session-a", durationMs: 9000, ports: [sample(199000)] };
+  };
+  await h.controller.poll();
+  assert.equal(h.controller.lastDurationMs, 9000);
+  assert.equal(h.controller.collectingSince, null);
+  assert.equal(h.delays.at(-1), 250);
+  h.env.request = async () => { throw new Error("timeout"); };
+  await h.controller.poll();
+  assert.equal(h.delays.at(-1), 5000);
+});
 
 test("counter differences retain 64-bit precision and compute measured rates", () => {
   assert.equal(counterDelta("9007199254740994", "9007199254740993"), 1);
@@ -141,7 +187,7 @@ test("pause, manual check, reset view, and resume do not clear switch counters",
   assert.ok(h.calls.every((call) => !JSON.stringify(call.payload).includes("clear interfaces")));
 });
 
-test("busy switch actions and hidden browser tabs suspend sampling", async () => {
+test("busy switch actions suspend sampling; hidden browser tabs continue sampling", async () => {
   const h = harness();
   await h.controller.start();
   h.context.busy = true;
@@ -152,8 +198,8 @@ test("busy switch actions and hidden browser tabs suspend sampling", async () =>
   h.context.busy = false;
   h.context.hidden = true;
   await h.controller.poll();
-  assert.equal(h.calls.length, count);
-  assert.match(h.controller.status, /hidden/);
+  assert.equal(h.calls.length, count + 1);
+  assert.match(h.controller.status, /Watching/);
   h.context.hidden = false;
   h.context.connection.host = "another-switch";
   h.controller.contextChanged();
@@ -225,18 +271,23 @@ test("the browser module wires controls and displays samples without HTML inject
     remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); },
     set innerHTML(value) { assert.fail("Switch data must use textContent"); }
   });
-  const ids = ["watchSelectedBtn", "watchPauseBtn", "watchCheckBtn", "watchResetBtn", "watchInterval", "watchPoe", "watchSelectionHint", "watchStatus", "watchPorts"];
+  const ids = ["watchSelectedBtn", "watchPauseBtn", "watchCheckBtn", "watchResetBtn", "watchInterval", "watchPoe", "watchSelectionHint", "watchStatus", "watchPorts", "watchGraph", "watchLegend", "watchOverview", "watchTiming"];
   const elements = Object.fromEntries(ids.map((id) => [id, makeElement()]));
   const h = harness();
+  h.context.ports = Array.from({ length: 8 }, (_, index) => ({ name: `ge-0/0/${index + 1}` }));
+  h.context.ports[1].currentDescription = "Old description";
+  h.context.ports[2].currentDescription = "Inventory device";
+  h.context.selected = new Set(h.context.ports.map((port) => port.name));
   let now = 100000;
   let bytes = 1000;
   const doc = { hidden: false, getElementById: (id) => elements[id], createElement: makeElement,
     createElementNS: (ns, tag) => makeElement(tag), addEventListener() {} };
   class Clock extends Date { static now() { return now; } }
   const root = { document: doc, getLiveWatchContext: () => h.context, setTimeout: () => 1, clearTimeout() {}, setInterval() {}, addEventListener() {},
-    fetch: async (url) => ({ ok: true, json: async () => url.endsWith("/stop") ? { ok: true } : { ok: true, sessionId: "session", ports: [sample(now, {
-      description: '<script>untrusted()</script>', counters: { rxBytes: String(bytes) }
-    })] } }) };
+    fetch: async (url) => ({ ok: true, json: async () => url.endsWith("/stop") ? { ok: true } : { ok: true, sessionId: "session", ports: h.context.ports.map(({ name }, index) => sample(now, {
+      name, description: index === 0 ? '<script>untrusted()</script>' : index === 1 ? "" : index === 2 ? undefined : "Example device",
+      counters: { rxBytes: String(bytes * (index + 1)) }
+    })) } }) };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "live-watch.js"), "utf8"), { window: root, AbortController, Date: Clock });
   await elements.watchSelectedBtn.handlers.click();
   const card = elements.watchPorts.children[0];
@@ -244,6 +295,26 @@ test("the browser module wires controls and displays samples without HTML inject
   now += 5000; bytes += 1000;
   await elements.watchCheckBtn.handlers.click();
   assert.equal(card.children[0].children[1].children[1].textContent, "1.6 Kb/s");
+  assert.equal(elements.watchPorts.children.length, 8);
+  assert.equal(elements.watchLegend.children.length, 8);
+  assert.equal(elements.watchLegend.children[0].children[0].textContent, "ge-0/0/1");
+  assert.equal(elements.watchLegend.children[0].children[1].textContent, '<script>untrusted()</script>');
+  assert.equal(elements.watchLegend.children[1].children[0].textContent, "ge-0/0/2");
+  assert.equal(elements.watchLegend.children[1].children.length, 1);
+  assert.equal(elements.watchLegend.children[2].children[1].textContent, "Inventory device");
+  assert.equal(elements.watchLegend.children[3].children[1].textContent, "Example device");
+  assert.equal(elements.watchGraph.children.filter((child) => child.tag === "polyline").length, 16);
+  assert.equal(elements.watchGraph.children.find((child) => child.tag === "polyline").children[0].textContent,
+    '<script>untrusted()</script> (ge-0/0/1) transmit');
+  assert.ok(elements.watchGraph.children.some((child) => child.textContent === "0 b/s"));
+  assert.ok(elements.watchGraph.children.some((child) => child.textContent === "+1 b/s"));
+  assert.ok(elements.watchGraph.children.some((child) => child.textContent === "−20 Kb/s"));
+  assert.ok(elements.watchGraph.children.some((child) => child.textContent === "TRANSMIT ↑ · 0–1 b/s"));
+  assert.ok(elements.watchGraph.children.some((child) => child.textContent === "RECEIVE ↓ · 0–20 Kb/s"));
+  elements.watchPorts.children.forEach((row, index) => {
+    assert.equal(row.attrs.style, elements.watchLegend.children[index].attrs.style);
+    assert.ok(row.attrs.style.includes(PORT_COLORS[index]));
+  });
   assert.match(elements.watchStatus.textContent, /Watching/);
   assert.equal(elements.watchPauseBtn.textContent, "Pause");
   elements.watchPauseBtn.handlers.click();

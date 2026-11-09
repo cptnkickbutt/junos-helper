@@ -33,6 +33,7 @@ const state = {
   savedDeviceId: null,
   visibleSavedDeviceGroups: null,
   connectionInProgress: false,
+  inventoryRefreshInProgress: false,
   deploymentInProgress: false,
   bounceInProgress: false,
   refreshTimer: null,
@@ -560,7 +561,7 @@ function getLiveWatchContext() {
   const connection = connectionPayload();
   return { connection, ports: state.ports, selected: new Set(state.selected),
     connected: state.protectionHost === connection.host.toLowerCase() && state.ports.length > 0,
-    busy: state.connectionInProgress || state.deploymentInProgress || state.bounceInProgress,
+    busy: (state.connectionInProgress && !state.inventoryRefreshInProgress) || state.deploymentInProgress || state.bounceInProgress,
     inventoryAt: state.deviceDataSnapshots?.get(connection.host.toLowerCase())?.collectedAt || null };
 }
 
@@ -1010,12 +1011,16 @@ async function connectToSwitch({ isRefresh = false } = {}) {
   const previousSelected = new Set(state.selected);
   const previousConfigManual = state.configManual;
   state.connectionInProgress = true;
+  // Read-only rediscovery of the connected target uses its own SSH connection.
+  // Keep configuration controls busy without interrupting the live-watch read.
+  state.inventoryRefreshInProgress = isRefresh && state.protectionHost === hostInput.value.trim().toLowerCase();
   connectBtn.disabled = true;
   refreshNowBtn.disabled = true;
   quickConnectBtn.disabled = true;
   connectionStatus.textContent = "Connecting…";
   connectionStatus.className = "status-pill";
   connectionStatus.textContent = isRefresh ? "Refreshing switch data…" : "Connecting…";
+  window.liveWatch?.onContextChange();
 
   try {
     const response = await fetch("/api/connect", {
@@ -1133,6 +1138,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
     connectionStatus.className = "status-pill error";
   } finally {
     state.connectionInProgress = false;
+    state.inventoryRefreshInProgress = false;
     connectBtn.disabled = false;
     refreshNowBtn.disabled = !state.ports.length;
     quickConnectBtn.disabled = !savedDeviceInput.value;

@@ -128,6 +128,8 @@ class LiveWatchApiTests(unittest.TestCase):
         body = response.get_json()
         self.assertEqual([item["name"] for item in body["ports"]], self.payload["ports"])
         self.assertIsInstance(body["ports"][0]["sampleTimeMs"], float)
+        self.assertIsInstance(body["ports"][0]["readDurationMs"], int)
+        self.assertIsInstance(body["durationMs"], int)
         self.assertEqual(body["ports"][0]["counters"]["rxBytes"], "9007199254740995")
         again = self.client.post("/api/live-watch/sample", json={**self.payload, "sessionId": body["sessionId"]})
         self.assertEqual(again.get_json()["sessionId"], body["sessionId"])
@@ -211,6 +213,57 @@ class LiveWatchApiTests(unittest.TestCase):
         client.exec_command.return_value = (None, stdout, stderr)
         self.assertIn("BPDU Error: None", REAL_WATCH_READ(client, "show interfaces ge-0/0/1 extensive"))
         client.exec_command.assert_called_once_with("cli -c 'show interfaces ge-0/0/1 extensive'", timeout=6)
+        stdout.close.assert_called_once()
+        stderr.close.assert_called_once()
+        stdout.channel.close.assert_called_once()
         stdout.read.return_value = b"error: interface not found"
         with self.assertRaisesRegex(ValueError, "interface not found"):
             REAL_WATCH_READ(client, "show interfaces ge-0/0/1 extensive")
+
+    def test_read_deadline_closes_transport_during_exec_acknowledgement(self):
+        client = Mock()
+        with patch("app.threading.Timer") as timer:
+            def blocked_exec(*args, **kwargs):
+                timer.call_args.args[1]()
+                raise OSError("transport closed")
+            client.exec_command.side_effect = blocked_exec
+            with self.assertRaisesRegex(TimeoutError, "exceeded 6 seconds"):
+                REAL_WATCH_READ(client, "show interfaces ge-0/0/1 extensive")
+            client.close.assert_called_once()
+            timer.return_value.start.assert_called_once()
+            timer.return_value.cancel.assert_called_once()
+
+    def test_read_deadline_rejects_truncated_output_even_with_zero_exit_status(self):
+        client = Mock()
+        stdin, stdout, stderr = Mock(), Mock(), Mock()
+        client.exec_command.return_value = (stdin, stdout, stderr)
+        stderr.read.return_value = b""
+        stdout.channel.recv_exit_status.return_value = 0
+        with patch("app.threading.Timer") as timer:
+            def slow_output():
+                timer.call_args.args[1]()
+                return interface_output().encode()
+            stdout.read.side_effect = slow_output
+            with self.assertRaisesRegex(TimeoutError, "exceeded 6 seconds"):
+                REAL_WATCH_READ(client, "show interfaces ge-0/0/1 extensive")
+        for stream in (stdin, stdout, stderr):
+            stream.close.assert_called_once()
+
+    def test_batch_budget_preserves_collected_port_and_marks_remaining_unavailable(self):
+        clock = [100.0]
+        def slow_read(client, command):
+            clock[0] += 4
+            return interface_output(command.split()[2])
+        self.read.side_effect = slow_read
+        ports = [f"ge-0/0/{number}" for number in range(1, 5)]
+        with patch("app.time.monotonic", side_effect=lambda: clock[0]):
+            body = self.client.post("/api/live-watch/sample", json={**self.payload, "ports": ports}).get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["ports"][0]["readDurationMs"], 4000)
+        self.assertIn("time budget", body["ports"][3]["error"])
+        self.assertEqual(self.read.call_count, 3)
+        with patch("app.time.monotonic", side_effect=lambda: clock[0]):
+            again = self.client.post("/api/live-watch/sample", json={**self.payload, "ports": ports, "sessionId": body["sessionId"]}).get_json()
+        self.assertEqual([sample["name"] for sample in again["ports"]], ports)
+        self.assertNotIn("error", again["ports"][3])
+        self.assertEqual(self.read.call_args_list[3].args[1], "show interfaces ge-0/0/4 extensive")

@@ -104,6 +104,7 @@ class WatchSession:
     last_used: float = field(default_factory=time.monotonic)
     lock: threading.Lock = field(default_factory=threading.Lock)
     optional: dict = field(default_factory=dict)
+    next_port: int = 0
 
 
 class WatchSessions:
