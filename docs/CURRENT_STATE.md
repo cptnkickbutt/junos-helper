@@ -7,9 +7,8 @@ Last reviewed: 2026-11-09
 
 ## Current focus
 
-The user requested a commit, push, and updated Windows EXE. v1.7 has been built
-and verified locally. Commit/tag/push and GitHub publication are the remaining
-release steps at this checkpoint; update this file after those operations.
+The requested commit, push, and updated Windows EXE are complete. v1.7 has been
+built, verified, committed, tagged, pushed, and published on GitHub.
 
 v1.7 contains the previously uncommitted Live watch improvements, tests, usage
 docs, and new continuity/server-planning docs. No long-term recorder,
@@ -18,11 +17,16 @@ authentication, Proxmox provisioning, or Linux deployment was implemented.
 ## Release status
 
 - Branch: `main`; remote: `https://github.com/cptnkickbutt/junos-helper.git`.
-- Previous published baseline: **v1.6**, 2026-10-27, commit `96d0874`.
-- Prepared release: **v1.7**, 2026-11-09. App version `1.7`, API version `24`
+- Latest published release: **v1.7**, 2026-11-09, commit `bc4f7ae`.
+  Annotated tag `v1.7` and release commit were pushed to `origin`.
+- App version `1.7`, API version `24`
   (browser requires the same), Windows file/product version `1.7.0.0`.
 - Fresh standard build: `dist/JunosHelper.exe`; distribution copy:
   `dist/JunosHelper-v1.7.exe` (20,167,848 bytes). No saved profiles embedded.
+- [Release and download](https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.7).
+  Published asset is uploaded, non-draft, and non-prerelease. GitHub's asset
+  SHA-256 matches the local EXE:
+  `e7154641452901709cbd16e8d37780fbfceedfdeddb3ff16b2fded9ba1e544b9`.
 - Existing coworker/seeded EXEs are separate ignored artifacts and were not rebuilt.
 
 ## Implemented behavior
@@ -116,6 +120,8 @@ Completed in this 2026-11-09 release session:
   workspace-local activity path. `/api/health` reported v1.7/API 24/packaged;
   all four served assets matched source. Authorized local shutdown returned
   success and the launcher exited cleanly.
+- `git diff --check` and staged whitespace checks passed. Release and asset
+  publication were verified through GitHub CLI; uploaded size/digest match local.
 
 No real-switch sampling/configuration or Linux deployment was tested. No fresh
 visual browser inspection was performed. Earlier-session visual validation was
@@ -144,10 +150,10 @@ synthetic and is not hardware evidence.
 
 ## Exact next step
 
-Finish the requested v1.7 commit/tag/push/publication and record verified outcomes
-here. The user is arranging the server separately; a GitHub push does not deploy
-it. After this release, follow user feedback or server setup results. Do not
-implement the proposed recorder/authentication without a new request.
+Use the published v1.7 EXE after stopping the old packaged app. The user is
+arranging the server separately; a GitHub push does not deploy it. Follow user
+feedback or server setup results. Do not implement the proposed
+recorder/authentication without a new request.
 
 ## Source documents and code map
 
