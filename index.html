@@ -212,9 +212,11 @@
                 </section>
 
                 <section class="feature-focus-card service-builder" aria-labelledby="qinqBuilderTitle">
-                  <h4 id="qinqBuilderTitle">New Q-in-Q service pair</h4>
-                  <p>Push the outer service tag at the customer port and carry the outer/inner pair on the uplink.</p>
+                  <h4 id="qinqBuilderTitle">Q-in-Q services</h4>
+                  <p>Add a customer port to a discovered group and shared service, or build a standalone service pair. Review the commands before pushing.</p>
                   <div class="service-controls qinq-controls">
+                    <label>Setup<select id="qinqMode"><option value="group">Existing group / shared uplink</option><option value="standalone">New standalone pair</option></select></label>
+                    <label id="qinqTemplateLabel">Copy service layout from<select id="qinqTemplate"><option value="">Connect to discover group services</option></select></label>
                     <label>Customer-facing port<select id="qinqCustomerPort"><option value="">Connect to discover ports</option></select></label>
                     <label>Uplink port<select id="qinqUplinkPort"><option value="">Connect to discover ports</option></select></label>
                     <label>Bridge VLAN name<input id="qinqServiceName" placeholder="CUSTOMER_QINQ" /></label>

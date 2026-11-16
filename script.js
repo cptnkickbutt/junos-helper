@@ -39,7 +39,7 @@ const state = {
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 24;
+const REQUIRED_API_VERSION = 25;
 const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
 const BOUNCE_INTERVAL_STORAGE_KEY = "junosHelper.bounceInterval";
 const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
@@ -138,6 +138,8 @@ const irbUnitInput = document.getElementById("irbUnit");
 const irbAddressInput = document.getElementById("irbAddress");
 const irbSummary = document.getElementById("irbSummary");
 const qinqCustomerPortInput = document.getElementById("qinqCustomerPort");
+const qinqModeInput = document.getElementById("qinqMode");
+const qinqTemplateInput = document.getElementById("qinqTemplate");
 const qinqUplinkPortInput = document.getElementById("qinqUplinkPort");
 const qinqServiceNameInput = document.getElementById("qinqServiceName");
 const qinqOuterTagInput = document.getElementById("qinqOuterTag");
@@ -1049,7 +1051,7 @@ async function connectToSwitch({ isRefresh = false } = {}) {
             selected: false,
             admin: detail.admin || "unknown",
             oper: detail.oper || "unknown",
-            configured: currentVlans.length > 0,
+            configured: !!detail.configured || currentVlans.length > 0,
             currentVlans,
             currentMode: detail.mode || configuration.mode || "unknown",
             currentNativeVlanId: detail.nativeVlanId || configuration.nativeVlanId || "",
@@ -1060,6 +1062,13 @@ async function connectToSwitch({ isRefresh = false } = {}) {
             learnedMacs: detail.learnedMacs || [],
             lldpNeighbor: detail.lldpNeighbor || null,
             currentSetLines: detail.setLines || configuration.setLines || [],
+            currentEffectiveSetLines: detail.effectiveSetLines || configuration.effectiveSetLines || detail.setLines || configuration.setLines || [],
+            currentGroups: detail.groups || configuration.groups || [],
+            currentGroupInterfacePatterns: detail.groupInterfacePatterns || configuration.groupInterfacePatterns || {},
+            currentUnits: detail.units || configuration.units || {},
+            currentEncapsulation: detail.encapsulation || configuration.encapsulation || "",
+            currentMtu: detail.mtu || configuration.mtu || "",
+            inheritanceResolved: !!(detail.inheritanceResolved || configuration.inheritanceResolved),
             modeKeyword: detail.modeKeyword || configuration.modeKeyword || "interface-mode"
           };
         });
@@ -1160,6 +1169,54 @@ function logicalServicesForPort(portName) {
   return services;
 }
 
+function portVlanPresentation(port) {
+  const vlans = [...(port.currentVlans || [])];
+  const qinq = [];
+  const units = port.currentUnits || {};
+  const labelTag = (tag, serviceName = "") => {
+    const vlan = state.vlans.find((entry) => entry.name === serviceName)
+      || state.vlans.find((entry) => String(entry.value) === String(tag));
+    return vlan ? `${vlan.name} (${tag})` : String(tag);
+  };
+  Object.entries(units).forEach(([number, unit]) => {
+    const service = state.bridgeServices.find((entry) => entry.interfaces.includes(`${port.name}.${number}`));
+    if (unit.inputVlanMap === "push" || unit.outerTag) {
+      const outerTags = new Set(unit.outerTag || unit.pushTag ? [unit.outerTag || unit.pushTag] : []);
+      if (service && !outerTags.size) service.interfaces.forEach((member) => {
+        const separator = member.lastIndexOf(".");
+        const peer = state.ports.find((entry) => entry.name === member.slice(0, separator));
+        const peerUnit = peer?.currentUnits?.[member.slice(separator + 1)];
+        if (peerUnit && peerUnit.inputVlanMap !== "push") {
+          (peerUnit.outerTag ? [peerUnit.outerTag] : peerUnit.vlanIds || []).forEach((tag) => outerTags.add(tag));
+        }
+      });
+      const inner = unit.innerTag || (unit.vlanIds || []).join(", ") || "unknown";
+      qinq.push(`${service?.name || "Q-in-Q"}: customer ${inner}; outer ${[...outerTags].join(", ") || "unknown"} (unit ${number})`);
+    } else if (service && service.interfaces.some((member) => {
+      const separator = member.lastIndexOf(".");
+      const peer = state.ports.find((entry) => entry.name === member.slice(0, separator));
+      return peer?.currentUnits?.[member.slice(separator + 1)]?.inputVlanMap === "push";
+    })) {
+      qinq.push(`${service.name}: shared uplink; outer ${(unit.vlanIds || []).join(", ") || "unknown"} (unit ${number})`);
+    } else {
+      (unit.vlanIds || []).forEach((tag) => {
+        const label = labelTag(tag, service?.name);
+        if (!vlans.includes(label) && !vlans.includes(service?.name) && !vlans.includes(tag)) vlans.push(label);
+      });
+    }
+  });
+  const bridged = Object.keys(units).some((unit) => unit !== "0");
+  const explicitMode = ["access", "trunk"].includes(port.currentMode) ? port.currentMode : "";
+  return {
+    mode: explicitMode ? `${explicitMode}${qinq.length ? " + Q-in-Q" : ""}`
+      : qinq.length ? "Q-in-Q / VLAN units" : bridged ? "VLAN units" : "not set",
+    vlans: vlans.join(", ") || "None",
+    qinq: qinq.join("; ") || "None",
+    groups: (port.currentGroups || []).join(", ") || "None",
+    inheritance: port.currentGroups?.length ? (port.inheritanceResolved ? "Resolved by switch" : "Unavailable; group settings may be missing") : ""
+  };
+}
+
 function negotiatedSpeedClass(speed) {
   const match = String(speed || "").trim().match(/^(\d+(?:\.\d+)?)\s*(Mbps|Gbps|Tbps)$/i);
   if (!match) return "speed-other";
@@ -1194,8 +1251,9 @@ function render(updateConfiguration = true) {
     button.type = "button";
     const description = port.currentDescription || "";
     const displayDescription = description.replace(/^\d{1,3}_/, "");
-    const mode = ["access", "trunk"].includes(port.currentMode) ? port.currentMode : "not set";
-    const vlanSummary = port.currentVlans?.length ? port.currentVlans.join(", ") : "None";
+    const presentation = portVlanPresentation(port);
+    const mode = presentation.mode;
+    const vlanSummary = presentation.vlans;
     const tooltipId = `port-tooltip-${port.index}`;
     button.setAttribute("aria-describedby", tooltipId);
     const label = document.createElement("div");
@@ -1239,6 +1297,8 @@ function render(updateConfiguration = true) {
       ["Mode", mode],
       ["Native VLAN", port.currentNativeVlanId || "None"],
       ["VLANs", vlanSummary],
+      ["Q-in-Q", presentation.qinq],
+      ["Groups", presentation.groups],
       ["Logical services", logicalServices.length ? logicalServices.join(", ") : "None"],
       ["MACs", String(learnedMacCount)],
       ["Neighbor", neighbor.systemName || "None learned"],
@@ -1257,6 +1317,9 @@ function render(updateConfiguration = true) {
       ["Mode", mode],
       ["Native VLAN", port.currentNativeVlanId || "None"],
       ["VLANs", vlanSummary],
+      ["Q-in-Q", presentation.qinq],
+      ["Groups", presentation.groups],
+      ["Inheritance", presentation.inheritance],
       ["Logical services", logicalServices.length ? logicalServices.join(", ") : "None"],
       ["Admin / link", `${port.currentDisabled ? "disabled" : (port.admin || "unknown")} / ${oper}`],
       ["Negotiated rate", port.negotiatedSpeed || "Unknown"],
@@ -1418,7 +1481,7 @@ function quickPortExclusion(port, topology = buildMacTopology()) {
   if (protection) return protection;
   if (port.currentMode !== "access") return "Requires explicit access mode";
   if ((port.currentSetLines || []).some((line) =>
-    /\b(?:native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b/.test(line)
+    /\b(?:apply-groups|native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b/.test(line)
     || /\bunit (?!0\b)\d+\b/.test(line)
     || /\bfamily (?!ethernet-switching\b)\S+/.test(line))) return "Logical service configuration";
   if (state.bridgeServices.some((service) => service.interfaces.some((name) => name.split(".")[0] === port.name))) return "Bridge service member";
@@ -2496,6 +2559,7 @@ function populateServiceChoices() {
     logicalServiceSourceInput.value = previousServiceSource;
   }
   updateIrbSummary();
+  populateQinqTemplates();
   updateQinqSummary();
   updateLogicalServiceMoveSummary();
 }
@@ -2525,11 +2589,15 @@ function logicalServiceMoveError() {
   const destination = destinations[0];
   if (destination === source.portName) return "Select a destination different from the current service port.";
   const sourcePort = state.ports.find((port) => port.name === source.portName);
+  if (sourcePort?.currentGroups?.length) {
+    return "This service inherits group settings. Use the group/shared-uplink builder to add a port; move group memberships explicitly in Custom command.";
+  }
   const unitMarker = ` unit ${source.unit} `;
   if (!(sourcePort?.currentSetLines || []).some((line) => line.includes(unitMarker))) {
     return `${source.interfaceName} has no discovered logical-unit configuration to copy.`;
   }
   const destinationPort = state.ports.find((port) => port.name === destination);
+  if (destinationPort?.currentGroups?.length) return "The destination inherits group settings; use the group/shared-uplink builder.";
   if ((destinationPort?.currentSetLines || []).some((line) => line.includes(unitMarker))) {
     return `${destination}.${source.unit} already has interface configuration.`;
   }
@@ -2653,6 +2721,171 @@ function buildIrbConfiguration() {
   activateWorkspaceTab("review", true);
 }
 
+function qinqGroupMode() {
+  return typeof qinqModeInput !== "undefined" && qinqModeInput.value === "group";
+}
+
+function qinqGroupTemplates() {
+  const templates = [];
+  state.ports.forEach((port) => {
+    if (!port.inheritanceResolved || !port.currentGroups?.length
+      || port.currentEncapsulation !== "extended-vlan-bridge") return;
+    Object.entries(port.currentUnits || {}).forEach(([unit, details]) => {
+      if (details.inputVlanMap !== "push" || details.outputVlanMap !== "pop") return;
+      const service = state.bridgeServices.find((entry) => entry.interfaces.includes(`${port.name}.${unit}`));
+      if (service) templates.push({ key: `${port.name}.${unit}`, port, unit, service });
+    });
+  });
+  return templates;
+}
+
+function selectedQinqTemplate() {
+  return qinqGroupTemplates().find((template) => template.key === qinqTemplateInput.value);
+}
+
+function qinqSharedUplink(template, uplink) {
+  const port = state.ports.find((entry) => entry.name === uplink);
+  if (!port?.inheritanceResolved || !template) return null;
+  for (const member of template.service.interfaces) {
+    const separator = member.lastIndexOf(".");
+    if (member.slice(0, separator) !== uplink) continue;
+    const unit = port.currentUnits?.[member.slice(separator + 1)];
+    if (unit?.vlanIds?.length === 1 && unit.inputVlanMap !== "push" && !unit.outerTag) {
+      return { port, unit: member.slice(separator + 1), outer: unit.vlanIds[0] };
+    }
+  }
+  return null;
+}
+
+function populateQinqTemplates() {
+  if (typeof qinqTemplateInput === "undefined") return;
+  const previous = qinqTemplateInput.value;
+  const templates = qinqGroupTemplates();
+  qinqTemplateInput.replaceChildren(new Option(templates.length ? "Select an existing customer layout" : "No resolved group services discovered", ""));
+  templates.forEach((template) => qinqTemplateInput.add(new Option(
+    `${template.port.name} — ${template.port.currentGroups.join(", ")} / ${template.service.name} (unit ${template.unit})`, template.key
+  )));
+  if (templates.some((template) => template.key === previous)) qinqTemplateInput.value = previous;
+  else if (templates.length) qinqTemplateInput.value = templates[0].key;
+  syncQinqTemplate();
+}
+
+function syncQinqTemplate() {
+  const grouped = qinqGroupMode();
+  qinqTemplateInput.disabled = !grouped;
+  document.getElementById("qinqTemplateLabel").hidden = !grouped;
+  [qinqServiceNameInput, qinqOuterTagInput, qinqMtuInput].forEach((input) => { input.readOnly = grouped; });
+  const template = grouped ? selectedQinqTemplate() : null;
+  if (template) {
+    qinqServiceNameInput.value = template.service.name;
+    qinqMtuInput.value = template.port.currentMtu || "";
+    let uplink = qinqSharedUplink(template, qinqUplinkPortInput.value);
+    if (!uplink) {
+      uplink = state.ports.map((port) => qinqSharedUplink(template, port.name)).find(Boolean);
+      qinqUplinkPortInput.value = uplink?.port.name || "";
+    }
+    qinqOuterTagInput.value = uplink?.outer || "";
+  } else if (grouped) {
+    qinqServiceNameInput.value = "";
+    qinqOuterTagInput.value = "";
+  }
+  updateQinqSummary();
+}
+
+function buildGroupedQinqLines(values, template) {
+  const sourcePrefix = `set interfaces ${template.port.name} `;
+  const targetPrefix = `set interfaces ${values.customer} `;
+  const lines = [`# Add ${values.customer} to ${template.service.name}; customer ${values.inner}, service unit ${template.unit}`];
+  template.port.currentSetLines.forEach((line) => {
+    const remainder = line.slice(sourcePrefix.length);
+    if (!line.startsWith(sourcePrefix) || /^(?:description\b|disable\b)/.test(remainder)
+      || remainder.startsWith(`unit ${template.unit} vlan-id-list `)) return;
+    lines.push(`${targetPrefix}${remainder}`);
+  });
+  lines.push(`${targetPrefix}unit ${template.unit} vlan-id-list ${values.inner}`);
+  state.bridgeServices.forEach((service) => service.interfaces.forEach((member) => {
+    if (member.startsWith(`${template.port.name}.`)) {
+      lines.push(`set vlans ${service.name} interface ${values.customer}.${member.slice(member.lastIndexOf(".") + 1)}`);
+    }
+  }));
+  return [...new Set(lines)];
+}
+
+function qinqTagIncludes(tags, value) {
+  return (tags || []).some((tag) => {
+    const match = String(tag).match(/^(\d+)(?:-(\d+))?$/);
+    return match && value >= Number(match[1]) && value <= Number(match[2] || match[1]);
+  });
+}
+
+function groupedQinqValidationError(values) {
+  const template = selectedQinqTemplate();
+  if (!template) return "Select a resolved group service layout. Refresh discovery if group settings are unavailable.";
+  if (values.customer === template.port.name) return "Choose a new customer port, different from the layout source.";
+  const target = state.ports.find((port) => port.name === values.customer);
+  if (!target || !/^(?:ge|xe|et|fe|mge)-/.test(target.name)) return "Choose a discovered physical customer port.";
+  if (values.serviceName !== template.service.name || values.mtu !== Number(template.port.currentMtu)) return "Refresh the selected service layout.";
+  const uplink = qinqSharedUplink(template, values.uplink);
+  if (!uplink || String(values.outer) !== String(uplink.outer)) return "Choose an existing shared uplink member with a resolved single service VLAN tag.";
+  const sourceLines = template.port.currentSetLines || [];
+  if (template.port.currentGroups.some((group) => {
+    const patterns = template.port.currentGroupInterfacePatterns?.[group] || [];
+    return patterns.length !== 1 || patterns[0] !== "<*>";
+  })) {
+    return "This builder requires verified <*> interface groups so the new port inherits the same layout. Refresh discovery or use Custom command for other group patterns.";
+  }
+  if (Object.values(template.port.currentUnits).filter((unit) => unit.inputVlanMap === "push").length !== 1
+    || Object.values(template.port.currentUnits).some((unit) => unit.outerTag)
+    || sourceLines.some((line) => /\bunit 0 family\b/.test(line))) {
+    return "Choose a layout with one customer QinQ unit and regular VLAN units.";
+  }
+  if (Object.entries(template.port.currentUnits).some(([number, unit]) => number !== template.unit && qinqTagIncludes(unit.vlanIds, values.inner))) {
+    return `Customer tag ${values.inner} overlaps a regular VLAN unit in this layout.`;
+  }
+  if (!sourceLines.some((line) => line.startsWith(`set interfaces ${template.port.name} unit ${template.unit} vlan-id-list `))
+    || sourceLines.some((line) => /\b(?:apply-groups-except|family (?:inet|inet6|ccc)|802\.3ad)\b/.test(line))) {
+    return "This layout has unsupported overrides; choose a customer layout with an explicit customer VLAN list.";
+  }
+  const sourceTags = sourceLines.filter((line) => line.startsWith(`set interfaces ${template.port.name} unit ${template.unit} vlan-id-list `))
+    .flatMap((line) => line.split(" vlan-id-list ")[1].replace(/[\[\]]/g, " ").trim().split(/\s+/));
+  if ((template.port.currentUnits[template.unit].vlanIds || []).some((tag) => !sourceTags.includes(tag))) {
+    return "This group also supplies customer tags; use a layout whose customer VLAN list is entirely explicit.";
+  }
+  const expected = buildGroupedQinqLines(values, template);
+  if (target.currentGroups?.length && !target.inheritanceResolved) return "Refresh the destination's inherited settings before adding a service.";
+  if ((target.currentSetLines || []).some((line) => !/^set interfaces\s+\S+\s+(?:description\b|disable$)/.test(line) && !expected.includes(line))) {
+    return `${target.name} already has other configuration. Choose an unused port or clear and refresh it first.`;
+  }
+  if (!target.currentGroups?.length && (target.currentEffectiveSetLines || []).some((line) => !/^set interfaces\s+\S+\s+(?:description\b|disable$)/.test(line))) {
+    return `${target.name} has inherited interface settings; choose an unused port.`;
+  }
+  for (const service of state.bridgeServices) {
+    if (service.interfaces.some((member) => member.startsWith(`${target.name}.`)
+      && !expected.includes(`set vlans ${service.name} interface ${member}`))) return `${target.name} already belongs to another logical service.`;
+  }
+  for (const member of template.service.interfaces) {
+    const separator = member.lastIndexOf(".");
+    const port = state.ports.find((entry) => entry.name === member.slice(0, separator));
+    if (port?.name === target.name || port?.name === values.uplink) continue;
+    const unit = port?.currentUnits?.[member.slice(separator + 1)];
+    if (!port?.inheritanceResolved || !unit) return "A shared service member has unresolved settings; refresh before assigning a customer tag.";
+    if (unit.inputVlanMap === "push" && qinqTagIncludes(unit.vlanIds, values.inner)) return `Customer tag ${values.inner} is already used by ${member}.`;
+  }
+  const staged = typeof combinedDeploymentConfig === "function" ? combinedDeploymentConfig() : "";
+  for (const line of staged.split(/\r?\n/)) {
+    if ([template.port.name, values.uplink, values.customer].some((name) => line.startsWith(`set interfaces ${name} `) || line.startsWith(`delete interfaces ${name}`))
+      || template.port.currentGroups.some((name) => line.startsWith(`set groups ${name} `) || line.startsWith(`delete groups ${name}`))) {
+      return "The preview or queue already changes this layout, group, uplink, or destination. Apply or clear those commands and refresh first.";
+    }
+    const tagLine = line.match(/^set interfaces (\S+) unit (\d+) vlan-id-list (.+)$/);
+    if (tagLine && qinqTagIncludes(tagLine[3].replace(/[\[\]]/g, " ").trim().split(/\s+/), values.inner)
+      && staged.includes(`set vlans ${template.service.name} interface ${tagLine[1]}.${tagLine[2]}`)) {
+      return `Customer tag ${values.inner} is already staged for ${tagLine[1]}.`;
+    }
+  }
+  return "";
+}
+
 function qinqValues() {
   return {
     customer: qinqCustomerPortInput.value,
@@ -2679,6 +2912,7 @@ function qinqValidationError() {
   if (!Number.isInteger(values.mtu) || values.mtu < 1518 || values.mtu > 16384) {
     return "Physical MTU must be from 1518 to 16384 bytes.";
   }
+  if (qinqGroupMode()) return groupedQinqValidationError(values);
   const intendedMembers = [`${values.customer}.${values.inner}`, `${values.uplink}.${values.inner}`];
   if (existingService && (existingService.interfaces.length !== intendedMembers.length
     || existingService.interfaces.some((name) => !intendedMembers.includes(name)))) {
@@ -2688,6 +2922,7 @@ function qinqValidationError() {
 }
 
 function buildQinqLines(values) {
+  if (qinqGroupMode()) return buildGroupedQinqLines(values, selectedQinqTemplate());
   const customerUnit = `${values.customer}.${values.inner}`;
   const uplinkUnit = `${values.uplink}.${values.inner}`;
   return [
@@ -2712,12 +2947,17 @@ function buildQinqLines(values) {
 }
 
 function qinqUnitConflict(values, expectedLines) {
+  if (qinqGroupMode()) return "";
   for (const interfaceName of [values.customer, values.uplink]) {
     const port = state.ports.find((entry) => entry.name === interfaceName);
+    if (port?.currentGroups?.length) return `${interfaceName} inherits group settings; use the existing group / shared uplink setup.`;
     const unitMarker = ` unit ${values.inner} `;
-    const existingLines = (port?.currentSetLines || []).filter((line) => line.includes(unitMarker));
+    const existingLines = (port?.currentEffectiveSetLines || port?.currentSetLines || []).filter((line) => line.includes(unitMarker));
     const unexpected = existingLines.find((line) => !expectedLines.includes(line));
     if (unexpected) return `${interfaceName} unit ${values.inner} already has other configuration.`;
+    const physicalConflict = (port?.currentEffectiveSetLines || port?.currentSetLines || []).some((line) =>
+      /^set interfaces\s+\S+\s+(?:encapsulation|mtu)\s+/.test(line) && !expectedLines.includes(line));
+    if (physicalConflict) return `${interfaceName} has different physical encapsulation or MTU; this builder will not replace it.`;
   }
   return "";
 }
@@ -2725,7 +2965,10 @@ function qinqUnitConflict(values, expectedLines) {
 function updateQinqSummary() {
   const values = qinqValues();
   const error = qinqValidationError();
-  qinqSummary.textContent = error || `${values.customer}.${values.inner} ↔ ${values.uplink}.${values.inner} · outer ${values.outer} / inner ${values.inner} · MTU ${values.mtu}`;
+  const template = qinqGroupMode() ? selectedQinqTemplate() : null;
+  qinqSummary.textContent = error || (template
+    ? `${values.customer}.${template.unit} → ${template.service.name} via ${values.uplink} · customer ${values.inner} / outer ${values.outer} · group ${template.port.currentGroups.join(", ")} · native ${template.port.currentNativeVlanId || "None"}. Copies the source port's VLAN-unit memberships. Shared uplink and group stay unchanged.`
+    : `${values.customer}.${values.inner} ↔ ${values.uplink}.${values.inner} · outer ${values.outer} / inner ${values.inner} · MTU ${values.mtu}`);
   qinqSummary.className = `tool-summary ${error ? "muted" : "valid"}`;
 }
 
@@ -3349,6 +3592,13 @@ irbVlanInput.addEventListener("change", () => {
 [irbUnitInput, irbAddressInput].forEach((input) => input.addEventListener("input", updateIrbSummary));
 [qinqCustomerPortInput, qinqUplinkPortInput, qinqServiceNameInput, qinqOuterTagInput, qinqInnerTagInput, qinqMtuInput]
   .forEach((input) => input.addEventListener("input", updateQinqSummary));
+[qinqModeInput, qinqTemplateInput].forEach((input) => input.addEventListener("change", syncQinqTemplate));
+qinqUplinkPortInput.addEventListener("change", () => {
+  if (qinqGroupMode()) {
+    qinqOuterTagInput.value = qinqSharedUplink(selectedQinqTemplate(), qinqUplinkPortInput.value)?.outer || "";
+  }
+  updateQinqSummary();
+});
 logicalServiceSourceInput.addEventListener("change", updateLogicalServiceMoveSummary);
 
 document.getElementById("selectAllBtn").addEventListener("click", () => {

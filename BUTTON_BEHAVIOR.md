@@ -2,6 +2,8 @@
 
 Command actions open and focus **Review & deploy** after successfully building or appending commands. Invalid input, canceled confirmations, and blocked edits keep the current tab and preview. Automatically updating a draft while selecting ports or editing fields does not change tabs.
 
+**Append Q-in-Q configuration** supports an existing-group/shared-uplink layout or a new standalone pair. The group path copies an existing customer's interface group attachment, explicit overrides, and regular VLAN-unit memberships to an unused port, replacing the customer tag while preserving the service unit. It does not modify the shared group or uplink. Conflicting existing or staged settings and duplicate tags reject the build. **Build logical-unit move** rejects applied interface groups because moving only explicit unit lines would omit their inherited settings.
+
 | Buttons | Effect | Navigation |
 | --- | --- | --- |
 | Regenerate full config; Append selected fields; Append VLAN removal | Stage commands for selected ports. Full regeneration requires at least one selected port. | Open Review & deploy. |

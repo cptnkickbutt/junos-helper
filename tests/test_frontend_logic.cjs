@@ -1040,6 +1040,127 @@ test("Q-in-Q rejects duplicate ports and unit conflicts beside the builder", () 
   assert.equal(context.tabs.length, 0);
 });
 
+function groupedServiceContext() {
+  const context = serviceBuilderContext();
+  context.qinqModeInput = { value: "group" };
+  context.qinqTemplateInput = { value: "mge-0/0/13.304" };
+  context.qinqCustomerPortInput.value = "mge-0/0/14";
+  context.qinqUplinkPortInput.value = "xe-0/2/0";
+  context.qinqServiceNameInput.value = "APT_SERVICE";
+  context.qinqOuterTagInput.value = "304";
+  context.qinqInnerTagInput.value = "3002";
+  context.state.vlans = [{ name: "VOICE", value: "26" }, { name: "AP_MGMT", value: "307" }, { name: "SW_MGMT", value: "311" }];
+  context.state.ports = [
+    { name: "mge-0/0/13", currentGroups: ["APARTMENT"], currentGroupInterfacePatterns: { APARTMENT: ["<*>"] }, inheritanceResolved: true,
+      currentEncapsulation: "extended-vlan-bridge", currentNativeVlanId: "311", currentMtu: "9216",
+      currentSetLines: ["set interfaces mge-0/0/13 apply-groups APARTMENT",
+        "set interfaces mge-0/0/13 description 13_Existing", "set interfaces mge-0/0/13 unit 304 vlan-id-list 3001"],
+      currentUnits: { "26": { vlanIds: ["26"] }, "307": { vlanIds: ["307"] }, "311": { vlanIds: ["311"] },
+        "304": { vlanIds: ["3001"], inputVlanMap: "push", outputVlanMap: "pop" } } },
+    { name: "mge-0/0/14", currentSetLines: ["set interfaces mge-0/0/14 description 14_Unused"], currentGroups: [], currentUnits: {}, inheritanceResolved: true },
+    { name: "xe-0/2/0", currentMode: "trunk", currentVlans: ["DATA"], inheritanceResolved: true, currentUnits: { "304": { vlanIds: ["304"] } } }
+  ];
+  context.state.bridgeServices = [
+    { name: "APT_SERVICE", interfaces: ["mge-0/0/13.304", "xe-0/2/0.304"] },
+    { name: "VOICE", interfaces: ["mge-0/0/13.26"] },
+    { name: "AP_MGMT", interfaces: ["mge-0/0/13.307"] },
+    { name: "SW_MGMT", interfaces: ["mge-0/0/13.311"] }
+  ];
+  return context;
+}
+
+test("group QinQ adds a customer using the service unit and all regular memberships without editing the shared uplink", () => {
+  const context = groupedServiceContext();
+  context.buildQinqConfiguration();
+  assert.deepEqual(context.batches[0].slice(1), [
+    "set interfaces mge-0/0/14 apply-groups APARTMENT",
+    "set interfaces mge-0/0/14 unit 304 vlan-id-list 3002",
+    "set vlans APT_SERVICE interface mge-0/0/14.304",
+    "set vlans VOICE interface mge-0/0/14.26",
+    "set vlans AP_MGMT interface mge-0/0/14.307",
+    "set vlans SW_MGMT interface mge-0/0/14.311"
+  ]);
+  assert.deepEqual(context.tabs, ["review"]);
+  context.updateQinqSummary();
+  assert.match(context.qinqSummary.textContent, /native 311/);
+  assert.match(context.qinqSummary.textContent, /mge-0\/0\/14\.304/);
+});
+
+test("group template controls populate the shared service fields and allow switching back to standalone", () => {
+  const context = groupedServiceContext();
+  const templateLabel = {};
+  context.document = { getElementById: () => templateLabel };
+  context.Option = function(text, value) { this.text = text; this.value = value; };
+  context.qinqTemplateInput.replaceChildren = function(option) { this.options = [option]; this.value = option.value; };
+  context.qinqTemplateInput.add = function(option) { this.options.push(option); };
+  context.qinqUplinkPortInput.value = "";
+  context.qinqServiceNameInput.value = "";
+  context.populateQinqTemplates();
+  assert.equal(context.qinqTemplateInput.value, "mge-0/0/13.304");
+  assert.equal(context.qinqUplinkPortInput.value, "xe-0/2/0");
+  assert.equal(context.qinqServiceNameInput.value, "APT_SERVICE");
+  assert.equal(context.qinqOuterTagInput.value, "304");
+  assert.equal(context.qinqServiceNameInput.readOnly, true);
+  assert.equal(templateLabel.hidden, false);
+  context.qinqModeInput.value = "standalone";
+  context.syncQinqTemplate();
+  assert.equal(context.qinqServiceNameInput.readOnly, false);
+  assert.equal(templateLabel.hidden, true);
+});
+
+test("group QinQ rejects duplicate tags, ranges, regular VLAN overlap, occupied ports, and unresolved inheritance", () => {
+  const cases = [
+    [(c) => { c.qinqInnerTagInput.value = "3001"; }, /already used/],
+    [(c) => { c.state.ports[0].currentUnits["304"].vlanIds = ["3000-3010"]; c.state.ports[0].currentSetLines[2] = "set interfaces mge-0/0/13 unit 304 vlan-id-list 3000-3010"; }, /already used/],
+    [(c) => { c.qinqInnerTagInput.value = "311"; }, /overlaps a regular VLAN/],
+    [(c) => { c.state.ports[1].currentSetLines.push("set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members DATA"); }, /already has other configuration/],
+    [(c) => { c.state.ports[0].inheritanceResolved = false; }, /resolved group service/],
+    [(c) => { c.state.ports[0].currentGroupInterfacePatterns.APARTMENT = ["mge-0/0/13"]; }, /verified <\*> interface groups/],
+    [(c) => { c.state.ports[2].inheritanceResolved = false; }, /existing shared uplink/],
+    [(c) => { c.state.ports[0].currentUnits["304"].vlanIds.push("3999"); }, /entirely explicit/],
+    [(c) => { c.state.ports[1].currentEffectiveSetLines = ["set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members INHERITED"]; }, /inherited interface settings/],
+    [(c) => { c.state.bridgeServices.push({ name: "OTHER", interfaces: ["mge-0/0/14.99"] }); }, /another logical service/],
+    [(c) => { c.combinedDeploymentConfig = () => "set groups APARTMENT interfaces <*> native-vlan-id 999"; }, /preview or queue already changes/],
+    [(c) => { c.combinedDeploymentConfig = () => "set interfaces mge-0/0/15 unit 304 vlan-id-list 3002\nset vlans APT_SERVICE interface mge-0/0/15.304"; }, /already staged/]
+  ];
+  for (const [change, expected] of cases) {
+    const context = groupedServiceContext();
+    change(context);
+    context.buildQinqConfiguration();
+    assert.equal(context.batches.length, 0);
+    assert.match(context.qinqSummary.textContent, expected);
+  }
+});
+
+test("tile details show inherited regular VLANs separately from customer and outer QinQ tags", () => {
+  const context = groupedServiceContext();
+  runSourceSection("function portVlanPresentation", "function negotiatedSpeedClass", context);
+  const details = context.portVlanPresentation(context.state.ports[0]);
+  assert.equal(details.mode, "Q-in-Q / VLAN units");
+  assert.equal(details.groups, "APARTMENT");
+  assert.match(details.vlans, /SW_MGMT \(311\)/);
+  assert.match(details.vlans, /AP_MGMT \(307\)/);
+  assert.match(details.vlans, /VOICE \(26\)/);
+  assert.doesNotMatch(details.vlans, /3001/);
+  assert.match(details.qinq, /customer 3001; outer 304 \(unit 304\)/);
+  const uplink = context.portVlanPresentation(context.state.ports[2]);
+  assert.equal(uplink.mode, "trunk + Q-in-Q");
+  assert.match(uplink.qinq, /shared uplink; outer 304/);
+  assert.match(uplink.vlans, /DATA/);
+  context.state.ports[2].currentUnits["304"].vlanIds = [];
+  assert.match(context.portVlanPresentation(context.state.ports[0]).qinq, /outer unknown/);
+  context.state.ports[0].inheritanceResolved = false;
+  assert.match(context.portVlanPresentation(context.state.ports[0]).inheritance, /Unavailable/);
+});
+
+test("standalone QinQ refuses to replace group-backed endpoint settings", () => {
+  const context = serviceBuilderContext();
+  context.state.ports = [{ name: "ge-0/0/1", currentGroups: ["APARTMENT"] }];
+  context.buildQinqConfiguration();
+  assert.equal(context.batches.length, 0);
+  assert.match(context.qinqSummary.textContent, /existing group/);
+});
+
 test("negotiated link rates map to distinct tile color classes", () => {
   const context = loadSourceSection(
     "function negotiatedSpeedClass",

@@ -3,25 +3,29 @@
 Read this file first in a new session. Replace stale facts instead of appending
 history; detailed usage and procedures live in the linked references.
 
-Last reviewed: 2026-11-09
+Last reviewed: 2026-11-16
 
 ## Current focus
 
-The requested commit, push, and updated Windows EXE are complete. v1.7 has been
-built, verified, committed, tagged, pushed, and published on GitHub.
-
-v1.7 contains the previously uncommitted Live watch improvements, tests, usage
-docs, and new continuity/server-planning docs. No long-term recorder,
-authentication, Proxmox provisioning, or Linux deployment was implemented.
+The user requested a full push and EXE update. v1.8 contains the QinQ
+discovery/display and builder overhaul for interface groups and VLAN logical
+units. The standard EXE is built and verified; commit/tag/push/publication are
+the remaining release steps. No real-switch configuration was performed.
+Deferred monitoring/server work remains outside this request.
 
 ## Release status
 
 - Branch: `main`; remote: `https://github.com/cptnkickbutt/junos-helper.git`.
+- Prepared release: **v1.8**, 2026-11-16. App `1.8`, API `25`, Windows
+  file/product version `1.8.0.0`. Standard build: `dist/JunosHelper.exe`;
+  distribution copy: `dist/JunosHelper-v1.8.exe` (20,174,311 bytes).
+  No saved device credentials embedded. Publication verification is pending.
 - Latest published release: **v1.7**, 2026-11-09, commit `bc4f7ae`.
   Annotated tag `v1.7` and release commit were pushed to `origin`.
-- App version `1.7`, API version `24`
-  (browser requires the same), Windows file/product version `1.7.0.0`.
-- Fresh standard build: `dist/JunosHelper.exe`; distribution copy:
+- Published baseline app version `1.7`, API version `24`, Windows file/product
+  version `1.7.0.0`. v1.8 source/build uses API **25**, with the browser requiring
+  the same. Restart the app and refresh the browser when upgrading.
+- Earlier-session v1.7 build: `dist/JunosHelper.exe`; distribution copy:
   `dist/JunosHelper-v1.7.exe` (20,167,848 bytes). No saved profiles embedded.
 - [Release and download](https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.7).
   Published asset is uploaded, non-draft, and non-prerelease. GitHub's asset
@@ -30,6 +34,23 @@ authentication, Proxmox provisioning, or Linux deployment was implemented.
 - Existing coworker/seeded EXEs are separate ignored artifacts and were not rebuilt.
 
 ## Implemented behavior
+
+- QinQ discovery reads both explicit interface statements and switch-resolved
+  inheritance. Keep editable `setLines` separate from `effectiveSetLines`;
+  expose groups, units/tags, physical encapsulation/MTU, and resolution status.
+  Tile hovers/Richard View show inherited native VLANs, named regular VLAN units,
+  and separate QinQ customer/outer tags. Do not infer a VLAN tag from a unit number.
+- The QinQ builder defaults to an existing interface group/shared service:
+  choose a discovered customer layout and an unused target, assign a customer
+  tag, copy explicit interface overrides/group attachments and all source VLAN
+  unit memberships. Preserve the discovered service unit and leave shared group
+  definitions/uplink unchanged. The original standalone pair path is available.
+  The group builder requires verified `<*>` interface patterns, one push/pop
+  customer unit, an explicit customer tag list, and a resolved single-tag shared
+  uplink. Filtered group-interface discovery verifies the wildcard layout.
+  Collision/range/overlap, destination, unresolved-member, and staged-conflict
+  guards are covered by synthetic tests. Group-backed single-unit moves are
+  blocked; whole-port moves retain explicit group attachments as before.
 
 - Custom command accepts Junos `set`/`delete` configuration paths. Global lines
   run once without selected ports. Optional variables are `{port}`,
@@ -106,7 +127,26 @@ instructions to implement them automatically.
 
 ## Verification
 
-Completed in this 2026-11-09 release session:
+Completed in the 2026-11-16 QinQ source/release session:
+
+- **119 Python + 66 Node tests passed (185 total)**, plus `git diff --check`.
+  New synthetic fixtures cover resolved/failed inheritance, raw/effective
+  separation, unit/tag distinctions, shared-uplink builder commands, template
+  controls, collisions/ranges, occupied ports, and staged conflicts.
+- Standard PyInstaller build passed with workspace-local cache. Archive checks
+  confirmed current HTML/CSS/JS assets, runtime modules and vendor database,
+  with no `.env` or `seed.env` included.
+- EXE file/product versions are `1.8.0.0`. The new EXE started on an isolated
+  loopback port with empty profiles and a workspace-local activity path.
+  `/api/health` reported v1.8/API 25/packaged; all four served assets matched
+  source, and authorized local shutdown exited cleanly.
+- No hardware reads/writes this session. GitHub publication is pending.
+- Visual browser QA was blocked: browser host unavailable, and native computer
+  use stopped because it could not verify the browser URL. No visual validation
+  is claimed. Ignored `.audit-cache/qinq-preview/` contains a synthetic local
+  preview generator/assets only; its temporary HTTP server was stopped.
+
+Earlier 2026-11-09 release-session results (not rerun as packaging checks):
 
 - **115 Python + 61 Node tests passed (176 total)** before the version-only bump.
   Coverage includes refresh/watch integration, watchdog and stream cleanup,
@@ -123,10 +163,9 @@ Completed in this 2026-11-09 release session:
 - `git diff --check` and staged whitespace checks passed. Release and asset
   publication were verified through GitHub CLI; uploaded size/digest match local.
 
-No real-switch sampling/configuration or Linux deployment was tested. No fresh
-visual browser inspection was performed. Earlier-session visual validation was
-blocked by browser tooling; the ignored `.audit-cache/live-preview/` fixture is
-synthetic and is not hardware evidence.
+No real-switch sampling/configuration or Linux deployment has been tested in
+these workspace sessions. The ignored `.audit-cache/live-preview/` fixture is
+also synthetic and is not hardware evidence.
 
 ## Local workflow and data
 
@@ -150,10 +189,11 @@ synthetic and is not hardware evidence.
 
 ## Exact next step
 
-Use the published v1.7 EXE after stopping the old packaged app. The user is
-arranging the server separately; a GitHub push does not deploy it. Follow user
-feedback or server setup results. Do not implement the proposed
-recorder/authentication without a new request.
+Commit the verified v1.8 release, create/push its annotated tag and main, publish
+the versioned EXE to GitHub, and verify its asset size/digest. Then record the
+publication result. Hardware behavior and visual QA remain unverified. Do not
+implement deferred recorder/authentication or server deployment without a new
+request.
 
 ## Source documents and code map
 

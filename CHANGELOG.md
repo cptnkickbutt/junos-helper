@@ -7,6 +7,14 @@ and this project uses versioned GitHub releases.
 
 ## [Unreleased]
 
+## [v1.8] - 2026-11-16
+
+### Changed
+
+- Discover resolved interface inheritance alongside explicit configuration. Show interface groups, inherited native VLANs, regular VLAN units, and QinQ customer/outer tags separately in tile hovers and Richard View, without treating unit numbers as VLAN IDs. Mark unavailable inheritance explicitly.
+- Add an existing-group/shared-uplink QinQ builder using a discovered customer layout. Preserve its service unit and regular VLAN memberships, assign a new customer tag, and leave the shared uplink and group definition unchanged. Reject tag collisions/ranges, regular-VLAN overlap, incompatible destinations, unresolved members, and conflicting staged changes. Retain the standalone-pair builder with group/physical-setting conflict checks.
+- Block group-backed single-unit moves and exclude interface-group attachments from quick access-port commits. API compatibility is now 25; restart the backend and refresh the browser together when upgrading.
+
 ## [v1.7] - 2026-11-09
 
 ### Changed

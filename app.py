@@ -152,8 +152,8 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-APP_VERSION = "1.7"
-API_VERSION = 24
+APP_VERSION = "1.8"
+API_VERSION = 25
 WATCH_SESSIONS = WatchSessions()
 atexit.register(WATCH_SESSIONS.close)
 WATCH_LOG_THROTTLE = {}
@@ -172,6 +172,8 @@ DISCOVERY_COMMANDS = (
     "show configuration vlans | display set",
     "show version",
     "show configuration interfaces | display set",
+    "show configuration interfaces | display inheritance no-comments | display set",
+    'show configuration groups | display set | match " interfaces "',
     "show configuration system host-name | display set",
 )
 INTERFACE_RE = re.compile(
@@ -867,6 +869,30 @@ def _parse_interface_configuration(output: str) -> dict[str, dict[str, Any]]:
         details = configuration.setdefault(interface_name, {"vlans": [], "setLines": []})
         details["setLines"].append(line)
 
+        groups_match = re.match(r"apply-groups\s+(.+)$", remainder)
+        if groups_match:
+            details["groups"] = shlex.split(groups_match.group(1).replace("[", " ").replace("]", " "))
+        for field in ("encapsulation", "mtu"):
+            field_match = re.fullmatch(rf"{field}\s+(\S+)", remainder)
+            if field_match:
+                details[field] = field_match.group(1)
+        unit_match = re.match(r"unit\s+(\d+)\s+(.+)$", remainder)
+        if unit_match:
+            unit = details.setdefault("units", {}).setdefault(unit_match.group(1), {})
+            unit_remainder = unit_match.group(2)
+            tag_match = re.fullmatch(r"vlan-id(?:-list)?\s+(.+)", unit_remainder)
+            if tag_match:
+                tags = shlex.split(tag_match.group(1).replace("[", " ").replace("]", " "))
+                unit.setdefault("vlanIds", []).extend(tag for tag in tags if tag not in unit.get("vlanIds", []))
+            for keyword, field in (("input-vlan-map", "inputVlanMap"), ("output-vlan-map", "outputVlanMap"),
+                                   ("vlan-tags outer", "outerTag"), ("vlan-tags inner", "innerTag")):
+                value_match = re.fullmatch(rf"{keyword}\s+(\S+)", unit_remainder)
+                if value_match:
+                    unit[field] = value_match.group(1)
+            push_tag = re.fullmatch(r"input-vlan-map vlan-id\s+(\d+)", unit_remainder)
+            if push_tag:
+                unit["pushTag"] = push_tag.group(1)
+
         mode_match = re.search(r"(interface-mode|port-mode)\s+(access|trunk)\b", remainder)
         if mode_match:
             details["modeKeyword"] = mode_match.group(1)
@@ -900,12 +926,43 @@ def _parse_interface_configuration(output: str) -> dict[str, dict[str, Any]]:
     return configuration
 
 
+def _discovered_interface_configuration(results: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
+    """Keep editable statements separate from the switch's resolved inheritance."""
+    raw = next((item.get("output", "") for item in results
+                if item["command"] == "show configuration interfaces | display set"), "")
+    configuration = _parse_interface_configuration(raw)
+    inherited = next((item for item in results if "display inheritance" in item["command"]), {})
+    output = inherited.get("output", "")
+    resolved = bool(output.strip()) and not inherited.get("error", "").strip() and not re.search(
+        r"(?:error:|syntax error|permission denied|unknown command)", output, re.I)
+    effective = _parse_interface_configuration(output) if resolved else {}
+    group_patterns: dict[str, list[str]] = {}
+    for item in results:
+        if not item["command"].startswith("show configuration groups") or item.get("error", "").strip():
+            continue
+        for line in item.get("output", "").splitlines():
+            match = re.match(r"^set groups (\S+) interfaces (\S+)\s+", line.strip())
+            if match and match.group(2) not in group_patterns.setdefault(match.group(1), []):
+                group_patterns[match.group(1)].append(match.group(2))
+    for name in configuration.keys() | effective.keys():
+        explicit = configuration.get(name, {"vlans": [], "setLines": []})
+        details = dict(effective.get(name, explicit))
+        details["effectiveSetLines"] = details.get("setLines", [])
+        details["setLines"] = explicit["setLines"]
+        details["groups"] = explicit.get("groups", [])
+        details["groupInterfacePatterns"] = {group: group_patterns.get(group, []) for group in details["groups"]}
+        details["inheritanceResolved"] = resolved and name in effective
+        configuration[name] = details
+    return configuration
+
+
 def _configured_interface_names(configuration: dict[str, dict[str, Any]]) -> set[str]:
-    """Treat switch ports with at least one VLAN membership as configured."""
+    """Include both enterprise memberships and service-provider VLAN units."""
     return {
         name
         for name, details in configuration.items()
-        if details.get("vlans")
+        if details.get("vlans") or any(unit.get("vlanIds") or unit.get("outerTag")
+                                      for unit in details.get("units", {}).values())
     }
 
 
@@ -1130,12 +1187,11 @@ def connect_switch() -> Any:
         operational_interface_names = set(parsed_interface_names)
 
         # collect configured interfaces from any configuration output
-        interface_configuration: dict[str, dict[str, Any]] = {}
+        interface_configuration = _discovered_interface_configuration(results)
         for item in results:
             cmd = item.get("command", "")
             out = item.get("output", "") or ""
-            if "show configuration interfaces" in cmd:
-                interface_configuration.update(_parse_interface_configuration(out))
+            if cmd == "show configuration interfaces | display set":
                 irb_units = _parse_irb_configuration(out)
 
         # Some platforms omit inactive physical ports from operational interface
@@ -1186,7 +1242,8 @@ def connect_switch() -> Any:
             d["configured"] = name in configured_interfaces
             d["vlans"] = configured.get("vlans", [])
             for field in (
-                "mode", "modeKeyword", "nativeVlanId", "description", "disabled", "setLines"
+                "mode", "modeKeyword", "nativeVlanId", "description", "disabled", "setLines",
+                "effectiveSetLines", "groups", "groupInterfacePatterns", "units", "encapsulation", "mtu", "inheritanceResolved"
             ):
                 if field in configured:
                     d[field] = configured[field]
@@ -1570,7 +1627,7 @@ def _quick_port_exclusions(configuration: dict, macs: dict, neighbors: dict, man
             reasons[name] = "Uplink MAC pattern"
         elif any(re.search(r"\b802\.3ad\b", line) for line in lines):
             reasons[name] = "Aggregate member"
-        elif access_only and any(re.search(r"\b(?:native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b", line)
+        elif access_only and any(re.search(r"\b(?:apply-groups|native-vlan-id|flexible-vlan-tagging|encapsulation|vlan-tagging)\b", line)
                  or re.search(r"\bunit (?!0\b)\d+\b", line)
                  or re.search(r"\bfamily (?!ethernet-switching\b)\S+", line) for line in lines):
             reasons[name] = "Aggregate membership or logical service configuration"
