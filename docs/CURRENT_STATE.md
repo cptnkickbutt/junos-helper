@@ -7,30 +7,25 @@ Last reviewed: 2026-11-16
 
 ## Current focus
 
-The user requested a full push and EXE update. v1.8 contains the QinQ
+The requested full push and EXE update are complete. v1.8 contains the QinQ
 discovery/display and builder overhaul for interface groups and VLAN logical
-units. The standard EXE is built and verified; commit/tag/push/publication are
-the remaining release steps. No real-switch configuration was performed.
-Deferred monitoring/server work remains outside this request.
+units. The standard EXE was built, verified, committed, tagged, pushed, and
+published on GitHub. No real-switch configuration was performed. Deferred
+monitoring/server work remains outside this request.
 
 ## Release status
 
 - Branch: `main`; remote: `https://github.com/cptnkickbutt/junos-helper.git`.
-- Prepared release: **v1.8**, 2026-11-16. App `1.8`, API `25`, Windows
-  file/product version `1.8.0.0`. Standard build: `dist/JunosHelper.exe`;
-  distribution copy: `dist/JunosHelper-v1.8.exe` (20,174,311 bytes).
-  No saved device credentials embedded. Publication verification is pending.
-- Latest published release: **v1.7**, 2026-11-09, commit `bc4f7ae`.
-  Annotated tag `v1.7` and release commit were pushed to `origin`.
-- Published baseline app version `1.7`, API version `24`, Windows file/product
-  version `1.7.0.0`. v1.8 source/build uses API **25**, with the browser requiring
-  the same. Restart the app and refresh the browser when upgrading.
-- Earlier-session v1.7 build: `dist/JunosHelper.exe`; distribution copy:
-  `dist/JunosHelper-v1.7.exe` (20,167,848 bytes). No saved profiles embedded.
-- [Release and download](https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.7).
-  Published asset is uploaded, non-draft, and non-prerelease. GitHub's asset
-  SHA-256 matches the local EXE:
-  `e7154641452901709cbd16e8d37780fbfceedfdeddb3ff16b2fded9ba1e544b9`.
+- Latest published release: **v1.8**, 2026-11-16, commit `2eb71ff`.
+  Annotated tag `v1.8` and release commit were pushed to `origin`.
+- App `1.8`, API **25** (browser requires the same), Windows file/product
+  version `1.8.0.0`. Restart the app and refresh the browser when upgrading.
+- Standard build: `dist/JunosHelper.exe`; distribution copy:
+  `dist/JunosHelper-v1.8.exe` (20,174,311 bytes). No saved credentials embedded.
+- [Release and download](https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.8).
+  Verified as the latest release, non-draft and non-prerelease; the asset is
+  uploaded. GitHub's asset SHA-256 matches the local EXE:
+  `5c0b81726cd1014b5d28d2c7a887a3c741f612c5f64a5b3b777ae85b64070171`.
 - Existing coworker/seeded EXEs are separate ignored artifacts and were not rebuilt.
 
 ## Implemented behavior
@@ -140,7 +135,10 @@ Completed in the 2026-11-16 QinQ source/release session:
   loopback port with empty profiles and a workspace-local activity path.
   `/api/health` reported v1.8/API 25/packaged; all four served assets matched
   source, and authorized local shutdown exited cleanly.
-- No hardware reads/writes this session. GitHub publication is pending.
+- GitHub publication and remote main/tag were verified. The uploaded EXE size
+  and SHA-256 match the local build. The final publication-handoff update is
+  documentation only; it does not change the verified application build.
+- No hardware reads/writes this session.
 - Visual browser QA was blocked: browser host unavailable, and native computer
   use stopped because it could not verify the browser URL. No visual validation
   is claimed. Ignored `.audit-cache/qinq-preview/` contains a synthetic local
@@ -189,11 +187,13 @@ also synthetic and is not hardware evidence.
 
 ## Exact next step
 
-Commit the verified v1.8 release, create/push its annotated tag and main, publish
-the versioned EXE to GitHub, and verify its asset size/digest. Then record the
-publication result. Hardware behavior and visual QA remain unverified. Do not
-implement deferred recorder/authentication or server deployment without a new
-request.
+Use the published v1.8 EXE: stop the old packaged app using **Stop app**, launch
+the replacement, refresh the browser, and reconnect to pull inherited interface
+settings. Check tile details and review a group/shared-uplink builder preview
+before any separately authorized switch push. Hardware behavior and visual QA
+remain unverified. A GitHub push does not deploy the separately planned server.
+Do not implement deferred recorder/authentication or server deployment without
+a new request.
 
 ## Source documents and code map
 
