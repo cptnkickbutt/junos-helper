@@ -7,27 +7,34 @@ Last reviewed: 2026-11-20
 
 ## Current focus
 
-v1.9 / API 28 is built and verified locally for the requested full push/release.
-All session changes are included: history/known-good/restore, locked-port bounce,
-dynamic commit comments, final-list VLAN membership, grouped QinQ customer-port
-rebuilds, and live-header pending-state detection. Source tests and packaged
-smoke checks passed. Release commit/tag/push/publication are the remaining steps;
-GitHub's published baseline is still v1.8 until publication is verified.
-No real-switch reads/writes were performed, and hardware recovery and the
-reported always-pending switch symptom remain unverified. Existing field order
-(Native VLAN before VLAN membership) is preserved.
+The requested full push and EXE update are complete. **v1.9 / API 28** contains
+configuration history/known-good recovery, locked-port bounce, dynamic commit
+comments, checked-list VLAN membership, grouped QinQ customer-port rebuilds,
+and the live-header pending-state fix. The standard credential-free EXE was
+built, verified, committed, tagged, pushed, and published. Uploaded size/digest
+and remote main/tag were verified. This final publication-handoff update is
+documentation only; it does not change the verified application build.
+No real-switch reads/writes were performed. Hardware restore/recovery and the
+reported always-pending switch symptom remain unverified; browser visual QA
+also remains unverified. Existing field order (Native VLAN before VLAN
+membership) is preserved. Deferred monitoring/server/authentication work is
+outside this request.
 
 ## Release status
 
 - Branch: `main`; remote: `https://github.com/cptnkickbutt/junos-helper.git`.
-- Verified local release candidate: **v1.9**, app `1.9`, API **28**, Windows
-  file/product version `1.9.0.0`. Backend and browser require the same API;
-  restart the app and refresh the browser when upgrading.
+- Latest published release: **v1.9**, 2026-11-20, release commit `5a99dee`
+  (`5a99dee0cb293e5225e8dea765caa1b6aac8ff9d`). Annotated tag `v1.9` points
+  to that commit and was pushed with main. A documentation-only publication
+  handoff commit follows the release tag on main.
+- App `1.9`, API **28**, Windows file/product version `1.9.0.0`. Backend and
+  browser require the same API. Restart the app and refresh the browser together.
 - Standard build: `dist/JunosHelper.exe`; distribution copy:
   `dist/JunosHelper-v1.9.exe` (20,314,641 bytes). No saved credentials embedded.
-- Local asset SHA-256: `1d537c534ef3b3cb1762eae2ed0829dd3c38db84d2b7f20a7669a9d24835a6e3`.
-- Remote publication pending. Prior published release: v1.8, 2026-11-16,
-  release commit `2eb71ff`, API 25, Windows version 1.8.0.0.
+- [Release and download](https://github.com/cptnkickbutt/junos-helper/releases/tag/v1.9).
+  Verified latest, non-draft, non-prerelease; EXE asset is uploaded. GitHub's
+  asset SHA-256 matches the local EXE:
+  `1d537c534ef3b3cb1762eae2ed0829dd3c38db84d2b7f20a7669a9d24835a6e3`.
 - Coworker/seeded EXEs remain separate ignored artifacts and were not rebuilt.
 
 ## Implemented behavior
@@ -202,8 +209,11 @@ Completed in the 2026-11-20 v1.9 build/release session:
   health reported v1.9/API 28/packaged, all five served assets matched source,
   and authorized local shutdown exited cleanly. Distribution copy/hash recorded
   above. No actual device sampling or configuration was part of the smoke test.
-- Commit, tag, push, release publication and uploaded digest checks are pending.
-  The earlier visual/helper and hardware limits below remain in effect.
+- Release commit/tag were pushed and GitHub publication verified as latest,
+  non-draft and non-prerelease. Uploaded asset state/size/SHA-256 and remote
+  main/annotated-tag target match the verified local release. The final handoff
+  update is documentation only, not a rebuilt EXE. Earlier visual/helper and
+  hardware limits below remain in effect.
 
 
 Completed in the latest 2026-11-20 Configure/QinQ/pending-state fix session:
@@ -295,11 +305,18 @@ also synthetic and is not hardware evidence.
 
 ## Exact next step
 
-Commit the verified v1.9 source/tests/docs/version update, create annotated tag
-v1.9, push main/tag, publish dist/JunosHelper-v1.9.exe with the prepared notes,
-and verify the uploaded asset digest and remote refs. Then update this handoff
-with actual publication results. No real-device changes or server deployment
-are part of this release request.
+Use the published v1.9 EXE. Stop the old packaged app using Stop app (or stop a
+source backend in its terminal), launch the replacement, refresh the browser,
+and reconnect. Confirm app 1.9/API 28 before checking final-list VLAN staging,
+grouped QinQ customer-port rebuild previews, history comparisons, and known-good
+metadata. The app must not keep reusing an older running backend.
+
+Refresh history to recheck the reported always-pending warning. Its cause/fix
+has synthetic coverage, but the specific switch behavior remains unverified.
+Actual rescue saves/restores, candidate concurrency/cleanup, and confirmed
+recovery need a separately authorized lab operation. A GitHub push does not
+deploy the separately planned server. Do not implement deferred recorder,
+authentication, or server work without a new request.
 
 ## Source documents and code map
 
