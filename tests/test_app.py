@@ -1024,7 +1024,8 @@ class ApiSafetyTests(unittest.TestCase):
         cli = execute_cli.call_args.args[1]
         self.assertTrue(cli.startswith("configure exclusive;"))
         self.assertIn("commit check;", cli)
-        self.assertIn('commit comment "Description update by Junos Helper"', cli)
+        self.assertIn('commit comment "Junos Helper: set descriptions x2; ports ge-0/0/1,ge-0/0/2; 2 commands"', cli)
+        self.assertEqual(payload["commitComment"], 'Junos Helper: set descriptions x2; ports ge-0/0/1,ge-0/0/2; 2 commands')
         self.assertNotIn("commit confirmed", cli)
 
     @patch("app._ssh_client")
@@ -1083,7 +1084,7 @@ class ApiSafetyTests(unittest.TestCase):
         self.assertIn("commit check; rollback 0; exit", check_cli)
         self.assertNotIn("commit confirmed", check_cli)
         self.assertTrue(execute_cli.call_args.args[1].startswith("configure exclusive;"))
-        self.assertIn('commit check; commit confirmed 5 comment "Applied by Junos Helper"', execute_cli.call_args.args[1])
+        self.assertIn('commit check; commit confirmed 5 comment "Junos Helper: disable ports x1; ports ge-0/0/1; 1 command"', execute_cli.call_args.args[1])
 
     @patch("app._execute_cli")
     @patch("app._ssh_client")

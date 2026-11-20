@@ -33,6 +33,7 @@ $pyInstallerArgs = @(
     "--add-data", "$(Join-Path $projectDir 'styles.css');.",
     "--add-data", "$(Join-Path $projectDir 'script.js');.",
     "--add-data", "$(Join-Path $projectDir 'live-watch.js');.",
+    "--add-data", "$(Join-Path $projectDir 'config-history.js');.",
     "--add-data", "$vendorDatabase;."
 )
 

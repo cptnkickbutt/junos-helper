@@ -96,13 +96,20 @@ class PortBounceTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/ports/bounce", json=self.payload).status_code, 200)
         self.assertEqual(len([command for command in self.commands() if command.startswith("request ")]), 1)
 
-    def test_protected_port_rejects_the_whole_selection(self):
+    def test_manual_and_automatic_protection_do_not_block_link_or_poe_bounce(self):
         self.manual.return_value = ["mge-0/0/13"]
         self.payload["ports"].append("mge-0/0/13")
-        response = self.client.post("/api/ports/bounce", json=self.payload)
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("Manually protected", response.get_json()["error"])
-        self.assertTrue(all(command.startswith("show ") for command in self.commands()))
+        self.outputs["show configuration interfaces | display set"] = (
+            'set interfaces mge-0/0/12 description "Core uplink"\n'
+            'set interfaces mge-0/0/12 unit 0 family ethernet-switching interface-mode trunk\n'
+            'set interfaces mge-0/0/13 ether-options 802.3ad ae0', "", 0)
+        for kind in ("link", "poe"):
+            with self.subTest(kind=kind):
+                self.execute.reset_mock()
+                response = self.client.post("/api/ports/bounce", json={**self.payload, "kind": kind})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len([cmd for cmd in self.commands() if cmd.startswith("request ")]), 2)
+        self.manual.assert_not_called()
 
     def test_disabled_or_undiscovered_port_is_never_bounced(self):
         for update in [
@@ -117,7 +124,7 @@ class PortBounceTests(unittest.TestCase):
                 self.assertTrue(all(command.startswith("show ") for command in self.commands()))
 
     def test_failed_fresh_read_never_bounces(self):
-        self.outputs["show ethernet-switching table"] = ("error: permission denied", "", 0)
+        self.outputs["show interfaces terse"] = ("error: permission denied", "", 0)
         response = self.client.post("/api/ports/bounce", json=self.payload)
         self.assertEqual(response.status_code, 409)
         self.assertIn("permission denied", response.get_json()["error"])
@@ -136,7 +143,7 @@ class PortBounceTests(unittest.TestCase):
         response = self.client.post("/api/ports/bounce", json=self.payload)
         self.assertEqual(response.status_code, 502)
         self.assertIn("syntax error", response.get_json()["results"][0]["error"])
-        self.assertEqual(len(self.commands()), 5)
+        self.assertEqual(len(self.commands()), 3)
 
     def test_missing_acknowledgement_is_not_reported_as_success(self):
         self.outputs["request interface bounce mge-0/0/12 interval 5"] = ("", "", 0)

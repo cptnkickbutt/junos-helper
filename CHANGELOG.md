@@ -7,6 +7,17 @@ and this project uses versioned GitHub releases.
 
 ## [Unreleased]
 
+## [v1.9] - 2026-11-20
+
+### Changed
+
+- Make Configure VLAN membership a final checked list for full regeneration and Stage selected fields, including deselection, empty lists, and clearing a deselected native VLAN. Later membership edits override earlier staged membership additions.
+- Rebuild the grouped QinQ customer port after confirmation instead of requiring an unused port. Remove its old VLAN-unit references and interface settings, use the selected group layout and Configure description, and ignore Configure switching fields/automatic drafts. Preserve unrelated manual work and queues, while rejecting queued target or staged layout conflicts. Shared source/group/uplink configuration stays unchanged; the standalone path retains append behavior.
+- Allow Port bounce and PoE bounce on manually or automatically protected physical ports. Confirmation lists protected ports and warns about uplink/management interruption without removing their locks. Keep fresh discovery, administrative-state, and enabled-PoE checks; quick configuration commits retain protection checks.
+- Generate bounded commit comments from submitted change types, affected ports/VLANs, and command counts for protected pushes, quick commits, and browser final confirmations. Include VLAN IDs for tag/native-VLAN changes, omit free-text descriptions and secret values, and save the generated comment in activity history. Comments summarize submitted commands rather than a verified before/after diff.
+- Add Config history & rollback beside Review & deploy, with current plus 15/20 historical versions, commit comments, individual/sequential batch comparisons, redacted restore-direction diffs, and reviewed whole-configuration restore through a private candidate and five-minute confirmed commit. Validate each restore stage before sending the next; pin review/confirmation to device, source, and current identities. Reject stale reviews, pending switch confirmations, incomplete snapshots, and staged editor/queue work.
+- Add switch-resident rescue as Known good, explicit replacement/save-current controls, and a restore shortcut. Add Known good & restores to the cross-device activity log with a durable last-observed metadata catalog that survives event retention. Verify pending status from the live current `show system commit` header, rather than XML rollback metadata or historical/user comments, to avoid false restore/save blocks. API compatibility is now 28; restart the backend and refresh the browser together. Source tests are synthetic; hardware and visual validation remain pending.
+
 ## [v1.8] - 2026-11-16
 
 ### Changed

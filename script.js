@@ -6,6 +6,7 @@ const state = {
   pendingConfirmation: false,
   pendingTarget: null,
   pendingActivityId: null,
+  pendingHistoryConfirmation: null,
   deviceDataSnapshots: new Map(),
   activityEvents: [],
   activityBefore: null,
@@ -39,7 +40,7 @@ const state = {
   refreshTimer: null,
   richardView: false
 };
-const REQUIRED_API_VERSION = 25;
+const REQUIRED_API_VERSION = 28;
 const AUTO_SAVE_STORAGE_KEY = "junosHelper.autoSaveConnections";
 const BOUNCE_INTERVAL_STORAGE_KEY = "junosHelper.bounceInterval";
 const VISIBLE_GROUPS_STORAGE_KEY = "junosHelper.visibleSavedDeviceGroups";
@@ -161,7 +162,7 @@ const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
 const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
 
 function activateWorkspaceTab(tabName, focus = false) {
-  if (tabName !== "review" && tabName !== "watch" && tabButtons.some((button) => button.dataset.tab === tabName)) {
+  if (!["review", "watch", "history"].includes(tabName) && tabButtons.some((button) => button.dataset.tab === tabName)) {
     state.lastEditingTab = tabName;
   }
   tabButtons.forEach((button) => {
@@ -212,6 +213,7 @@ function updatePushAvailability() {
   document.getElementById("quickTaskSummary").textContent = quickError || "All queued and current commands qualify for quick commit. Fresh switch checks run before committing.";
   updateProtectionSummary();
   window.liveWatch?.onContextChange();
+  window.configHistory?.onContextChange();
 }
 
 function invalidatePreview() {
@@ -487,6 +489,7 @@ function clearConfirmationTimer() {
 
 function setDeploymentReady(message = "Compare before a rollback-protected push. Push runs commit check first; failed checks preserve your editor and queue.") {
   state.pendingActivityId = null;
+  state.pendingHistoryConfirmation = null;
   clearConfirmationTimer();
   state.pendingConfirmation = false;
   state.pendingTarget = null;
@@ -557,6 +560,38 @@ function connectionPayload(extra = {}) {
     deviceName: deviceNameInput.value.trim(),
     ...extra
   };
+}
+
+function getConfigHistoryContext() {
+  return { payload: connectionPayload(), connected: !!state.protectionHost && state.protectionHost === hostInput.value.trim().toLowerCase(),
+    busy: state.connectionInProgress || state.deploymentInProgress || state.bounceInProgress || state.protectionSaving,
+    pending: state.pendingConfirmation,
+    pendingRestore: state.pendingHistoryConfirmation ? { host: state.pendingTarget?.host } : null,
+    hasDraft: configCommandCount(configOutput.value) > 0 || !!state.configQueue.length };
+}
+
+let historyConnectionDisabled = null;
+function setHistoryChangeInProgress(busy) {
+  const controls = [hostInput, usernameInput, passwordInput, savedDeviceInput, connectBtn, quickConnectBtn, refreshNowBtn];
+  if (busy) {
+    historyConnectionDisabled = controls.map((control) => control.disabled);
+    controls.forEach((control) => { control.disabled = true; });
+  } else if (historyConnectionDisabled) {
+    controls.forEach((control, index) => { control.disabled = historyConnectionDisabled[index]; });
+    historyConnectionDisabled = null;
+  }
+  state.deploymentInProgress = busy;
+  renderConfigQueue();
+}
+
+function beginHistoryConfirmation(result, target) {
+  state.pendingConfirmation = true;
+  state.pendingActivityId = result.activityId || null;
+  state.pendingTarget = { host: target.host, username: target.username, deviceId: target.deviceId, deviceName: target.deviceName };
+  state.pendingHistoryConfirmation = { token: result.confirmationToken, password: target.password, sourceLabel: result.sourceLabel };
+  startConfirmationWindow(result.confirmMinutes || 5);
+  connectionStatus.textContent = `Configuration restored on ${target.host}. Verify service and confirm within five minutes.`;
+  connectionStatus.className = "status-pill connected";
 }
 
 function getLiveWatchContext() {
@@ -676,6 +711,8 @@ async function loadActivityLog(older = false) {
     state.activityBefore = null;
     activityLogList.replaceChildren();
     olderActivityLogBtn.hidden = true;
+    const catalog = document.getElementById("knownGoodCatalog");
+    if (catalog) { catalog.hidden = true; catalog.replaceChildren(); }
   }
   if (activeOnly && !host) {
     activityLogSummary.textContent = "Choose a target device or select All devices.";
@@ -699,6 +736,25 @@ async function loadActivityLog(older = false) {
     state.activityBefore = payload.nextBefore;
     olderActivityLogBtn.hidden = !payload.hasMore;
     renderActivityLog();
+    const catalog = document.getElementById("knownGoodCatalog");
+    if (catalog) {
+      catalog.hidden = activityLogView.value !== "known-good";
+      catalog.replaceChildren();
+      if (!catalog.hidden) {
+        const heading = document.createElement("h3");
+        heading.textContent = "Last observed known-good configurations";
+        catalog.appendChild(heading);
+        const note = document.createElement("p");
+        note.className = "credential-note";
+        note.textContent = "Metadata remains after activity entries expire. This is the last observation, not a live availability check or a separate configuration backup. Open Config history & rollback on the device to verify or restore.";
+        catalog.appendChild(note);
+        for (const entry of payload.knownGood || []) {
+          const item = document.createElement("p");
+          item.textContent = `${entry.deviceName || entry.host} · ${entry.host} · ${entry.state} · ${entry.label || "Switch rescue"}${entry.savedAt ? ` · Saved ${new Date(entry.savedAt).toLocaleString()} by ${entry.operator}` : " · Save details unknown"} · Last checked ${new Date(entry.observedAt).toLocaleString()}${entry.fingerprint ? ` · ${entry.fingerprint.slice(0, 12)}` : ""}`;
+          catalog.appendChild(item);
+        }
+      }
+    }
     activityLogSummary.textContent = `${state.activityEvents.length} entries · ${activeOnly ? host : "All devices"}${payload.warning ? ` · ${payload.warning}` : ""}`;
     activityLogSummary.className = `tool-summary ${payload.warning ? "error-text" : "muted"}`;
   } catch (error) {
@@ -713,8 +769,9 @@ async function loadActivityLog(older = false) {
   }
 }
 
-function showActivityLog() {
-  activityLogScope.value = "active";
+function showActivityLog({ knownGood = false } = {}) {
+  activityLogScope.value = knownGood ? "all" : "active";
+  if (knownGood) activityLogView.value = "known-good";
   openOptionsPopup(activityLogDialog, "openActivityLogBtn");
   void flushBrowserErrors();
   return loadActivityLog();
@@ -1567,9 +1624,8 @@ function bounceSelectionError() {
   if (!state.protectionHost || state.protectionHost !== hostInput.value.trim().toLowerCase()) return "Connect to this switch first.";
   const selected = state.ports.filter((port) => state.selected.has(port.name));
   if (!selected.length || selected.length > 48) return "Select 1 to 48 physical Ethernet ports.";
-  const topology = buildMacTopology();
   const errors = selected.flatMap((port) => {
-    let reason = portProtectionReason(port, topology);
+    let reason = "";
     if (!/^(?:fe|ge|mge|xe|et)-\d+\/\d+\/\d+(?:\/\d+)?(?::\d+)?$/i.test(port.name)) reason = "Physical Ethernet ports only";
     else if (port.currentDisabled || port.admin === "down") reason = "Port is administratively disabled";
     return reason ? [`${port.name}: ${reason}`] : [];
@@ -1593,7 +1649,14 @@ async function bounceSelectedPorts(kind) {
   const target = hostInput.value.trim();
   const label = kind === "poe" ? "PoE bounce" : "Port bounce";
   const effect = kind === "poe" ? "Power will be interrupted; connected powered devices may reboot." : "Network links will be interrupted.";
-  if (!window.confirm(`${label} on ${target} for ${interval} seconds?\n\n${ports.join(", ")}\n\n${effect}\nThis runs immediately. Queued and preview configuration is not deployed.`)) return;
+  const topology = buildMacTopology();
+  const protectedPorts = state.ports.filter((port) => state.selected.has(port.name)).flatMap((port) => {
+    const reason = portProtectionReason(port, topology);
+    return reason ? [`${port.name}: ${reason}`] : [];
+  });
+  const warning = protectedPorts.length
+    ? `\n\nWarning: protected ports selected:\n${protectedPorts.join("\n")}\nBouncing these ports may interrupt uplinks and switch management access. Port protection will remain enabled.` : "";
+  if (!window.confirm(`${label} on ${target} for ${interval} seconds?\n\n${ports.join(", ")}\n\n${effect}${warning}\nThis runs immediately. Queued and preview configuration is not deployed.`)) return;
   const payload = connectionPayload({ ports, kind, interval });
   const connectionControls = [hostInput, usernameInput, passwordInput, savedDeviceInput, connectBtn, quickConnectBtn, refreshNowBtn];
   const previousDisabled = connectionControls.map((control) => control.disabled);
@@ -2433,13 +2496,9 @@ function buildDesiredLines(port, description) {
   if (nativeVlan && !vlanMembers.includes(nativeVlan.name)) vlanMembers.push(nativeVlan.name);
   const modeKeyword = port.modeKeyword || state.modeKeyword || "interface-mode";
   const lines = [`set interfaces ${port.name} unit 0 family ethernet-switching ${modeKeyword} ${portModeInput.value}`];
-  if (port.currentNativeVlanId && port.currentNativeVlanId !== nativeVlanId) {
-    lines.push(`delete interfaces ${port.name} native-vlan-id`);
-  }
+  lines.push(`delete interfaces ${port.name} native-vlan-id`);
   if (nativeVlanId) lines.push(`set interfaces ${port.name} native-vlan-id ${nativeVlanId}`);
-  if (port.currentVlans?.length) {
-    lines.push(`delete interfaces ${port.name} unit 0 family ethernet-switching vlan members`);
-  }
+  lines.push(`delete interfaces ${port.name} unit 0 family ethernet-switching vlan members`);
   if (portModeInput.value === "access" && vlanMembers.length) {
     lines.push(`set interfaces ${port.name} unit 0 family ethernet-switching vlan members ${vlanMembers[0]}`);
   } else if (vlanMembers.length) {
@@ -2795,7 +2854,13 @@ function syncQinqTemplate() {
 function buildGroupedQinqLines(values, template) {
   const sourcePrefix = `set interfaces ${template.port.name} `;
   const targetPrefix = `set interfaces ${values.customer} `;
-  const lines = [`# Add ${values.customer} to ${template.service.name}; customer ${values.inner}, service unit ${template.unit}`];
+  const lines = [`# Rebuild ${values.customer} for ${template.service.name}; customer ${values.inner}, service unit ${template.unit}`];
+  state.bridgeServices.forEach((service) => service.interfaces.forEach((member) => {
+    if (member === values.customer || member.startsWith(`${values.customer}.`)) {
+      lines.push(`delete vlans ${service.name} interface ${member}`);
+    }
+  }));
+  lines.push(`delete interfaces ${values.customer}`);
   template.port.currentSetLines.forEach((line) => {
     const remainder = line.slice(sourcePrefix.length);
     if (!line.startsWith(sourcePrefix) || /^(?:description\b|disable\b)/.test(remainder)
@@ -2803,6 +2868,8 @@ function buildGroupedQinqLines(values, template) {
     lines.push(`${targetPrefix}${remainder}`);
   });
   lines.push(`${targetPrefix}unit ${template.unit} vlan-id-list ${values.inner}`);
+  const description = descriptionInput.value.trim();
+  if (description) lines.push(buildDescriptionLine({ name: values.customer }, description));
   state.bridgeServices.forEach((service) => service.interfaces.forEach((member) => {
     if (member.startsWith(`${template.port.name}.`)) {
       lines.push(`set vlans ${service.name} interface ${values.customer}.${member.slice(member.lastIndexOf(".") + 1)}`);
@@ -2851,17 +2918,10 @@ function groupedQinqValidationError(values) {
   if ((template.port.currentUnits[template.unit].vlanIds || []).some((tag) => !sourceTags.includes(tag))) {
     return "This group also supplies customer tags; use a layout whose customer VLAN list is entirely explicit.";
   }
-  const expected = buildGroupedQinqLines(values, template);
-  if (target.currentGroups?.length && !target.inheritanceResolved) return "Refresh the destination's inherited settings before adding a service.";
-  if ((target.currentSetLines || []).some((line) => !/^set interfaces\s+\S+\s+(?:description\b|disable$)/.test(line) && !expected.includes(line))) {
-    return `${target.name} already has other configuration. Choose an unused port or clear and refresh it first.`;
-  }
-  if (!target.currentGroups?.length && (target.currentEffectiveSetLines || []).some((line) => !/^set interfaces\s+\S+\s+(?:description\b|disable$)/.test(line))) {
-    return `${target.name} has inherited interface settings; choose an unused port.`;
-  }
-  for (const service of state.bridgeServices) {
-    if (service.interfaces.some((member) => member.startsWith(`${target.name}.`)
-      && !expected.includes(`set vlans ${service.name} interface ${member}`))) return `${target.name} already belongs to another logical service.`;
+  if (target.currentGroups?.length && !target.inheritanceResolved) return "Refresh the destination's inherited settings before rebuilding it.";
+  if (!target.currentGroups?.length && (target.currentEffectiveSetLines || []).some((line) =>
+    !(target.currentSetLines || []).includes(line) && !/^set interfaces\s+\S+\s+(?:description\b|disable$)/.test(line))) {
+    return `${target.name} has inherited interface settings outside its own group attachments; use a different port or resolve that inheritance first.`;
   }
   for (const member of template.service.interfaces) {
     const separator = member.lastIndexOf(".");
@@ -2871,11 +2931,25 @@ function groupedQinqValidationError(values) {
     if (!port?.inheritanceResolved || !unit) return "A shared service member has unresolved settings; refresh before assigning a customer tag.";
     if (unit.inputVlanMap === "push" && qinqTagIncludes(unit.vlanIds, values.inner)) return `Customer tag ${values.inner} is already used by ${member}.`;
   }
-  const staged = typeof combinedDeploymentConfig === "function" ? combinedDeploymentConfig() : "";
-  for (const line of staged.split(/\r?\n/)) {
-    if ([template.port.name, values.uplink, values.customer].some((name) => line.startsWith(`set interfaces ${name} `) || line.startsWith(`delete interfaces ${name}`))
-      || template.port.currentGroups.some((name) => line.startsWith(`set groups ${name} `) || line.startsWith(`delete groups ${name}`))) {
-      return "The preview or queue already changes this layout, group, uplink, or destination. Apply or clear those commands and refresh first.";
+  const queued = (state.configQueue || []).map((batch) => batch.config).join("\n");
+  if (queued.split(/\r?\n/).some((line) => qinqTargetCommand(line, values.customer))) {
+    return "A queued batch already changes this customer port. Remove that batch before rebuilding the port.";
+  }
+  // An automatic Configure draft is disposable. Preserve unrelated manual
+  // commands, and replace target-port statements as part of this rebuild.
+  const staged = [queued, state.configManual ? configOutput.value : ""].filter(Boolean).join("\n");
+  const layoutVlans = new Set(state.bridgeServices.filter((service) => service.interfaces.some((member) => member.startsWith(`${template.port.name}.`))).map((service) => service.name));
+  for (const rawLine of staged.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (qinqTargetCommand(line, values.customer)) continue;
+    const parts = line.trim().split(/\s+/);
+    if (!["set", "delete"].includes(parts[0])) continue;
+    if ([template.port.name, values.uplink].some((name) => qinqTargetCommand(line, name))
+      || (parts[1] === "interfaces" && parts.length === 2)
+      || (parts[1] === "groups" && (parts.length === 2 || template.port.currentGroups.includes(parts[2])))
+      || (parts[1] === "vlans" && (parts.length === 2 || layoutVlans.has(parts[2])
+        && (parts.length === 3 || parts[3] !== "interface")))) {
+      return "The preview or queue already changes this layout, group, uplink, or service definition. Apply or clear those commands and refresh first.";
     }
     const tagLine = line.match(/^set interfaces (\S+) unit (\d+) vlan-id-list (.+)$/);
     if (tagLine && qinqTagIncludes(tagLine[3].replace(/[\[\]]/g, " ").trim().split(/\s+/), values.inner)
@@ -2884,6 +2958,16 @@ function groupedQinqValidationError(values) {
     }
   }
   return "";
+}
+
+function qinqTargetCommand(line, name) {
+  const parts = line.trim().split(/\s+/);
+  if (!["set", "delete"].includes(parts[0])) return false;
+  if (parts[1] === "interfaces") return parts[2] === name || parts[2]?.startsWith(`${name}.`);
+  if (parts[1] === "vlans" && parts[3] === "interface") {
+    return parts[4] === name || parts[4]?.startsWith(`${name}.`);
+  }
+  return false;
 }
 
 function qinqValues() {
@@ -2967,7 +3051,7 @@ function updateQinqSummary() {
   const error = qinqValidationError();
   const template = qinqGroupMode() ? selectedQinqTemplate() : null;
   qinqSummary.textContent = error || (template
-    ? `${values.customer}.${template.unit} → ${template.service.name} via ${values.uplink} · customer ${values.inner} / outer ${values.outer} · group ${template.port.currentGroups.join(", ")} · native ${template.port.currentNativeVlanId || "None"}. Copies the source port's VLAN-unit memberships. Shared uplink and group stay unchanged.`
+    ? `Rebuild ${values.customer}.${template.unit} → ${template.service.name} via ${values.uplink} · customer ${values.inner} / outer ${values.outer} · group ${template.port.currentGroups.join(", ")} · native ${template.port.currentNativeVlanId || "None"}. Replaces the customer's interface and VLAN-unit memberships using this layout. Only Description comes from Configure. Shared uplink and group stay unchanged.`
     : `${values.customer}.${values.inner} ↔ ${values.uplink}.${values.inner} · outer ${values.outer} / inner ${values.inner} · MTU ${values.mtu}`);
   qinqSummary.className = `tool-summary ${error ? "muted" : "valid"}`;
 }
@@ -2985,8 +3069,18 @@ function buildQinqConfiguration() {
     qinqSummary.className = "tool-summary error-text";
     return;
   }
-  appendConfigLines(lines);
-  connectionStatus.textContent = `Appended Q-in-Q service ${values.serviceName} on ${values.customer} and ${values.uplink}`;
+  if (qinqGroupMode()) {
+    if (!window.confirm(`Rebuild customer port ${values.customer} for ${values.serviceName}?\n\nThis removes its existing interface settings and VLAN-unit references, then applies the selected group layout and the Configure description. Existing customer-port edits in the current draft are replaced. Queued batches are preserved.\n\nThe layout source, shared group, and uplink are unchanged. This only stages commands for review.`)) return;
+    const existing = state.configManual ? configOutput.value.split(/\r?\n/).filter((line) => !qinqTargetCommand(line, values.customer)).join("\n").trim() : "";
+    replaceConfig([existing, lines.join("\n")].filter(Boolean).join("\n"), true);
+  } else {
+    const description = descriptionInput.value.trim();
+    if (description) lines.push(buildDescriptionLine({ name: values.customer }, description));
+    appendConfigLines(lines);
+  }
+  connectionStatus.textContent = qinqGroupMode()
+    ? `Built Q-in-Q customer-port rebuild for ${values.customer}; shared uplink ${values.uplink} unchanged`
+    : `Appended Q-in-Q service ${values.serviceName} on ${values.customer} and ${values.uplink}`;
   connectionStatus.className = "status-pill";
   activateWorkspaceTab("review", true);
 }
@@ -3122,14 +3216,9 @@ function appendSelectedFields() {
     return;
   }
   const vlanList = parseMembershipInput();
-  if (fields.vlans && !vlanList.length) {
-    connectionStatus.textContent = "Select at least one VLAN membership to append";
-    connectionStatus.className = "status-pill error";
-    return;
-  }
   const nativeVlanId = nativeVlanInput.value;
   const nativeVlan = state.vlans.find((vlan) => String(vlan.value) === nativeVlanId);
-  if (fields.nativeVlan && portModeInput.value === "trunk" && (!nativeVlanId || !nativeVlan)) {
+  if (fields.nativeVlan && portModeInput.value === "trunk" && nativeVlanId && !nativeVlan) {
     connectionStatus.textContent = "Select a discovered native VLAN first";
     connectionStatus.className = "status-pill error";
     return;
@@ -3143,15 +3232,23 @@ function appendSelectedFields() {
       portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching ${modeKeyword} ${portModeInput.value}`);
     }
     if (fields.nativeVlan) {
-      if (portModeInput.value === "trunk") {
+      if (portModeInput.value === "trunk" && nativeVlanId) {
         portLines.add(`set interfaces ${port.name} native-vlan-id ${nativeVlanId}`);
-        portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching vlan members ${nativeVlan.name}`);
+        if (!fields.vlans) portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching vlan members ${nativeVlan.name}`);
       } else {
         portLines.add(`delete interfaces ${port.name} native-vlan-id`);
       }
     }
     if (fields.vlans) {
-      vlanList.forEach((vlan) => {
+      const desired = [...vlanList];
+      if (fields.nativeVlan && portModeInput.value === "trunk" && nativeVlan && !desired.includes(nativeVlan.name)) desired.push(nativeVlan.name);
+      const effectiveNativeId = stagedNativeVlanId(port);
+      const currentNative = state.vlans.find((vlan) => String(vlan.value) === effectiveNativeId);
+      if (!fields.nativeVlan && effectiveNativeId && !desired.includes(currentNative?.name)) {
+        portLines.add(`delete interfaces ${port.name} native-vlan-id`);
+      }
+      portLines.add(`delete interfaces ${port.name} unit 0 family ethernet-switching vlan members`);
+      desired.forEach((vlan) => {
         portLines.add(`set interfaces ${port.name} unit 0 family ethernet-switching vlan members ${vlan}`);
       });
     }
@@ -3170,9 +3267,24 @@ function appendSelectedFields() {
     fields.nativeVlan && "native VLAN",
     fields.description && "description"
   ].filter(Boolean);
-  connectionStatus.textContent = `Appended ${fieldLabels.join(", ")} for ${selectedPorts.length} port${selectedPorts.length === 1 ? "" : "s"}`;
+  connectionStatus.textContent = `Staged ${fieldLabels.join(", ")} for ${selectedPorts.length} port${selectedPorts.length === 1 ? "" : "s"}${fields.vlans ? "; VLAN membership will match the checked list" : ""}`;
   connectionStatus.className = "status-pill";
   activateWorkspaceTab("review", true);
+}
+
+function stagedNativeVlanId(port) {
+  let value = String(port.currentNativeVlanId || "");
+  const staged = [(state.configQueue || []).map((batch) => batch.config).join("\n"), state.configManual ? configOutput.value : ""].join("\n");
+  for (const line of staged.split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts[1] !== "interfaces" || parts[2] !== port.name) continue;
+    if (parts[0] === "delete" && parts.length === 3) value = "";
+    if (parts[3] === "native-vlan-id") {
+      if (parts[0] === "delete") value = "";
+      else if (parts[0] === "set") value = parts[4] || "";
+    }
+  }
+  return value;
 }
 
 function removeVlanFromSelected() {
@@ -3492,36 +3604,52 @@ async function pushToSwitch() {
 }
 
 async function confirmCommit() {
-  if (!state.pendingConfirmation || !state.confirmationDeadline) return;
+  if (!state.pendingConfirmation || !state.confirmationDeadline || state.historyConfirmationInProgress) return;
+  const restoring = !!state.pendingHistoryConfirmation;
+  if (restoring) {
+    state.historyConfirmationInProgress = true;
+    setHistoryChangeInProgress(true);
+  }
   confirmBtn.disabled = true;
   confirmBtn.textContent = "Confirming…";
   connectionStatus.textContent = "Confirming commit…";
   connectionStatus.className = "status-pill";
   try {
-    const response = await fetch("/api/confirm", {
+    const historyConfirmation = state.pendingHistoryConfirmation;
+    const response = await fetch(historyConfirmation ? "/api/config-history/confirm" : "/api/confirm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         deviceId: state.pendingTarget?.deviceId || state.savedDeviceId,
         host: state.pendingTarget?.host || hostInput.value.trim(),
         username: state.pendingTarget?.username || usernameInput.value.trim(),
-        password: passwordInput.value,
-        deviceName: deviceNameInput.value.trim(),
-        confirmationFor: state.pendingActivityId
+        password: historyConfirmation ? historyConfirmation.password : passwordInput.value,
+        deviceName: historyConfirmation ? state.pendingTarget?.deviceName || "" : deviceNameInput.value.trim(),
+        confirmationFor: state.pendingActivityId,
+        ...(historyConfirmation ? { confirmationToken: historyConfirmation.token } : { config: combinedDeploymentConfig() })
       })
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || "Confirmation failed");
-    clearDeploymentWorkspace();
+    if (!historyConfirmation) clearDeploymentWorkspace();
     setDeploymentReady("Commit confirmed successfully. Rollback protection is cleared and the workspace is ready for another push.");
     connectionStatus.textContent = "Commit confirmed; automatic rollback canceled";
     if (payload.activityWarning) connectionStatus.textContent += ` · ${payload.activityWarning}`;
     connectionStatus.className = "status-pill connected";
+    if (historyConfirmation) {
+      await connectToSwitch({ isRefresh: true });
+      window.configHistory?.onContextChange();
+    }
   } catch (error) {
     confirmBtn.disabled = !state.confirmationDeadline || state.confirmationDeadline <= Date.now();
     confirmBtn.textContent = "Confirm committed change";
     connectionStatus.textContent = `Confirmation error: ${error.message}`;
     connectionStatus.className = "status-pill error";
+  } finally {
+    if (restoring) {
+      state.historyConfirmationInProgress = false;
+      setHistoryChangeInProgress(false);
+    }
   }
 }
 
@@ -3564,6 +3692,8 @@ nativeVlanInput.addEventListener("change", () => {
   updateConfig();
 });
 vlanMembershipInput.addEventListener("change", () => {
+  const native = state.vlans.find((vlan) => String(vlan.value) === nativeVlanInput.value);
+  if (native && !parseMembershipInput().includes(native.name)) nativeVlanInput.value = "";
   updateIntendedChangeSummary();
   updateConfig();
 });

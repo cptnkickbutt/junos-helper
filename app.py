@@ -24,6 +24,7 @@ import paramiko
 from dotenv import dotenv_values, load_dotenv, set_key
 from flask import Flask, g, jsonify, request, send_from_directory
 from activity_log import ActivityLog, utc_now
+from config_history import HistoryService, HistoryError
 from live_watch import WatchSessions, WatchSessionError, validate_watch_ports, parse_interface_sample, parse_poe_sample
 from mac_vendor_lookup import BaseMacLookup, InvalidMacError, MacLookup, VendorNotFoundError
 
@@ -152,16 +153,16 @@ logger = logging.getLogger("junos_helper")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-APP_VERSION = "1.8"
-API_VERSION = 25
+APP_VERSION = "1.9"
+API_VERSION = 28
 WATCH_SESSIONS = WatchSessions()
 atexit.register(WATCH_SESSIONS.close)
 WATCH_LOG_THROTTLE = {}
 WATCH_LOG_LOCK = threading.Lock()
 PORT_BOUNCE_LOCK = threading.Lock()
-COMMIT_COMMENT = "Applied by Junos Helper"
+DEVICE_CHANGE_LOCKS: dict[str, threading.Lock] = {}
+DEVICE_CHANGE_LOCKS_GUARD = threading.Lock()
 CONFIRM_COMMENT = "Confirmed by Junos Helper"
-QUICK_DESCRIPTION_COMMIT_COMMENT = "Description update by Junos Helper"
 
 DISCOVERY_COMMANDS = (
     "show interfaces terse",
@@ -367,6 +368,11 @@ ACTIVITY_OPERATIONS = {
     "/api/ports/bounce": ("Port bounce", "change"),
     "/api/protected-ports": ("Port protection", "settings"),
     "/api/devices": ("Save device", "settings"), "/api/devices/group": ("Assign group", "settings"),
+    "/api/config-history": ("Configuration history", "review"),
+    "/api/config-history/compare": ("Historical comparison", "review"),
+    "/api/config-history/known-good": ("Save known good", "change"),
+    "/api/config-history/restore": ("Restore configuration", "change"),
+    "/api/config-history/confirm": ("Restore confirmation", "change"),
 }
 ACTIVITY_LAST_ERROR = ""
 
@@ -468,6 +474,28 @@ def start_activity() -> None:
                           "message": f"{operation} requested. No completion result recorded yet."})
 
 
+@app.before_request
+def serialize_device_changes():
+    if request.path not in {"/api/push", "/api/confirm", "/api/quick-task-commit", "/api/quick-description-commit",
+                            "/api/ports/bounce", "/api/config-history/known-good", "/api/config-history/restore",
+                            "/api/config-history/confirm"}:
+        return
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Supply a JSON object."}), 400
+    try:
+        host, _, _ = _connection_values(payload)
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"ok": False, "error": "Supply valid connection values."}), 400
+    if not host:
+        return
+    with DEVICE_CHANGE_LOCKS_GUARD:
+        lock = DEVICE_CHANGE_LOCKS.setdefault(host.lower(), threading.Lock())
+    if not lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Another switch change is in progress for this device."}), 409
+    g.device_change_lock = lock
+
+
 @app.after_request
 def finish_activity(response):
     event = getattr(g, "activity_event", None)
@@ -479,6 +507,12 @@ def finish_activity(response):
     status, severity = ("succeeded", "info") if ok else ("failed", "error")
     message = f'{event["operation"]} {"completed" if ok else "failed"}.'
     details = {**event["details"], "httpStatus": response.status_code}
+    if body.get("commitComment"):
+        details["commitComment"] = body["commitComment"]
+    if request.path.startswith("/api/config-history/"):
+        for key in ("sourceLabel", "knownGoodFingerprint", "baselineRevision", "revision", "label", "addedLines", "removedLines"):
+            if key in body:
+                details[key] = body[key]
     if request.path == "/api/connect" and ok:
         event["device_name"] = _activity_clean(body.get("deviceName"), payload)[:128]
         failures = [item for item in body.get("results", []) if item.get("error") or re.search(
@@ -489,11 +523,11 @@ def finish_activity(response):
             details["commandErrors"] = [{"command": item.get("command"),
                 "error": _activity_clean(_cli_failure_message(item.get("output", ""), item.get("error", ""), "Data pull failed"), payload)} for item in failures]
         message = f'{event["operation"]}: {details["interfaceCount"]} interfaces, {len(failures)} command errors.'
-    elif request.path == "/api/push" and ok and body.get("pendingConfirmation"):
+    elif request.path in {"/api/push", "/api/config-history/restore"} and ok and body.get("pendingConfirmation"):
         status = "awaiting-confirmation"
         details["confirmationDeadline"] = (datetime.now(timezone.utc) + timedelta(minutes=body.get("confirmMinutes", 5))).isoformat(timespec="seconds")
         message = "Configuration applied with rollback protection; awaiting final confirmation."
-    elif request.path == "/api/confirm" and ok:
+    elif request.path in {"/api/confirm", "/api/config-history/confirm"} and ok:
         status, message = "confirmed", "Committed change confirmed successfully."
     elif request.path.startswith("/api/quick-") and ok:
         status, message = "committed", "Quick changes committed successfully; no confirmation window."
@@ -517,18 +551,26 @@ def finish_activity(response):
     return response
 
 
+@app.teardown_request
+def release_device_change_lock(error=None):
+    lock = g.pop("device_change_lock", None)
+    if lock is not None:
+        lock.release()
+
+
 @app.get("/api/activity")
 def activity_history() -> Any:
     view = request.args.get("view", "changes")
     try:
         before = int(request.args.get("before", "0"))
-        if view not in {"changes", "all", "errors"} or before < 0:
+        if view not in {"changes", "all", "errors", "known-good"} or before < 0:
             raise ValueError
     except ValueError:
         return jsonify({"ok": False, "error": "Invalid activity filter."}), 400
     try:
         history = _activity_store().read(host=request.args.get("host", ""), view=view, before=before)
-        return jsonify({"ok": True, **history, "warning": ACTIVITY_LAST_ERROR,
+        catalog = _activity_store().known_good(host=request.args.get("host", "")) if view == "known-good" else []
+        return jsonify({"ok": True, **history, "knownGood": catalog, "warning": ACTIVITY_LAST_ERROR,
                         "retentionDays": 90, "maxEntries": 50000})
     except (OSError, sqlite3.Error, ValueError):
         return jsonify({"ok": False, "error": "Activity history is unavailable. Check the local storage location."}), 503
@@ -1016,6 +1058,11 @@ def live_watch_javascript() -> Any:
     return send_from_directory(RESOURCE_DIR, "live-watch.js")
 
 
+@app.get("/config-history.js")
+def config_history_javascript() -> Any:
+    return send_from_directory(RESOURCE_DIR, "config-history.js")
+
+
 @app.get("/api/health")
 def health() -> Any:
     return jsonify({"ok": True, "appVersion": APP_VERSION, "apiVersion": API_VERSION, "packaged": IS_FROZEN})
@@ -1355,6 +1402,78 @@ def _validated_description_only_lines(config_text: str) -> list[str]:
     return commands
 
 
+def _change_commit_comment(commands: list[str], *, confirmed: bool = False) -> str:
+    """Summarize submitted intent, never copy free text or secret configuration values."""
+    changes: dict[str, int] = {}
+    ports: set[str] = set()
+    vlans: set[str] = set()
+    areas = {"system", "protocols", "routing-options", "routing-instances", "policy-options",
+             "firewall", "snmp", "chassis", "groups", "access", "security"}
+    for command in commands:
+        parts = shlex.split(command)
+        action, area = parts[:2]
+        path = parts[3:]
+        label = area if area in areas else "configuration"
+        if area == "interfaces":
+            label = "interfaces"
+            if len(parts) > 2 and INTERFACE_RE.fullmatch(parts[2]):
+                ports.add(parts[2])
+            # Inspect only structural positions, never description text or other values.
+            if path[:1] == ["unit"] and len(path) >= 2:
+                path = path[2:]
+            if path[:2] == ["family", "ethernet-switching"]:
+                path = path[2:]
+            fields = {"description": "descriptions", "disable": "disable ports",
+                      "interface-mode": "port mode", "port-mode": "port mode",
+                      "native-vlan-id": "native VLAN", "vlan": "VLAN membership",
+                      "vlan-id": "VLAN tags", "vlan-id-list": "VLAN tags", "vlan-tags": "VLAN tags",
+                      "input-vlan-map": "VLAN mapping", "output-vlan-map": "VLAN mapping",
+                      "apply-groups": "interface groups"}
+            if path:
+                label = fields.get(path[0], label)
+            if path[:2] == ["vlan", "members"]:
+                vlans.update(name.strip("[]") for name in path[2:]
+                             if re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", name.strip("[]")))
+            if path[:1] in (["native-vlan-id"], ["vlan-id"]) and len(path) == 2 and path[1].isdigit():
+                label += f" {path[1]}"
+            if path == ["disable"]:
+                label = "disable ports" if action == "set" else "enable ports"
+        elif area == "vlans":
+            label = "VLANs"
+            if len(parts) > 2 and re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", parts[2]):
+                vlans.add(parts[2])
+            if path[:1] == ["interface"]:
+                label = "VLAN membership"
+                if len(path) > 1 and INTERFACE_RE.fullmatch(path[1]):
+                    ports.add(path[1])
+            elif path[:1] == ["vlan-id"] and len(path) == 2 and path[1].isdigit():
+                label = f"VLAN ID {path[1]}"
+        elif area == "poe":
+            label = "PoE"
+            if parts[2:3] == ["interface"] and len(parts) > 3 and INTERFACE_RE.fullmatch(parts[3]):
+                ports.add(parts[3])
+        label = label if label in {"disable ports", "enable ports"} else f"{action} {label}"
+        changes[label] = changes.get(label, 0) + 1
+
+    def targets(label: str, names: set[str]) -> str:
+        ordered = sorted(names)
+        shown = ",".join(ordered[:2])
+        return f"{label} {shown}" + (f" +{len(ordered) - 2}" if len(ordered) > 2 else "")
+
+    summaries = [f"{label} x{count}" for label, count in list(changes.items())[:3]]
+    if len(changes) > 3:
+        summaries.append(f"+{len(changes) - 3} change types")
+    # Reserve room for the total even when target names or change labels are long.
+    prefix = "Confirmed by Junos Helper: " if confirmed else "Junos Helper: "
+    suffix = f"; {len(commands)} command{'s' if len(commands) != 1 else ''}"
+    detail = "; ".join(summaries + ([targets("ports", ports)] if ports else [])
+                       + ([targets("VLANs", vlans)] if vlans else []))
+    budget = 240 - len(prefix) - len(suffix)
+    if len(detail) > budget:
+        detail = detail[:budget - 3] + "..."
+    return prefix + detail + suffix
+
+
 def _execute_cli(client: paramiko.SSHClient, cli_commands: str) -> tuple[str, str, int]:
     remote_command = f"cli -c {shlex.quote(cli_commands)}"
     _, stdout, stderr = client.exec_command(remote_command, timeout=60)
@@ -1643,20 +1762,15 @@ def _bounce_read(client: paramiko.SSHClient, command: str) -> str:
     return output
 
 
-def _check_bounce_ports(client: paramiko.SSHClient, host: str, ports: list[str], kind: str) -> None:
+def _check_bounce_ports(client: paramiko.SSHClient, ports: list[str], kind: str) -> None:
     details = {item["name"]: item for item in _parse_interface_details(_bounce_read(client, "show interfaces terse"))}
     configuration = _parse_interface_configuration(_bounce_read(client, "show configuration interfaces | display set"))
     for name in details:
         configuration.setdefault(name, {})
-    macs = _parse_ethernet_switching_table(_bounce_read(client, "show ethernet-switching table"))
-    neighbors = _parse_lldp_neighbors(_bounce_read(client, "show lldp neighbors detail"))
-    exclusions = _quick_port_exclusions(configuration, macs, neighbors, _manual_protected_ports(host), access_only=False)
     errors = []
     for name in ports:
         if name not in details:
             errors.append(f"{name}: physical interface was not discovered; refresh inventory")
-        elif name in exclusions:
-            errors.append(f"{name}: {exclusions[name]}")
         elif configuration[name].get("disabled") or details[name]["admin"] != "up":
             errors.append(f"{name}: interface must be administratively enabled")
     if errors:
@@ -1688,7 +1802,7 @@ def bounce_ports() -> Any:
     results = []
     try:
         client = _ssh_client(host, username, password)
-        _check_bounce_ports(client, host, ports, kind)
+        _check_bounce_ports(client, ports, kind)
         for name in ports:
             command = f"request interface bounce {'poe ' if kind == 'poe' else ''}{name} interval {interval}"
             try:
@@ -1795,7 +1909,7 @@ def quick_description_commit() -> Any:
                 _parse_lldp_neighbors(fresh["show lldp neighbors detail"]), _manual_protected_ports(host)
             )
         combined = "; ".join(commands)
-        commit_comment = "Quick tasks via Junos Helper" if request.path == "/api/quick-task-commit" else QUICK_DESCRIPTION_COMMIT_COMMENT
+        commit_comment = _change_commit_comment(commands)
         output, error, exit_status = _execute_cli(
             client,
             f'configure exclusive; {combined}; commit check; commit comment "{commit_comment}"; exit',
@@ -1817,6 +1931,7 @@ def quick_description_commit() -> Any:
                 "error": error.strip(),
                 "pendingConfirmation": False,
                 "commandCount": len(commands),
+                "commitComment": commit_comment,
             }
         )
     except (paramiko.SSHException, OSError, ValueError) as exc:
@@ -1863,9 +1978,10 @@ def push_config() -> Any:
                 "ok": False, "stage": "commit-check", "error": message,
                 "output": check_output.strip(), "pendingConfirmation": False,
             }), 422
+        commit_comment = _change_commit_comment(commands)
         output, error, exit_status = _execute_cli(
             client,
-            f'configure exclusive; {combined}; commit check; commit confirmed 5 comment "{COMMIT_COMMENT}"; exit',
+            f'configure exclusive; {combined}; commit check; commit confirmed 5 comment "{commit_comment}"; exit',
         )
         combined_output = f"{output}\n{error}".lower()
         success = "commit complete" in combined_output or "commit confirmed" in combined_output
@@ -1884,6 +2000,7 @@ def push_config() -> Any:
                 "pendingConfirmation": True,
                 "commitCheckPassed": True,
                 "confirmMinutes": 5,
+                "commitComment": commit_comment,
             }
         )
     except (paramiko.SSHException, OSError, ValueError) as exc:
@@ -1901,12 +2018,22 @@ def confirm_config() -> Any:
     if not host or not username:
         return jsonify({"ok": False, "error": "Host and username are required."}), 400
 
+    # The browser retains the frozen draft until confirmation. It is used only
+    # for the comment here; confirmation never reapplies its commands.
+    commit_comment = CONFIRM_COMMENT
+    if isinstance(payload.get("config"), str) and payload["config"]:
+        try:
+            commit_comment = _change_commit_comment(_validated_config_lines(payload["config"]), confirmed=True)
+        except (ValueError, TypeError):
+            # Comment metadata must not prevent time-sensitive confirmation.
+            pass
+
     client: paramiko.SSHClient | None = None
     try:
         client = _ssh_client(host, username, password)
         output, error, exit_status = _execute_cli(
             client,
-            f'configure exclusive; commit comment "{CONFIRM_COMMENT}"; exit',
+            f'configure exclusive; commit comment "{commit_comment}"; exit',
         )
         combined_output = f"{output}\n{error}".lower()
         if exit_status != 0 or "commit complete" not in combined_output or "error:" in combined_output:
@@ -1915,10 +2042,69 @@ def confirm_config() -> Any:
             return jsonify(
                 {"ok": False, "error": message, "output": output.strip()}
             ), 502
-        return jsonify({"ok": True, "output": output.strip(), "error": error.strip()})
+        return jsonify({"ok": True, "output": output.strip(), "error": error.strip(), "commitComment": commit_comment})
     except (paramiko.SSHException, OSError, ValueError) as exc:
         logger.warning("Commit confirmation failed for %s: %s", host, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        if client is not None:
+            client.close()
+
+
+@app.post("/api/config-history")
+@app.post("/api/config-history/compare")
+@app.post("/api/config-history/known-good")
+@app.post("/api/config-history/restore")
+@app.post("/api/config-history/confirm")
+def configuration_history_api():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Supply a JSON object."}), 400
+    try:
+        host, username, password = _connection_values(payload)
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"ok": False, "error": "Supply valid connection values."}), 400
+    if not host or not username:
+        return jsonify({"ok": False, "error": "Host and username are required."}), 400
+    path = request.path.rsplit("/", 1)[-1]
+    if path == "config-history" and (type(payload.get("depth", 20)) is not int or payload.get("depth", 20) not in {15, 20}):
+        return jsonify({"ok": False, "error": "Choose 15 or 20 previous configurations."}), 400
+    label = payload.get("label", "")
+    if path == "known-good" and (not isinstance(label, str) or len(label) > 64 or re.search(r"[\x00-\x1f\x7f]", label)):
+        return jsonify({"ok": False, "error": "Known-good labels accept up to 64 characters on one line."}), 400
+    client = None
+    try:
+        client = _ssh_client(host, username, password)
+        service = HistoryService(client, host, username)
+        if path == "config-history":
+            result = service.history(payload.get("depth", 20))
+            known = result["knownGood"]
+            try:
+                known["catalog"] = _activity_store().observe_known_good(host, _activity_clean(payload.get("deviceName"), payload)[:128],
+                    known["fingerprint"], error=known.get("error", ""))
+            except (OSError, sqlite3.Error):
+                result["catalogWarning"] = "Known-good catalog could not be updated; live switch results are shown."
+        elif path == "compare":
+            result = service.compare(payload.get("sourceToken"))
+        elif path == "known-good":
+            result = service.save_known_good(payload.get("baselineToken"), payload.get("replaceFingerprint"))
+            result["knownGoodFingerprint"] = result.pop("fingerprint")
+            result["label"] = _activity_clean(label.strip(), payload)[:64]
+            try:
+                result["catalog"] = _activity_store().observe_known_good(host, _activity_clean(payload.get("deviceName"), payload)[:128],
+                    result["knownGoodFingerprint"], saved={"operator": _activity_clean(username, payload),
+                    "revision": result["revision"], "label": result["label"]})
+            except (OSError, sqlite3.Error):
+                result["catalogWarning"] = "Rescue save verified, but known-good catalog metadata could not be saved."
+        elif path == "restore":
+            result = service.restore(payload.get("previewToken"))
+        else:
+            result = service.confirm(payload.get("confirmationToken"))
+        return jsonify({"ok": True, **result})
+    except HistoryError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), exc.status
+    except (paramiko.SSHException, OSError):
+        return jsonify({"ok": False, "error": "Switch connection failed or its response was lost. Verify switch state before retrying a save or restore."}), 502
     finally:
         if client is not None:
             client.close()

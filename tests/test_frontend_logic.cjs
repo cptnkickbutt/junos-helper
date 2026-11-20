@@ -23,7 +23,7 @@ function loadSourceSection(startMarker, endMarker, context = {}) {
 }
 
 function navigationContext(editingTab) {
-  const buttons = ["watch", "configure", "move", "series", "vlans", "custom", "review"].map((tab) => ({
+  const buttons = ["watch", "configure", "move", "series", "vlans", "custom", "history", "review"].map((tab) => ({
     dataset: { tab }, classList: { toggle() {} }, setAttribute() {},
     focus() { this.focused = true; }
   }));
@@ -44,6 +44,8 @@ test("Live watch does not replace the most recent editing tab as the queue retur
   context.activateWorkspaceTab("watch");
   assert.equal(context.state.lastEditingTab, "custom");
   assert.equal(context.tabPanels.find((panel) => !panel.hidden).dataset.panel, "watch");
+  context.activateWorkspaceTab("history");
+  assert.equal(context.state.lastEditingTab, "custom");
 });
 
 function inventoryRefreshContext() {
@@ -231,7 +233,7 @@ function utilityContext() {
     deviceDataOutput: element(), deviceDataSummary: element(),
     activityLogScope: { value: "active" }, activityLogView: { value: "changes" },
     activityLogSummary: element(), activityLogList: element(), refreshActivityLogBtn: element(), olderActivityLogBtn: element(),
-    URLSearchParams, document: { createElement: element },
+    URLSearchParams, document: { createElement: element, getElementById: () => null },
     fetch: async () => { assert.fail("This action must not make a request"); }
   });
   context.optionsDialog.open = true;
@@ -302,6 +304,70 @@ test("out-of-order history requests cannot display a previous device or filter",
   assert.match(context.activityLogSummary.textContent, /All devices/);
   assert.match(context.activityEventMessage(historyEvent(1, { confirmationState: "window-elapsed" })), /Verify the current switch state/);
   assert.doesNotMatch(context.activityEventMessage(historyEvent(1, { confirmationState: "window-elapsed" })), /rolled back/);
+});
+
+test("known-good log opens all devices and renders its durable catalog as text", async () => {
+  const context = utilityContext();
+  const catalog = { children: [], hidden: true, replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); } };
+  context.document.getElementById = () => catalog;
+  let query;
+  context.fetch = async (url) => {
+    query = url;
+    return { ok: true, json: async () => ({ ok: true, events: [], knownGood: [{ host: 'switch-b',
+      deviceName: '<script>unsafe</script>', state: 'available', label: 'Verified', savedAt: '2026-11-20T15:00:00Z',
+      observedAt: '2026-11-20T15:00:00Z', operator: 'netops', fingerprint: 'a'.repeat(64) }] }) };
+  };
+  await context.showActivityLog({ knownGood: true });
+  assert.match(query, /view=known-good/);
+  assert.doesNotMatch(query, /host=/);
+  assert.equal(catalog.hidden, false);
+  assert.match(catalog.children[2].textContent, /<script>unsafe<\/script>.*switch-b.*Verified/);
+  context.activityLogView.value = 'changes';
+  await context.loadActivityLog();
+  assert.equal(catalog.hidden, true);
+});
+
+test("generated target comments do not block restore but actual editor or queue work does", () => {
+  const context = loadSourceSection('function getConfigHistoryContext', 'let historyConnectionDisabled', {
+    connectionPayload: () => ({ host: 'switch' }), hostInput: { value: 'switch' },
+    state: { protectionHost: 'switch', configQueue: [] }, configOutput: { value: '# Target: switch\n# SSH: user@switch' },
+    configCommandCount: (text) => text.split('\n').filter(line => line.trim() && !line.trim().startsWith('#')).length
+  });
+  assert.equal(context.getConfigHistoryContext().hasDraft, false);
+  context.configOutput.value += '\nset interfaces ge-0/0/1 disable';
+  assert.equal(context.getConfigHistoryContext().hasDraft, true);
+  context.configOutput.value = '';
+  context.state.configQueue = [{ config: 'set vlans CAMERA vlan-id 310' }];
+  assert.equal(context.getConfigHistoryContext().hasDraft, true);
+});
+
+test("restore confirmation stays bound to its original device and rejects duplicate clicks", async () => {
+  const calls = [], busy = [];
+  let finish;
+  const context = loadSourceSection('async function confirmCommit', '[hostInput, usernameInput]', {
+    state: { pendingConfirmation: true, confirmationDeadline: Date.now() + 60000, pendingActivityId: 'original-activity',
+      pendingHistoryConfirmation: { token: 'reviewed-token', password: 'original-password' },
+      pendingTarget: { host: 'switch-a', username: 'original-user', deviceId: 'A', deviceName: 'Access A' } },
+    hostInput: { value: 'switch-b' }, usernameInput: { value: 'other-user' }, passwordInput: { value: 'other-password' },
+    deviceNameInput: { value: 'Other device' }, confirmBtn: {}, connectionStatus: {},
+    setHistoryChangeInProgress: value => busy.push(value),
+    clearDeploymentWorkspace: () => assert.fail('Restore confirmation must not clear unrelated drafts'),
+    setDeploymentReady() {}, connectToSwitch: async () => {}, window: {},
+    fetch: async (url, options) => {
+      calls.push({ url, payload: JSON.parse(options.body) });
+      return new Promise(resolve => { finish = resolve; });
+    }
+  });
+  const first = context.confirmCommit();
+  await context.confirmCommit();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], { url: '/api/config-history/confirm', payload: { deviceId: 'A', host: 'switch-a',
+    username: 'original-user', password: 'original-password', deviceName: 'Access A',
+    confirmationFor: 'original-activity', confirmationToken: 'reviewed-token' } });
+  finish({ ok: true, json: async () => ({ ok: true }) });
+  await first;
+  assert.deepEqual(busy, [true, false]);
+  assert.equal(context.state.historyConfirmationInProgress, false);
 });
 
 test("browser logging failures retain messages for retry without recursively throwing", async () => {
@@ -594,7 +660,11 @@ test("successful quick commits and confirmations return to editing; failures sta
         isDescriptionOnlyDeployment: () => operation !== "quickTasks", connectionPayload: (value) => value,
         quickTaskValidationError: () => "", connectToSwitch: async () => {},
         configCommandCount: () => 1, renderConfigQueue() {}, setDeploymentReady() {},
-        requests: [], fetch: async (url) => { context.requests.push(url); return { ok, json: async () => ({ ok }) }; }
+        requests: [], fetch: async (url, options) => {
+          context.requests.push(url);
+          if (operation === "confirmCommit") assert.equal(JSON.parse(options.body).config, "config");
+          return { ok, json: async () => ({ ok }) };
+        }
       });
       context.state.pendingConfirmation = operation === "confirmCommit";
       context.state.confirmationDeadline = Date.now() + 60000;
@@ -621,6 +691,88 @@ function stagedVlansContext() {
   context.renderConfigQueue = () => context.syncAvailableVlans();
   return context;
 }
+
+function membershipEditContext(members) {
+  const context = commandActionContext('configure');
+  context.appendModeFieldInput.checked = false;
+  context.appendVlanFieldInput.checked = true;
+  context.portModeInput.value = 'trunk';
+  context.state.vlans = [{ name: 'KEEP', value: '310' }, { name: 'DROP', value: '311' }];
+  context.state.ports[0].currentVlans = ['KEEP', 'DROP'];
+  context.parseMembershipInput = () => [...members];
+  return context;
+}
+
+function appliedMembership(config, initial = []) {
+  const members = new Set(initial);
+  for (const line of config.split('\n')) {
+    const match = line.match(/^(set|delete) interfaces ge-0\/0\/1 unit 0 family ethernet-switching vlan members(?: (.+))?$/);
+    if (!match) continue;
+    if (match[1] === 'delete' && !match[2]) members.clear();
+    else for (const name of (match[2] || '').replace(/[\[\]]/g, '').split(/\s+/).filter(Boolean)) {
+      if (match[1] === 'set') members.add(name);
+      else members.delete(name);
+    }
+  }
+  return [...members];
+}
+
+test('focused VLAN membership stages the final checked list, including removals and an empty list', () => {
+  for (const desired of [['KEEP'], [], ['KEEP', 'DROP']]) {
+    const context = membershipEditContext(desired);
+    context.appendSelectedFields();
+    assert.deepEqual(appliedMembership(context.configOutput.value, ['KEEP', 'DROP']), desired);
+    assert.doesNotMatch(context.configOutput.value, /interface-mode| description |unit 300/);
+    assert.match(context.connectionStatus.textContent, /match the checked list/);
+  }
+});
+
+test('membership edits override older manual or queued membership without touching other queued work', () => {
+  const context = membershipEditContext(['KEEP']);
+  context.state.configManual = true;
+  context.configOutput.value = 'set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members DROP';
+  context.state.configQueue = [{ label: 'Original', config: 'set vlans OTHER vlan-id 312\nset interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members DROP' }];
+  const queue = JSON.stringify(context.state.configQueue);
+  context.appendSelectedFields();
+  assert.deepEqual(appliedMembership(context.combinedDeploymentConfig(), ['KEEP', 'DROP']), ['KEEP']);
+  assert.equal(JSON.stringify(context.state.configQueue), queue);
+  assert.match(context.configOutput.value, /delete interfaces ge-0\/0\/1 unit 0 family ethernet-switching vlan members/);
+});
+
+test('deselected native membership clears discovered or previously staged native settings', () => {
+  for (const queued of [false, true]) {
+    const context = membershipEditContext(['KEEP']);
+    if (queued) context.state.configQueue = [{ config: 'set interfaces ge-0/0/1 native-vlan-id 311' }];
+    else context.state.ports[0].currentNativeVlanId = '311';
+    context.appendSelectedFields();
+    assert.match(context.configOutput.value, /delete interfaces ge-0\/0\/1 native-vlan-id/);
+    assert.deepEqual(appliedMembership(context.configOutput.value, ['KEEP', 'DROP']), ['KEEP']);
+  }
+  const retained = membershipEditContext(['KEEP']);
+  retained.state.ports[0].currentNativeVlanId = '310';
+  retained.appendSelectedFields();
+  assert.doesNotMatch(retained.configOutput.value, /native-vlan-id/);
+});
+
+test('membership checkbox changes clear the native picker when that VLAN is unchecked', () => {
+  let change;
+  const context = membershipEditContext(['KEEP']);
+  context.nativeVlanInput.value = '311';
+  context.vlanMembershipInput.addEventListener = (name, callback) => { change = callback; };
+  context.updateIntendedChangeSummary = () => {};
+  context.updateConfig = () => {};
+  runSourceSection('vlanMembershipInput.addEventListener("change"', 'configOutput.addEventListener', context);
+  change();
+  assert.equal(context.nativeVlanInput.value, '');
+});
+
+test('full regeneration resets memberships from older batches even if inventory has no VLANs', () => {
+  const context = membershipEditContext(['KEEP']);
+  context.state.ports[0].currentVlans = [];
+  context.state.configQueue = [{ config: 'set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members DROP' }];
+  context.applySelectedPorts();
+  assert.deepEqual(appliedMembership(context.combinedDeploymentConfig(), ['DROP']), ['KEEP']);
+});
 
 function refreshVlanInventory(context, vlans) {
   context.payload = { vlanMemberships: vlans, host: "switch", bridgeServices: [], irbUnits: [] };
@@ -786,10 +938,13 @@ test("bounce buttons call their operational API without deploying or clearing st
   }
 });
 
-test("bounce rejects protected ports, disabled ports, invalid intervals and stale targets", async () => {
-  for (const scenario of ["protected", "disabled", "interval", "stale", "empty"]) {
+test("bounce rejects disabled ports, invalid intervals and stale targets", async () => {
+  for (const scenario of ["disabled", "interval", "stale", "empty", "logical", "aggregate"]) {
     const context = bounceContext();
-    if (scenario === "protected") context.state.selected = new Set(["xe-0/0/48"]);
+    if (["logical", "aggregate"].includes(scenario)) {
+      context.state.ports[0].name = scenario === "logical" ? "ge-0/0/1.300" : "ae0";
+      context.state.selected = new Set([context.state.ports[0].name]);
+    }
     if (scenario === "disabled") context.state.ports[0].currentDisabled = true;
     if (scenario === "interval") context.elements.bounceInterval.value = "0";
     if (scenario === "stale") context.hostInput.value = "another-switch";
@@ -798,6 +953,28 @@ test("bounce rejects protected ports, disabled ports, invalid intervals and stal
     assert.equal(context.requests.length, 0);
     assert.equal(context.confirmations.length, 0);
     assert.equal(context.elements.portBounceResults.className, "tool-summary error-text");
+  }
+});
+
+test("bounce allows locked ports after warning and preserves their protection", async () => {
+  for (const kind of ["link", "poe"]) {
+    for (const manual of [true, false]) {
+      const context = bounceContext();
+      if (manual) context.state.manualProtectedPorts = ["ge-0/0/1"];
+      else context.state.selected = new Set(["xe-0/0/48"]);
+      assert.equal(context.bounceSelectionError(), "");
+      const protection = [...context.state.manualProtectedPorts];
+      await context.bounceSelectedPorts(kind);
+      assert.equal(context.requests.length, 1);
+      assert.match(context.confirmations[0], /Warning: protected ports selected/);
+      assert.match(context.confirmations[0], /switch management access/);
+      assert.deepEqual([...context.state.manualProtectedPorts], protection);
+      const canceled = bounceContext();
+      canceled.state.manualProtectedPorts = ["ge-0/0/1"];
+      canceled.window.confirm = () => false;
+      await canceled.bounceSelectedPorts(kind);
+      assert.equal(canceled.requests.length, 0);
+    }
   }
 });
 
@@ -968,7 +1145,7 @@ function serviceBuilderContext() {
   const context = {
     state: {
       vlans: [{ name: "CUSTOMER", value: 310 }], irbUnits: [],
-      bridgeServices: [], ports: []
+      bridgeServices: [], ports: [], configQueue: [], configManual: false
     },
     irbVlanInput: { value: "CUSTOMER" }, irbUnitInput: { value: "310" },
     irbAddressInput: { value: "192.0.2.1/24" }, irbSummary: {},
@@ -977,11 +1154,16 @@ function serviceBuilderContext() {
     qinqServiceNameInput: { value: "CUSTOMER_QINQ" },
     qinqOuterTagInput: { value: "200" }, qinqInnerTagInput: { value: "300" },
     qinqMtuInput: { value: "9216" }, qinqSummary: {}, connectionStatus: {},
-    batches: [], tabs: []
+    batches: [], tabs: [], configOutput: { value: "" }, descriptionInput: { value: "Customer description" },
+    window: { confirm: () => true }
   };
   context.appendConfigLines = (lines) => context.batches.push(Array.from(lines));
+  context.replaceConfig = (text) => { context.configOutput.value = text; context.state.configManual = true; context.batches.push(text.split("\n")); };
   context.activateWorkspaceTab = (tab) => context.tabs.push(tab);
-  return loadSourceSection("function validIpv4Prefix", "function applySelectedPorts", context);
+  loadSourceSection("function validIpv4Prefix", "function applySelectedPorts", context);
+  runSourceSection("function escapeDescription", "function seriesNumberWidth", context);
+  runSourceSection("function buildDescriptionLine", "function buildSeriesConfiguration", context);
+  return context;
 }
 
 test("IRB button builds gateway commands and opens review", () => {
@@ -1069,12 +1251,14 @@ function groupedServiceContext() {
   return context;
 }
 
-test("group QinQ adds a customer using the service unit and all regular memberships without editing the shared uplink", () => {
+test("group QinQ rebuilds a customer using the service unit, Configure description, and all regular memberships", () => {
   const context = groupedServiceContext();
   context.buildQinqConfiguration();
   assert.deepEqual(context.batches[0].slice(1), [
+    "delete interfaces mge-0/0/14",
     "set interfaces mge-0/0/14 apply-groups APARTMENT",
     "set interfaces mge-0/0/14 unit 304 vlan-id-list 3002",
+    'set interfaces mge-0/0/14 description "Customer description"',
     "set vlans APT_SERVICE interface mge-0/0/14.304",
     "set vlans VOICE interface mge-0/0/14.26",
     "set vlans AP_MGMT interface mge-0/0/14.307",
@@ -1084,6 +1268,63 @@ test("group QinQ adds a customer using the service unit and all regular membersh
   context.updateQinqSummary();
   assert.match(context.qinqSummary.textContent, /native 311/);
   assert.match(context.qinqSummary.textContent, /mge-0\/0\/14\.304/);
+});
+
+test('group QinQ ignores automatic Configure fields and rebuilds an occupied customer without changing peers', () => {
+  const context = groupedServiceContext();
+  const target = context.state.ports[1];
+  target.currentSetLines = [
+    'set interfaces mge-0/0/14 unit 0 family ethernet-switching interface-mode trunk',
+    'set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members OLD',
+    'set interfaces mge-0/0/14 unit 99 vlan-id 999', 'set interfaces mge-0/0/14 disable'
+  ];
+  target.currentEffectiveSetLines = [...target.currentSetLines];
+  context.state.bridgeServices.push({ name: 'OLD_SERVICE', interfaces: ['mge-0/0/14.99', 'xe-0/2/0.99'] });
+  context.state.bridgeServices.push({ name: 'OLD', interfaces: ['mge-0/0/14.0'] });
+  context.state.configManual = false;
+  context.configOutput.value = 'set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members WRONG\nset interfaces mge-0/0/14 native-vlan-id 999';
+  context.descriptionInput.value = '14_New "customer"';
+  let warning;
+  context.window.confirm = message => { warning = message; return true; };
+  context.buildQinqConfiguration();
+  const lines = context.batches[0];
+  assert.ok(lines.indexOf('delete vlans OLD_SERVICE interface mge-0/0/14.99') < lines.indexOf('delete interfaces mge-0/0/14'));
+  assert.ok(lines.includes('delete vlans OLD interface mge-0/0/14.0'));
+  assert.ok(lines.includes('set interfaces mge-0/0/14 description "14_New \\"customer\\""'));
+  assert.doesNotMatch(lines.join('\n'), /WRONG|native-vlan-id 999|set interfaces mge-0\/0\/14 disable|unit 0 family/);
+  assert.doesNotMatch(lines.join('\n'), /^(?:set|delete) (?:groups|interfaces xe-0\/2\/0|interfaces mge-0\/0\/13)/m);
+  assert.doesNotMatch(lines.join('\n'), /delete vlans OLD_SERVICE interface xe-0\/2\/0\.99/);
+  assert.match(warning, /Rebuild customer port mge-0\/0\/14/);
+});
+
+test('group QinQ replaces only target edits in the manual draft and preserves unrelated work and queued batches', () => {
+  const context = groupedServiceContext();
+  context.state.configManual = true;
+  context.configOutput.value = [
+    'set interfaces mge-0/0/14 native-vlan-id 999',
+    'set vlans OLD interface mge-0/0/14.99',
+    'set interfaces mge-0/0/140 description "Leave alone"',
+    'set vlans NEW vlan-id 700'
+  ].join('\n');
+  context.state.configQueue = [{ config: 'set interfaces mge-0/0/15 description "Queued"' }];
+  const queue = JSON.stringify(context.state.configQueue);
+  context.buildQinqConfiguration();
+  const text = context.batches[0].join('\n');
+  assert.doesNotMatch(text, /native-vlan-id 999|set vlans OLD interface/);
+  assert.match(text, /interfaces mge-0\/0\/140 description "Leave alone"/);
+  assert.match(text, /set vlans NEW vlan-id 700/);
+  assert.equal(JSON.stringify(context.state.configQueue), queue);
+});
+
+test('canceled grouped QinQ rebuild preserves the entire draft and stays in context', () => {
+  const context = groupedServiceContext();
+  context.configOutput.value = 'set interfaces mge-0/0/14 description "Keep draft"';
+  context.state.configManual = true;
+  context.window.confirm = () => false;
+  context.buildQinqConfiguration();
+  assert.equal(context.configOutput.value, 'set interfaces mge-0/0/14 description "Keep draft"');
+  assert.equal(context.batches.length, 0);
+  assert.equal(context.tabs.length, 0);
 });
 
 test("group template controls populate the shared service fields and allow switching back to standalone", () => {
@@ -1108,20 +1349,20 @@ test("group template controls populate the shared service fields and allow switc
   assert.equal(templateLabel.hidden, true);
 });
 
-test("group QinQ rejects duplicate tags, ranges, regular VLAN overlap, occupied ports, and unresolved inheritance", () => {
+test("group QinQ rejects duplicate tags, ranges, regular VLAN overlap, staged layout changes, and unresolved inheritance", () => {
   const cases = [
     [(c) => { c.qinqInnerTagInput.value = "3001"; }, /already used/],
     [(c) => { c.state.ports[0].currentUnits["304"].vlanIds = ["3000-3010"]; c.state.ports[0].currentSetLines[2] = "set interfaces mge-0/0/13 unit 304 vlan-id-list 3000-3010"; }, /already used/],
     [(c) => { c.qinqInnerTagInput.value = "311"; }, /overlaps a regular VLAN/],
-    [(c) => { c.state.ports[1].currentSetLines.push("set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members DATA"); }, /already has other configuration/],
     [(c) => { c.state.ports[0].inheritanceResolved = false; }, /resolved group service/],
     [(c) => { c.state.ports[0].currentGroupInterfacePatterns.APARTMENT = ["mge-0/0/13"]; }, /verified <\*> interface groups/],
     [(c) => { c.state.ports[2].inheritanceResolved = false; }, /existing shared uplink/],
     [(c) => { c.state.ports[0].currentUnits["304"].vlanIds.push("3999"); }, /entirely explicit/],
     [(c) => { c.state.ports[1].currentEffectiveSetLines = ["set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members INHERITED"]; }, /inherited interface settings/],
-    [(c) => { c.state.bridgeServices.push({ name: "OTHER", interfaces: ["mge-0/0/14.99"] }); }, /another logical service/],
-    [(c) => { c.combinedDeploymentConfig = () => "set groups APARTMENT interfaces <*> native-vlan-id 999"; }, /preview or queue already changes/],
-    [(c) => { c.combinedDeploymentConfig = () => "set interfaces mge-0/0/15 unit 304 vlan-id-list 3002\nset vlans APT_SERVICE interface mge-0/0/15.304"; }, /already staged/]
+    [(c) => { c.state.configQueue = [{ config: "set groups APARTMENT interfaces <*> native-vlan-id 999" }]; }, /preview or queue already changes/],
+    [(c) => { c.state.configQueue = [{ config: "set interfaces mge-0/0/15 unit 304 vlan-id-list 3002\nset vlans APT_SERVICE interface mge-0/0/15.304" }]; }, /already staged/],
+    [(c) => { c.state.configQueue = [{ config: "set interfaces mge-0/0/14 unit 0 family ethernet-switching vlan members DATA" }]; }, /queued batch already changes/],
+    [(c) => { c.state.configQueue = [{ config: "delete vlans VOICE" }]; }, /preview or queue already changes/]
   ];
   for (const [change, expected] of cases) {
     const context = groupedServiceContext();

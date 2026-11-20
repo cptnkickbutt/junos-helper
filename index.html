@@ -124,6 +124,7 @@
             <button class="tab-button" id="tab-series" role="tab" aria-selected="false" aria-controls="panel-series" data-tab="series">Series/Descriptions</button>
             <button class="tab-button" id="tab-vlans" role="tab" aria-selected="false" aria-controls="panel-vlans" data-tab="vlans">VLANs</button>
             <button class="tab-button" id="tab-custom" role="tab" aria-selected="false" aria-controls="panel-custom" data-tab="custom">Custom command</button>
+            <button class="tab-button" id="tab-history" role="tab" aria-selected="false" aria-controls="panel-history" data-tab="history">Config history &amp; rollback</button>
             <button class="tab-button review-tab" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review">Review & deploy</button>
           </nav>
 
@@ -149,7 +150,7 @@
           </div>
 
           <div class="tab-panel active" id="panel-configure" role="tabpanel" aria-labelledby="tab-configure" data-panel="configure">
-            <div class="tab-intro"><h3>Configure selected ports</h3><p>Controls hydrate from a single selected port. Use them to build a final switching configuration or append a focused edit.</p></div>
+            <div class="tab-intro"><h3>Configure selected ports</h3><p>Controls hydrate from a single selected port. VLAN membership represents the final checked list: deselect a VLAN to remove it when staging membership changes.</p></div>
             <div class="configuration-tools">
               <label>Port mode<select id="portMode"><option value="access">Access</option><option value="trunk">Trunk</option></select></label>
               <label>Native VLAN<select id="nativeVlan" disabled><option value="">Trunk mode only</option></select></label>
@@ -162,19 +163,19 @@
             <div class="tab-card-grid">
               <div class="tool-group">
                 <h4>Configuration builder</h4>
-                <p>Regenerate every field, or choose only the fields that should be appended. A focused append replaces an untouched automatic draft. Successful command actions open Review &amp; deploy.</p>
+                <p>Regenerate every field, or stage only the chosen fields. VLAN membership updates replace the port’s unit 0 membership with the checked list; an empty list clears it. Deselecting its native VLAN also clears that native setting. Successful command actions open Review &amp; deploy.</p>
                 <fieldset class="append-field-picker">
-                  <legend>Fields to append</legend>
+                  <legend>Fields to update</legend>
                   <div class="append-field-options">
                     <label><input id="appendModeField" type="checkbox" />Port mode</label>
-                    <label><input id="appendVlanField" type="checkbox" />VLAN membership</label>
                     <label><input id="appendNativeVlanField" type="checkbox" />Native VLAN</label>
+                    <label><input id="appendVlanField" type="checkbox" />VLAN membership</label>
                     <label><input id="appendDescriptionField" type="checkbox" />Description</label>
                   </div>
                 </fieldset>
                 <div class="button-row stage-actions">
                   <button id="applyBtn">Regenerate full config</button>
-                  <button id="appendSelectedFieldsBtn" class="secondary">Append selected fields</button>
+                  <button id="appendSelectedFieldsBtn" class="secondary">Stage selected fields</button>
                   <button id="removeVlanBtn" class="secondary">Append VLAN removal</button>
                 </div>
               </div>
@@ -191,7 +192,7 @@
                   <button id="bouncePortsBtn" class="action-bounce-link" type="button" disabled>Port bounce</button>
                   <button id="bouncePoeBtn" class="action-bounce-poe" type="button" disabled>PoE bounce</button>
                 </div>
-                <p>Bounces run immediately after confirmation and interrupt service. Set off time under <strong>Options &rarr; Port actions</strong>. Protected and disabled ports are excluded. Native bounce support is required on the switch; PoE must be enabled for a PoE bounce.</p>
+                <p>Bounces run immediately after confirmation and interrupt service. Set off time under <strong>Options &rarr; Port actions</strong>. Protected ports can be bounced after a warning; their locks remain enabled. Administratively disabled ports are excluded. Native bounce support is required on the switch; PoE must be enabled for a PoE bounce.</p>
                 <pre id="portBounceResults" class="tool-summary" role="status" aria-live="polite">Select ports to bounce their links or cycle PoE power.</pre>
               </div>
             </div>
@@ -213,7 +214,7 @@
 
                 <section class="feature-focus-card service-builder" aria-labelledby="qinqBuilderTitle">
                   <h4 id="qinqBuilderTitle">Q-in-Q services</h4>
-                  <p>Add a customer port to a discovered group and shared service, or build a standalone service pair. Review the commands before pushing.</p>
+                  <p>Rebuild the customer port from a discovered group layout and shared service. This replaces its interface settings and old VLAN-unit references; only Description comes from Configure. Shared groups and uplinks stay unchanged. A standalone service-pair builder is also available.</p>
                   <div class="service-controls qinq-controls">
                     <label>Setup<select id="qinqMode"><option value="group">Existing group / shared uplink</option><option value="standalone">New standalone pair</option></select></label>
                     <label id="qinqTemplateLabel">Copy service layout from<select id="qinqTemplate"><option value="">Connect to discover group services</option></select></label>
@@ -225,7 +226,7 @@
                     <label>Physical MTU<input id="qinqMtu" type="number" min="1518" max="16384" value="9216" /></label>
                   </div>
                   <div id="qinqSummary" class="tool-summary muted" role="status">Choose two different physical ports and both VLAN tags.</div>
-                  <button id="buildQinqBtn">Append Q-in-Q configuration</button>
+                  <button id="buildQinqBtn">Build Q-in-Q configuration</button>
                 </section>
 
                 <section class="feature-focus-card service-builder logical-service-move" aria-labelledby="logicalServiceMoveTitle">
@@ -314,6 +315,37 @@
               <pre id="customCommandPreview" class="custom-command-preview" aria-label="Expanded custom commands">No custom commands to preview.</pre>
               <button id="buildCustomCommandBtn" type="button">Append custom commands</button>
             </div>
+          </div>
+
+          <div class="tab-panel" id="panel-history" role="tabpanel" aria-labelledby="tab-history" data-panel="history" hidden>
+            <div class="tab-intro"><h3>Configuration history &amp; rollback</h3><p>Compare saved switch configurations with current, then restore a reviewed version with five-minute rollback protection. These are whole-switch configurations, independent of port selection.</p></div>
+            <div class="history-controls">
+              <button id="historyRefresh" class="secondary" type="button">Refresh history</button>
+              <label>Previous versions<select id="historyDepth"><option value="15">15</option><option value="20" selected>20</option></select></label>
+              <button id="historyCompareAll" class="secondary" type="button" disabled>Compare all shown with current</button>
+              <button id="historyCancel" class="secondary" type="button" hidden>Stop comparisons</button>
+            </div>
+            <p id="historyBaseline" class="credential-note">No switch history loaded.</p>
+            <p id="historyStatus" class="tool-summary" role="status" aria-live="polite">Connect to a switch, then refresh history.</p>
+            <section class="history-known-good" aria-labelledby="historyKnownGoodTitle">
+              <div><p class="section-label">Pinned recovery point</p><h3 id="historyKnownGoodTitle">Known good</h3><p id="historyKnownGood">Refresh to check the switch rescue configuration.</p></div>
+              <div class="history-controls">
+                <button id="historyCompareKnownGood" class="secondary" type="button" disabled>Compare known good</button>
+                <button id="historyRestoreKnownGood" class="secondary" type="button" disabled>Restore known good…</button>
+                <label>Optional label<input id="historyLabel" maxlength="64" placeholder="Verified after maintenance" /></label>
+                <button id="historySaveKnownGood" class="secondary" type="button" disabled>Save current as known good</button>
+              </div>
+              <p class="credential-note">Uses the switch’s rescue backup, separate from rotating rollback versions. Save details are also retained in the cross-device activity log. Saving current replaces an existing rescue backup only after confirmation.</p>
+              <button id="historyCatalog" class="secondary compact-button" type="button">Known good across devices</button>
+            </section>
+            <div class="history-table-wrap"><table class="history-table"><caption>Recent switch commits, including changes made outside Junos Helper</caption><thead><tr><th scope="col">Version</th><th scope="col">Committed (switch time)</th><th scope="col">User</th><th scope="col">Comment</th><th scope="col">Compared with current</th></tr></thead><tbody id="historyRows"></tbody></table></div>
+            <section class="history-comparison" aria-labelledby="historyDiffTitle">
+              <h3 id="historyDiffTitle">Configuration comparison</h3>
+              <p class="credential-note">Plus lines will be added and minus lines removed by restoring the selected version. Counts include configuration text and hierarchy lines. Sensitive values are masked.</p>
+              <pre id="historyDiff" tabindex="0" aria-label="Configuration restore preview">Select a version to compare.</pre>
+              <p id="historyDraftHint" class="credential-note"></p>
+              <div class="button-row"><button id="historyRestore" class="danger" type="button" disabled>Restore selected version with protection</button><button id="historyConfirm" class="confirm" type="button" hidden>Confirm restored configuration</button></div>
+            </section>
           </div>
 
           <div class="tab-panel" id="panel-review" role="tabpanel" aria-labelledby="tab-review" data-panel="review" hidden>
@@ -440,10 +472,11 @@
       </div>
       <div class="activity-log-controls">
         <label>Device<select id="activityLogScope"><option value="active">Active device</option><option value="all">All devices</option></select></label>
-        <label>Show<select id="activityLogView"><option value="changes">Changes &amp; errors</option><option value="all">All activity</option><option value="errors">Errors &amp; warnings</option></select></label>
+        <label>Show<select id="activityLogView"><option value="changes">Changes &amp; errors</option><option value="all">All activity</option><option value="errors">Errors &amp; warnings</option><option value="known-good">Known good &amp; restores</option></select></label>
         <button id="refreshActivityLogBtn" class="secondary" type="button">Refresh log</button>
       </div>
       <p id="activityLogSummary" class="tool-summary muted" role="status" aria-live="polite"></p>
+      <section id="knownGoodCatalog" class="known-good-catalog" aria-label="Cross-device known-good catalog" hidden></section>
       <ol id="activityLogList" class="activity-log-list"></ol>
       <button id="olderActivityLogBtn" class="secondary" type="button" hidden>Load older entries</button>
       <p class="credential-note">Newest first; times shown in your browser's local time. Retained locally for up to 90 days or 50,000 entries. This history records Junos Helper actions; an elapsed confirmation window does not prove a rollback. Raw configurations and discovery output are not stored in this log.</p>
@@ -474,5 +507,6 @@
     </dialog>
     <script src="script.js"></script>
     <script src="live-watch.js"></script>
+    <script src="config-history.js"></script>
   </body>
 </html>

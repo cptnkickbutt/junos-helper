@@ -45,6 +45,9 @@ class ActivityLog:
             db.execute("CREATE INDEX IF NOT EXISTS activity_request ON activity(request_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS activity_related ON activity(related_request_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS activity_timestamp ON activity(timestamp)")
+            db.execute("""CREATE TABLE IF NOT EXISTS known_good (
+                host TEXT PRIMARY KEY, metadata TEXT NOT NULL
+            )""")
         except sqlite3.Error:
             db.close()
             raise
@@ -84,6 +87,8 @@ class ActivityLog:
             clauses.append("(a.category = 'change' OR a.severity != 'info')")
         elif view == "errors":
             clauses.append("a.severity IN ('error', 'warning')")
+        elif view == "known-good":
+            clauses.append("(a.operation IN ('Save known good', 'Restore configuration', 'Restore confirmation'))")
         if before:
             clauses.append("a.id < ?")
             params.append(before)
@@ -105,3 +110,31 @@ class ActivityLog:
                 events.append(event)
         return {"events": events, "hasMore": len(rows) > limit,
                 "nextBefore": events[-1]["id"] if len(rows) > limit else None}
+
+    def observe_known_good(self, host: str, device_name: str, fingerprint: str, *, error: str = "", saved: dict | None = None) -> dict:
+        """Durable last-observed catalog, independent of activity retention. No config."""
+        host = host.strip().lower()
+        with closing(self._connect()) as db, db:
+            row = db.execute("SELECT metadata FROM known_good WHERE host = ?", (host,)).fetchone()
+            previous = json.loads(row[0]) if row else {}
+            same = bool(error) or (previous.get("fingerprint") == fingerprint and bool(fingerprint))
+            metadata = {"host": host, "deviceName": device_name or previous.get("deviceName", ""),
+                        "fingerprint": previous.get("fingerprint", "") if error else fingerprint, "observedAt": utc_now(),
+                        "verifiedAt": previous.get("verifiedAt", "") if error else utc_now(),
+                        "state": "unreadable" if error else "available" if fingerprint else "missing",
+                        "savedAt": previous.get("savedAt", "") if same else "",
+                        "operator": previous.get("operator", "") if same else "",
+                        "revision": previous.get("revision", "") if same else "",
+                        "label": previous.get("label", "") if same else ""}
+            if saved:
+                metadata.update({key: str(saved.get(key) or "")[:128] for key in ("operator", "revision", "label")})
+                metadata["savedAt"] = utc_now()
+            db.execute("INSERT INTO known_good (host, metadata) VALUES (?, ?) "
+                       "ON CONFLICT(host) DO UPDATE SET metadata=excluded.metadata", (host, json.dumps(metadata)))
+        return metadata
+
+    def known_good(self, host: str = "") -> list[dict]:
+        with closing(self._connect()) as db:
+            rows = db.execute("SELECT metadata FROM known_good" + (" WHERE host = ?" if host else "")
+                              + " ORDER BY host", (host.strip().lower(),) if host else ()).fetchall()
+            return [json.loads(row[0]) for row in rows]
